@@ -33,3 +33,21 @@ Modes: `batched` is one forward where every row re-reads the state (ORT's
 GroupQueryAttention refuses a batched multi-token continuation from a cache,
 so state-once + one-forward is not available in the browser yet);
 `sequential` is one forward per question, for comparison.
+
+Padding: Gemma 3 causal-LM exports honour `attention_mask` / `position_ids`,
+so rows are left-padded and only one logits position is kept. The Gemma 4
+multimodal export does not — padded rows read the pads as context and the
+answers are wrong (noul questions collapsed to ~0.97 with candidate mass
+0.001). For it the batch is right-padded and logits are kept at every
+position (capped at 64M elements, above that it falls back to sequential).
+
+Measured (M4, 16 GB, Chromium WebGPU, warm):
+
+| model | request | tokens | batched | sequential |
+|---|---|---|---|---|
+| gemma-3-270m q4f16 | ticket, 5 questions | 673 | 2.0 s | 1.7 s |
+| gemma-4-E2B q4f16 | ticket, 5 questions | 673 | 4.2 s | 4.3 s |
+| gemma-4-E2B q4f16 | contract, 8 questions | 2,263 | 11.4 s | — |
+
+Gemma 4 E2B answers in the browser match the native llama.cpp run
+(`refund_requested` 0.010 vs 0.037 Q4_0; the rest within a few 1e-3).
