@@ -32,8 +32,8 @@ What runs where:
 - `engine.js`: tokenizes the rendered segments (control tokens in caller text
   are neutralized the same way as native), decodes the state once into a KV
   cache, continues every question from it with `num_logits_to_keep = 1`, and
-  reads the label logits and candidate mass. **Calibrate** runs the same
-  questions over the content-free state `N/A` once (cached per question,
+  reads the label logits and candidate mass. **Calibrate** (on by default)
+  runs the same questions over the content-free state `N/A` once (cached per question,
   never through the resident cache) and hands those logits to
   `grande.answer`, which subtracts them before the softmax — contextual
   calibration, the same `--baseline` as native.
