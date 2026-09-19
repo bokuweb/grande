@@ -68,49 +68,75 @@ zero-shot label readout is weakest, exactly what a trained pointer head fixes
 
 ## 3. Latency, same machine
 
-| runtime | model | request | tokens | latency |
-|---|---|---|---|---|
-| grande native (Metal) | Gemma 3 270M f16 + head | 12 Q, 500-tok state | 1,072 | **174 ms** (6,160 tok/s) |
-| grande native | Gemma 4 E2B Q4_0 | 12 Q, 500-tok state | 1,072 | 4,450 ms cold / **2,480 ms** state resident |
-| grande native | Gemma 4 E2B Q4_0 | 5 Q ticket | 313 | 785 ms |
-| grande native | Gemma 4 E2B Q4_0 | JGLUE, 1 Q | ~100 | 700 ms |
-| grande native | Gemma 3 270M + head | JGLUE, 1 Q | ~100 | 47–77 ms |
-| kev-0.5b (PyTorch MPS fp32) | Qwen2.5-0.5B | 5 Q ticket | 261 | 211–313 ms |
-| kev-0.5b | JGLUE, 1 Q | | | 136–234 ms |
-| grande browser (WebGPU) | Gemma 3 270M q4f16 | 5 Q ticket | 673 | 2.0 s |
-| grande browser | Gemma 4 E2B q4f16 | 5 Q ticket | 673 | 4.2 s |
-| grande browser | Gemma 4 E2B q4f16 | 8 Q contract | 2,263 | 11.4 s |
-| **reflex browser** (WebGPU) | Qwen3.5-0.8B q4f16 | 5 Q ticket (same JSON) | 1,114 / 324 warm | 6.7 s cold / 3.5 s state cached |
-| reflex Python (published) | Qwen3.5-4B bf16, GB10 | 4 Q | | ~100 ms warm |
-| kev (published) | 0.5B, M5 | 6 Q | | ~160 ms |
-| Jev (published) | ~10B-active MoE (inferred) | 30k tokens | | ~160 ms |
+All grande native numbers below were re-measured with the GPU otherwise idle
+(the first pass of this document had other jobs running and was ~2× slower;
+this laptop is sensitive to contention and heat, so compare within a table,
+not across sessions). `cold` = state and branches evaluated; `warm` = same
+state again, branches only (the prefix stays resident in the KV cache).
 
-Raw llama.cpp `llama-bench pp1024` on this M4: E2B Q4_0 **247 tok/s**, 270M
-f16 **6,181 tok/s**. grande's packed pass runs at 242–291 and 6,160 tok/s,
-i.e. the runtime adds nothing; the wall is prefill compute of the backbone on
-a base M4 GPU. reflex's browser answers on the Japanese ticket were wrong on
-3 of 5 questions (queue=account 62%, refund 71%); grande E2B got all 5.
+| runtime | model | request | tokens | cold | warm |
+|---|---|---|---|---|---|
+| grande native (Metal) | Gemma 3 270M f16 + head | 12 Q, 500-tok state | 1,072 | **168 ms** | **86 ms** |
+| grande native | Gemma 4 E2B Q4_0 | 12 Q, 500-tok state | 1,072 | 1.94 s | 1.01 s |
+| grande native | Gemma 4 E2B Q4_0 | 12 Q, 2,000-tok state | 2,620 | 4.69 s | 1.11 s |
+| grande native | Gemma 4 E2B Q4_0 | 5 Q ticket | 313 | ~0.6 s | |
+| grande native | Gemma 3 270M + head | JGLUE, 1 Q | ~100 | 47–77 ms | |
+| kev-0.5b (PyTorch MPS fp32) | Qwen2.5-0.5B | 5 Q ticket | 261 | 211–313 ms | |
+| kev-0.5b | JGLUE, 1 Q | | | 136–234 ms | |
+| grande browser (WebGPU) | Gemma 3 270M q4f16 | 5 Q ticket | 673 | 2.0 s | |
+| grande browser | Gemma 4 E2B q4f16 | 5 Q ticket | 673 | 4.2 s | |
+| grande browser | Gemma 4 E2B q4f16 | 8 Q contract | 2,263 | 11.4 s | |
+| **reflex browser** (WebGPU) | Qwen3.5-0.8B q4f16 | 5 Q ticket (same JSON) | 1,114 / 324 warm | 6.7 s | 3.5 s |
+| reflex Python (published) | Qwen3.5-4B bf16, GB10 | 4 Q | | | ~100 ms |
+| kev (published) | 0.5B, M5 | 6 Q | | ~160 ms | |
+| Jev (published) | ~10B-active MoE (inferred) | 30k tokens | | ~160 ms | |
+
+Raw llama.cpp `llama-bench pp1024`, idle M4: E2B Q4_0 **569 tok/s**, 270M
+f16 **6,181 tok/s**. grande's packed pass: 553 and 6,380 tok/s. The runtime
+adds nothing; the wall is prefill compute of the backbone on a base M4 GPU.
+Flash attention on/off and n_ubatch 128–2048 change nothing (compute-bound).
+reflex's browser answers on the Japanese ticket were wrong on 3 of 5
+questions (queue=account 62%, refund 71%); grande E2B got all 5.
 
 ## 4. What moves each axis
 
-Size (E2B Q4_0, 2,841 MB):
+Size (E2B). Vocabulary pruning first (`tools/prune_vocab.py`: 262k → 29,180
+tokens from JGLUE train + kev's suites + the examples, BPE merge closure
+kept), then requantized from the pruned Q8_0 with `llama-quantize
+--allow-requantize`. Accuracy on the first 300 JGLUE valid records (not in
+the pruning corpus); the unpruned Q4_0 scores 0.530 / 0.857 on the same rows.
 
-| step | size | accuracy | status |
-|---|---|---|---|
-| vocab pruning 262k → 29k (JGLUE train + kev suites + examples) | **1,273 MB** | unchanged on JGLUE valid | `tools/prune_vocab.py`, done |
-| + PLE / embeddings at Q2–Q3 instead of Q4/Q8 | ~1.1 GB | untested | quantize from the Q8_0 source |
-| + transformer blocks Q3_K / IQ3 | ~0.9 GB | untested | |
-| + early exit / layer drop (needs training) | ~0.6 GB | | RFC 07 §2.4 |
-| 270M + head (different backbone) | 0.55 GB f16, ~0.3 GB Q8 | JNLI 0.54 / JCQA 0.67 with 3k records | done; more data is the lever |
+| variant | size | JNLI | JCQA | 12 Q / 500-tok, warm |
+|---|---|---|---|---|
+| Q4_0, unpruned | 2,841 MB | 0.530 | 0.857 | 1.06 s |
+| Q8_0, pruned | 2,355 MB | 0.533 | 0.860 | 1.15 s |
+| Q4_K_M, pruned | 1,408 MB | 0.517 | 0.843 | 1.14 s |
+| **Q4_0, pruned** | **1,273 MB** | 0.580 (n=400) | 0.855 (n=400) | 1.10 s |
+| Q3_K_M, pruned | 1,181 MB | 0.520 | 0.793 | 1.18 s |
+| Q2_K, pruned | 969 MB | 0.223 | 0.240 | – (model collapses) |
+
+Reading: pruning is free (Q8_0-pruned ≡ unpruned); Q4 costs nothing
+measurable on JNLI and ~1 pt on JCQA; Q3_K_M loses 6 pts on JCQA; Q2_K
+without an importance matrix destroys the model (the PLE table is probably
+what breaks — keeping embeddings at Q8 and quantizing only the blocks is the
+next thing to try). Quantization level does not change speed (compute-bound).
+One real cost of pruning: text outside the corpus tokenizes into more pieces
+(the synthetic contract state: 549 → 612 branch tokens, +11%); a broader
+Japanese corpus for the kept set fixes that.
+
+Beyond this: PLE / embeddings at Q3 with the blocks at Q4 (~1.0 GB), early
+exit / layer drop (needs training, RFC 07 §2.4), or the 270M backbone
+(0.55 GB f16, JNLI 0.54 / JCQA 0.67 with 3k records; data is the lever).
 
 Speed (E2B, M4):
 
 | lever | effect | status |
 |---|---|---|
 | unified KV cache (no per-stream copy) | correctness + budget; needed for long states | done |
-| resident prefix across requests over the same state | 4.45 s → 2.48 s on a 500-token state, 12 Q | done |
+| resident prefix across requests over the same state | 500-tok state: 1.94 → 1.01 s; 2,000-tok: 4.69 → 1.11 s | done |
 | flash attention on/off, n_ubatch 128–2048 | no change (compute-bound) | measured |
+| quantization level | no change (compute-bound) | measured |
 | shorter label template | ~−15% branch tokens | not done |
-| smaller backbone | 270M is 25× faster than E2B | done |
+| smaller backbone | 270M is 11× faster than E2B (86 vs 1,010 ms warm) | done |
 | early exit at layer 24/35 | ~−30% | needs training |
 | bigger GPU | prefill is compute-bound; a 4090-class GPU is ~30× an M4 | |

@@ -116,7 +116,10 @@ See [docs/comparison.md](docs/comparison.md). Short version, same M4:
 - Browser, same 5-question Japanese ticket: grande E2B 4.2 s and all 5 right;
   reflex 0.8B 6.7 s cold / 3.5 s warm and 3 of 5 wrong.
 - Vocabulary pruning cuts E2B Q4_0 from 2,841 MB to 1,273 MB with no JGLUE
-  accuracy change (`tools/prune_vocab.py`).
+  accuracy change (`tools/prune_vocab.py`); Q3_K_M on top reaches 1,181 MB
+  at −6 pts JCQA, Q2_K collapses.
+- Idle M4, 12 questions over a 500-token state: E2B Q4_0 1.94 s cold /
+  1.01 s with the state resident; 270M 168 / 86 ms.
 
 ## Usage
 

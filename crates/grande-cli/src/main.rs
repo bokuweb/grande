@@ -411,25 +411,36 @@ fn main() -> Result<()> {
                 state: serde_json::json!(state),
                 questions: qs,
             };
-            let mut best_ms = u128::MAX;
+            let mut cold_ms = 0u128;
+            let mut warm_ms = u128::MAX;
             let mut tokens = 0usize;
+            let mut branch_tokens = 0usize;
             for r in 0..rounds {
                 let t = Instant::now();
                 let (_, diag) = engine.answer(&req, Mode::Packed)?;
                 let ms = t.elapsed().as_millis();
                 let branch: usize = diag.branch_tokens.iter().sum();
                 tokens = diag.prefix_tokens + branch;
-                best_ms = best_ms.min(ms);
+                branch_tokens = branch;
+                if r == 0 {
+                    cold_ms = ms;
+                } else {
+                    warm_ms = warm_ms.min(ms);
+                }
                 eprintln!(
                     "round {r}: {ms} ms, {tokens} tokens ({} prefix + {branch} branches)",
                     diag.prefix_tokens
                 );
             }
+            // Round 0 evaluates the state and the branches; later rounds find the
+            // state resident and evaluate the branches only.
             println!(
                 "{}",
                 serde_json::json!({
-                    "tokens": tokens, "questions": questions, "best_ms": best_ms,
-                    "tok_per_s": (tokens as f64 / (best_ms as f64 / 1000.0)).round(),
+                    "tokens": tokens, "branch_tokens": branch_tokens, "questions": questions,
+                    "cold_ms": cold_ms, "cold_tok_per_s": (tokens as f64 / (cold_ms.max(1) as f64 / 1000.0)).round(),
+                    "warm_ms": if warm_ms == u128::MAX { serde_json::Value::Null } else { serde_json::json!(warm_ms) },
+                    "warm_tok_per_s": if warm_ms == u128::MAX { serde_json::Value::Null } else { serde_json::json!((branch_tokens as f64 / (warm_ms as f64 / 1000.0)).round()) },
                 })
             );
         }
