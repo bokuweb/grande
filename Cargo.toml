@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/grande-core", "crates/grande-llama", "crates/grande-eval", "crates/grande-server", "crates/grande-web", "crates/grande-cli"]
+members = ["crates/grande-core", "crates/grande-llama", "crates/grande-eval", "crates/grande-server", "crates/grande-web", "crates/grande-wgpu", "crates/grande-cli"]
 
 [workspace.package]
 version = "0.1.0"

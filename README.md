@@ -51,6 +51,10 @@ Gemma 4 E2B zero-shot is selectable.
       restore instead of a prefill, across requests and restarts.
 - [x] browser: state decoded once and resident, questions continue from its
       KV cache (`shared` mode); no state re-reading.
+- [x] `grande-wgpu`: our own Gemma 3 forward pass in WGSL — state + every
+      branch in one block-causal pass, native (Metal / Vulkan) and WebGPU from
+      the same kernels. Parity with llama.cpp on the trained 270M; `grande
+      --model <checkpoint dir>` and the `grande-270m-ja-wgpu` browser model.
 - [ ] IIA test, permutation flip rate on a JGLUE sample
 
 ## First numbers (2026-09-19, M-series Mac, Metal)
@@ -170,14 +174,49 @@ reports the restore (`restored_ms`, `restored_from`) next to cold and warm.
 ```
 crates/grande-core    types, renderer, readout, math, calibration, Backend trait
 crates/grande-llama   llama-cpp-2 backend
+crates/grande-wgpu    wgpu backend: Gemma 3 in WGSL, native and WebGPU
+crates/grande-web     wasm surface for the browser demo (+ the wgpu engine)
 crates/grande-cli     `grande` binary
 examples/             request files
 ```
 
 The `Backend` trait is two methods (`tokenize`, `evaluate`) plus token
-lookups. There is no `generate`; a wgpu or Metal engine only has to implement
-prefix + isolated branches → rows at positions.
+lookups. There is no `generate`; an engine only has to implement prefix +
+isolated branches → rows at positions.
 
+## The wgpu engine
+
+`crates/grande-wgpu` implements that contract without a third-party
+runtime: six WGSL kernels (embedding, RMSNorm, f16-weight matmul, q/k norm +
+RoPE, block-causal attention, gated MLP) and one command buffer per request.
+Every token carries a (position, sequence) pair — prefix tokens are
+sequence 0, branch b's tokens are sequence b restarting at the prefix length
+— and the attention kernel's visibility rule (prefix or own sequence,
+causal, sliding window) *is* the isolation. No KV cache to manage, no
+padding, no runtime constraint on batching a continuation.
+
+```bash
+# package a trained run for it (config, tokenizer, head, f16 safetensors)
+python tools/export_wgpu.py --run runs/grande-270m-12k --out web/models/grande-270m-ja-wgpu
+# a directory instead of a GGUF selects the engine
+./target/release/grande probe --model web/models/grande-270m-ja-wgpu \
+  --head runs/grande-270m-12k/head.safetensors --request examples/ticket-ja.json
+```
+
+The trained 270M answers match llama.cpp to ~5e-4 in probability on the
+ticket and isolation examples, and `crates/grande-wgpu/tests/reference.rs`
+checks the shaders against a plain-Rust forward on a random model. Only what
+the 270M needs is implemented (one KV head, head_dim 256); Gemma 4's
+per-layer embeddings and shared KV layers are not.
+
+Where it stands (M4, measured while another training job held the GPU, so
+only the ratios mean anything): in the browser the same checkpoint answers
+the 5-question ticket in 0.17–0.55 s on this engine against 0.86–1.35 s on
+the ONNX Runtime path run interleaved with it, and the 8-question contract
+in 0.41–0.74 s against 2.9–4.0 s; natively it is still 2–3× behind
+llama.cpp's Metal kernels at ~500–900 tokens and ~10× at 2,500 (the
+attention over a long prefix is where the kernel is weakest). Native stays
+on llama.cpp; the browser is where this engine pays off.
 ## Notes
 
 - Gemma's tokenizer splits digits (`10` → 2 tokens, `254` → 3), so the label

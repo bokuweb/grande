@@ -1,6 +1,6 @@
 //! `grande`: run a System One style request against a local GGUF.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -114,6 +114,9 @@ enum Cmd {
         /// Measure the state restore from this directory instead of RAM.
         #[arg(long)]
         state_cache_dir: Option<PathBuf>,
+        /// Pointer head weights (safetensors); switches to the packed layout.
+        #[arg(long)]
+        head: Option<PathBuf>,
     },
     /// Mechanism tests (kev's): isolation, packed vs separate, boundary
     /// forgery. Prints one line per test with a pass/fail verdict.
@@ -200,9 +203,20 @@ enum Cmd {
     },
 }
 
+/// Open the model at `path`: a GGUF file runs on llama.cpp, a directory with
+/// `config.json` + `model.safetensors` + `tokenizer.json` on the wgpu engine.
+fn load_backend(path: &Path, opts: Options) -> Result<Box<dyn Backend>> {
+    if path.is_dir() {
+        let n_ctx = opts.n_ctx as usize;
+        Ok(Box::new(grande_wgpu::WgpuBackend::load(path, n_ctx, 256)?))
+    } else {
+        Ok(Box::new(LlamaEngine::load(path, opts)?))
+    }
+}
+
 /// Pick layout + readout: a pointer head switches to the packed delimiter
 /// layout, otherwise the zero-shot label readout on the chat layout.
-fn readout_for(backend: &LlamaEngine, head: Option<&PathBuf>) -> Result<(Renderer, Readout)> {
+fn readout_for(backend: &dyn Backend, head: Option<&PathBuf>) -> Result<(Renderer, Readout)> {
     match head {
         Some(p) => {
             let h = grande_core::readout::safetensors::load(&std::fs::read(p)?)?;
@@ -303,7 +317,7 @@ fn main() -> Result<()> {
                 "{} exists; choose a fresh --out",
                 rows_path.display()
             );
-            let backend = LlamaEngine::load(
+            let backend = load_backend(
                 &model,
                 Options {
                     n_ctx,
@@ -317,7 +331,7 @@ fn main() -> Result<()> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("model")
                 .to_lowercase();
-            let (renderer, readout) = readout_for(&backend, head.as_ref())?;
+            let (renderer, readout) = readout_for(&*backend, head.as_ref())?;
             let renderer = renderer.terse(terse);
             let layout = if head.is_some() {
                 "gemma_pointer"
@@ -406,8 +420,9 @@ fn main() -> Result<()> {
             n_ubatch,
             flash,
             state_cache_dir,
+            head,
         } => {
-            let backend = LlamaEngine::load(
+            let backend = load_backend(
                 &model,
                 Options {
                     n_ctx,
@@ -427,6 +442,7 @@ fn main() -> Result<()> {
                         512 << 20
                     },
                     state_cache_dir,
+                    embeddings: head.is_some(),
                     ..Default::default()
                 },
             )?;
@@ -435,7 +451,7 @@ fn main() -> Result<()> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("model")
                 .to_lowercase();
-            let (renderer, readout) = readout_for(&backend, None)?;
+            let (renderer, readout) = readout_for(&*backend, head.as_ref())?;
             let mut engine = Engine::new(backend, renderer, readout, name);
             // Build a state of roughly `state_tokens` tokens from a repeated clause.
             let unit = "第3条 本契約に基づく報酬は月額金500,000円（消費税別）とし、甲は乙の請求書受領月の翌月末日までに支払う。";
@@ -883,7 +899,7 @@ fn main() -> Result<()> {
             let req: Request = serde_json::from_slice(&std::fs::read(&request)?)
                 .with_context(|| format!("parsing {}", request.display()))?;
             let t0 = Instant::now();
-            let backend = LlamaEngine::load(
+            let backend = load_backend(
                 &model,
                 Options {
                     n_ctx,
@@ -900,7 +916,7 @@ fn main() -> Result<()> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("model")
                 .to_lowercase();
-            let (renderer, readout) = readout_for(&backend, head.as_ref())?;
+            let (renderer, readout) = readout_for(&*backend, head.as_ref())?;
             let mut engine = Engine::new(backend, renderer, readout, name);
             engine.temperature = temperature;
 

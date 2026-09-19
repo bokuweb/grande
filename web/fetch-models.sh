@@ -13,3 +13,13 @@ for f in model_quantized.onnx model_quantized.onnx_data; do
   gh release download "$TAG" --repo bokuweb/grande --pattern "$f" --output "$DEST/onnx/$f" --clobber
 done
 ls -la "$DEST" "$DEST/onnx"
+
+# The same checkpoint for the wgpu engine (crates/grande-wgpu), if released.
+WTAG="${2:-wgpu-v1}"
+WDEST="models/grande-270m-ja-wgpu"
+mkdir -p "$WDEST"
+for f in config.json tokenizer.json tokenizer_config.json head.safetensors model.safetensors; do
+  gh release download "$WTAG" --repo bokuweb/grande --pattern "$f" --output "$WDEST/$f" --clobber \
+    || { echo "no $WTAG release; skipping the wgpu model"; rm -rf "$WDEST"; break; }
+done
+ls -la "$WDEST" 2>/dev/null || true

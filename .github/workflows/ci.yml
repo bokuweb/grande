@@ -16,6 +16,6 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo test -p grande-core -p grande-eval -p grande-web
-      - run: cargo clippy -p grande-core -p grande-eval -p grande-web -p grande-server -- -D warnings
+      - run: cargo test -p grande-core -p grande-eval -p grande-web -p grande-wgpu
+      - run: cargo clippy -p grande-core -p grande-eval -p grande-web -p grande-server -p grande-wgpu -- -D warnings
       - run: cargo build -p grande-web --target wasm32-unknown-unknown

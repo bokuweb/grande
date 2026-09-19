@@ -52,6 +52,16 @@ Modes:
 The trained pointer model (`grande-270m-ja`, a hidden-state export without
 a KV cache) always runs batched, so it still re-reads the state per question.
 
+`grande-270m-ja-wgpu` is the same checkpoint on grande's own engine
+(`crates/grande-wgpu`, compiled into `pkg/grande_bg.wasm` and run on WebGPU
+through wgpu): state and every question in one forward pass with a
+block-causal mask, no ONNX Runtime. Its files (`config.json`,
+`tokenizer.json`, `head.safetensors`, `model.safetensors` f16, 320 MB) come
+from `tools/export_wgpu.py` and live in `models/grande-270m-ja-wgpu/`
+(fetched from the `wgpu-v1` release by `fetch-models.sh`). Measured with the
+GPU shared with a training job, interleaved with the ONNX model: ticket
+0.17–0.55 s vs 0.86–1.35 s, contract 0.41–0.74 s vs 2.9–4.0 s.
+
 Padding (`batched` only): Gemma 3 causal-LM exports honour `attention_mask`
 / `position_ids`, so rows are left-padded and only one logits position is
 kept. The Gemma 4 multimodal export does not — padded rows read the pads as

@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 grande-core = { path = "../grande-core" }
 grande-llama = { path = "../grande-llama" }
+grande-wgpu = { path = "../grande-wgpu" }
 grande-eval = { path = "../grande-eval" }
 grande-server = { path = "../grande-server" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

@@ -85,4 +85,40 @@ pub trait Backend {
     fn prefix_source(&self) -> Option<PrefixSource> {
         None
     }
+    /// Forget the resident state (diagnostics: lets a benchmark measure a
+    /// restore or a cold pass without changing the request). No-op for
+    /// backends that keep nothing between requests.
+    fn evict_resident(&mut self) {}
+}
+
+impl<B: Backend + ?Sized> Backend for Box<B> {
+    fn tokenize(&self, text: &str) -> Result<Vec<Token>> {
+        (**self).tokenize(text)
+    }
+    fn special(&self, name: &str) -> Result<Token> {
+        (**self).special(name)
+    }
+    fn bos(&self) -> Token {
+        (**self).bos()
+    }
+    fn n_embd(&self) -> usize {
+        (**self).n_embd()
+    }
+    fn n_vocab(&self) -> usize {
+        (**self).n_vocab()
+    }
+    fn evaluate(
+        &mut self,
+        prefix: &[Token],
+        branches: &[BranchTokens],
+        want: Want,
+    ) -> Result<Vec<BranchOutput>> {
+        (**self).evaluate(prefix, branches, want)
+    }
+    fn prefix_source(&self) -> Option<PrefixSource> {
+        (**self).prefix_source()
+    }
+    fn evict_resident(&mut self) {
+        (**self).evict_resident()
+    }
 }
