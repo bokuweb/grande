@@ -9,7 +9,8 @@ use anyhow::{anyhow, Context};
 use grande_core::{Backend, BranchOutput, BranchTokens, Error, Token, Want};
 use tokenizers::Tokenizer;
 
-use crate::{Engine, Weights};
+use crate::model::{Config, Manifest};
+use crate::{Engine, EngineBuilder, Weights};
 
 pub struct WgpuBackend {
     engine: Engine,
@@ -18,17 +19,45 @@ pub struct WgpuBackend {
 }
 
 impl WgpuBackend {
-    /// Load `config.json`, `model.safetensors` and `tokenizer.json` from a
-    /// checkpoint directory. `capacity` is the packed-token budget.
+    /// Load a checkpoint directory: `config.json` + `tokenizer.json` and
+    /// either `manifest.json` with the exported tensor files
+    /// (tools/export_wgpu_gguf.py) or an HF `model.safetensors` (Gemma 3).
+    /// `capacity` is the packed-token budget.
     pub fn load(dir: &Path, capacity: usize, max_rows: usize) -> anyhow::Result<Self> {
         let read = |name: &str| {
             std::fs::read(dir.join(name))
                 .with_context(|| format!("reading {}", dir.join(name).display()))
         };
-        let weights = Weights::load(&read("config.json")?, &read("model.safetensors")?)?;
         let tokenizer = Tokenizer::from_bytes(read("tokenizer.json")?)
             .map_err(|e| anyhow!("tokenizer.json: {e}"))?;
-        let engine = pollster::block_on(Engine::new(&weights, capacity, max_rows))?;
+        let config_json = read("config.json")?;
+        let engine = if dir.join("manifest.json").is_file() {
+            let config =
+                Config::from_json(&serde_json::from_slice(&config_json).context("config.json")?)?;
+            let manifest: Manifest =
+                serde_json::from_slice(&read("manifest.json")?).context("manifest.json")?;
+            let mut b = pollster::block_on(EngineBuilder::new(config))?;
+            for file in &manifest.files {
+                let bytes = read(&file.path)?;
+                for entry in &file.tensors {
+                    let t = entry.tensor(&bytes)?;
+                    b.push(&entry.name, &t)
+                        .with_context(|| format!("{}: {}", file.path, entry.name))?;
+                }
+            }
+            if let Some(entry) = &manifest.per_layer_table {
+                let path = entry
+                    .path
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("manifest: per_layer_table has no path"))?;
+                let bytes = read(path)?;
+                b.set_per_layer_table(entry.tensor(&bytes)?)?;
+            }
+            b.finish(capacity, max_rows)?
+        } else {
+            let weights = Weights::load(&config_json, &read("model.safetensors")?)?;
+            pollster::block_on(Engine::new(&weights, capacity, max_rows))?
+        };
         Ok(WgpuBackend {
             engine,
             tokenizer,

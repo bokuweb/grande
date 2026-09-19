@@ -1,15 +1,17 @@
 // act[M, F] = gelu_tanh(X * Wg^T) * (X * Wu^T): the gate and up projections
 // and the GeGLU in one kernel. Same tiling as matmul.wgsl but 128 invocations
 // each owning 4 rows x 8 cols of both products; only the activation is
-// written.
+// written. Both weights share one storage type (QUANT, see weight.wgsl).
 
 struct Params { m: u32, n: u32, k: u32, _pad: u32 }
 
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read> wg: array<u32>;
-@group(0) @binding(3) var<storage, read> wu: array<u32>;
-@group(0) @binding(4) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<storage, read> sg: array<u32>;
+@group(0) @binding(4) var<storage, read> wu: array<u32>;
+@group(0) @binding(5) var<storage, read> su: array<u32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
 
 const BM: u32 = 64u;
 const BN: u32 = 64u;
@@ -52,8 +54,10 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_index)
                 xs[c * LD + r] = v;
             }
         }
-        // Gate and up tiles: pair li % 8, cols li/8 + 16i.
-        {
+        // Gate and up tiles. f16: pair li % 8 of cols li/8 + 16i. Quantized:
+        // invocations 0..64 decode col li of the gate, 64..128 col li-64 of
+        // the up projection, 16 k each from 4 words and one block scale.
+        if (QUANT == 0u) {
             let c2 = li % 8u;
             for (var i = 0u; i < 4u; i++) {
                 let r = li / 8u + 16u * i;
@@ -69,6 +73,48 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_index)
                 gs[(2u * c2 + 1u) * LD + r] = a.y;
                 us[(2u * c2) * LD + r] = b.x;
                 us[(2u * c2 + 1u) * LD + r] = b.y;
+            }
+        } else {
+            let r = li % 64u;
+            let gn = col0 + r;
+            let up = li >= 64u;
+            var v: array<vec4<f32>, 4>;
+            if (gn < p.n) {
+                let e = gn * p.k + k0;
+                let blk = e / 32u;
+                var d: f32;
+                if (up) { d = block_scale(su[blk / 2u], blk); } else { d = block_scale(sg[blk / 2u], blk); }
+                if (QUANT == 1u) {
+                    let wb = e / 4u;
+                    for (var q = 0u; q < 4u; q++) {
+                        var word: u32;
+                        if (up) { word = wu[wb + q]; } else { word = wg[wb + q]; }
+                        v[q] = dq8(word, d);
+                    }
+                } else {
+                    let wb = blk * 4u;
+                    let lo = (k0 % 32u) == 0u;
+                    for (var q = 0u; q < 4u; q++) {
+                        var word: u32;
+                        if (up) { word = wu[wb + q]; } else { word = wg[wb + q]; }
+                        if (lo) { v[q] = dq4lo(word, d); } else { v[q] = dq4hi(word, d); }
+                    }
+                }
+            } else {
+                for (var q = 0u; q < 4u; q++) { v[q] = vec4<f32>(0.0); }
+            }
+            for (var q = 0u; q < 4u; q++) {
+                if (up) {
+                    us[(4u * q) * LD + r] = v[q].x;
+                    us[(4u * q + 1u) * LD + r] = v[q].y;
+                    us[(4u * q + 2u) * LD + r] = v[q].z;
+                    us[(4u * q + 3u) * LD + r] = v[q].w;
+                } else {
+                    gs[(4u * q) * LD + r] = v[q].x;
+                    gs[(4u * q + 1u) * LD + r] = v[q].y;
+                    gs[(4u * q + 2u) * LD + r] = v[q].z;
+                    gs[(4u * q + 3u) * LD + r] = v[q].w;
+                }
             }
         }
         workgroupBarrier();

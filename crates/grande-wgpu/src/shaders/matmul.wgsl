@@ -1,17 +1,19 @@
 // Y[M, N] = X[M, K] * W[N, K]^T   (a linear layer; W row-major as HF stores it)
-// X, Y are f32; W is f16 packed two per u32. A 64x64 output tile per
+// X, Y are f32; W is f16 packed two per u32 or a quantized block format (see
+// weight.wgsl, prepended; QUANT picks the decoder). A 64x64 output tile per
 // workgroup of 64 invocations, each owning 8 rows x 8 cols (rows tr+8i, cols
 // tc+8j, so tile reads are consecutive across invocations). K streams through
 // workgroup memory 16 wide, k-major with a padded stride: the transposed
 // stores and the inner-loop reads are both bank-conflict free. K must be a
-// multiple of 16; M and N are bounds-checked.
+// multiple of 32; M and N are bounds-checked.
 
 struct Params { m: u32, n: u32, k: u32, _pad: u32 }
 
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read> w: array<u32>;
-@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<storage, read> sc: array<u32>;
+@group(0) @binding(4) var<storage, read_write> y: array<f32>;
 
 const BM: u32 = 64u;
 const BN: u32 = 64u;
@@ -53,8 +55,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
                 xs[c * LD + r] = v;
             }
         }
-        // W tile: pair li % 8, cols li/8 + 8i.
-        {
+        // W tile. f16: pair li % 8 of cols li/8 + 8i (coalesced across
+        // invocations). Quantized: invocation li decodes the 16 k of its own
+        // col from 4 words and one block scale.
+        if (QUANT == 0u) {
             let c2 = li % 8u;
             for (var i = 0u; i < 8u; i++) {
                 let r = li / 8u + 8u * i;
@@ -63,6 +67,34 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
                 if (gn < p.n) { v = unpack2x16float(w[(gn * p.k + k0) / 2u + c2]); }
                 ws[(2u * c2) * LD + r] = v.x;
                 ws[(2u * c2 + 1u) * LD + r] = v.y;
+            }
+        } else {
+            let r = li;
+            let gn = col0 + r;
+            var v: array<vec4<f32>, 4>;
+            if (gn < p.n) {
+                let e = gn * p.k + k0;
+                let blk = e / 32u;
+                let d = block_scale(sc[blk / 2u], blk);
+                if (QUANT == 1u) {
+                    let wb = e / 4u;
+                    for (var q = 0u; q < 4u; q++) { v[q] = dq8(w[wb + q], d); }
+                } else {
+                    let wb = blk * 4u;
+                    if ((k0 % 32u) == 0u) {
+                        for (var q = 0u; q < 4u; q++) { v[q] = dq4lo(w[wb + q], d); }
+                    } else {
+                        for (var q = 0u; q < 4u; q++) { v[q] = dq4hi(w[wb + q], d); }
+                    }
+                }
+            } else {
+                for (var q = 0u; q < 4u; q++) { v[q] = vec4<f32>(0.0); }
+            }
+            for (var q = 0u; q < 4u; q++) {
+                ws[(4u * q) * LD + r] = v[q].x;
+                ws[(4u * q + 1u) * LD + r] = v[q].y;
+                ws[(4u * q + 2u) * LD + r] = v[q].z;
+                ws[(4u * q + 3u) * LD + r] = v[q].w;
             }
         }
         workgroupBarrier();
