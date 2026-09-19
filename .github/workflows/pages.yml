@@ -23,18 +23,19 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - name: Install wasm-bindgen (version pinned in Cargo.lock) and binaryen
+      - name: Install wasm-bindgen (version pinned in Cargo.lock)
         run: |
           VERSION=$(grep -A1 'name = "wasm-bindgen"' Cargo.lock | grep version | head -1 | sed 's/.*"\(.*\)"/\1/')
           echo "wasm-bindgen $VERSION"
           curl -sSL "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${VERSION}/wasm-bindgen-${VERSION}-x86_64-unknown-linux-musl.tar.gz" | tar xz
           sudo mv "wasm-bindgen-${VERSION}-x86_64-unknown-linux-musl/wasm-bindgen" /usr/local/bin/
-          sudo apt-get install -y -qq binaryen
       - name: Build wasm
         run: |
           cargo build --release -p grande-web --target wasm32-unknown-unknown
           wasm-bindgen --target web --out-dir web/pkg --out-name grande target/wasm32-unknown-unknown/release/grande_web.wasm
-          wasm-opt -Oz -o web/pkg/grande_bg.wasm web/pkg/grande_bg.wasm
+          # No wasm-opt: Ubuntu's binaryen is old enough to break the externref
+          # table (WebAssembly.Table.grow fails at init). 4.4 MB unoptimized
+          # is acceptable for a demo.
           rm -f web/pkg/.gitignore
           ls -la web/pkg
       - uses: actions/configure-pages@v5
