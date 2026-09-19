@@ -304,9 +304,10 @@ JGLUE valid, first 300 records, E2B Q4_0, label readout, no temperature
 
 Under 3 orders (`--permute 3`) the JNLI argmax flips on 14% of records and
 the distributions differ by 0.34 in L1 on average, which is what the
-average removes. The branches are not free on llama.cpp (2–2.5× the time
-per record here); on the wgpu engine, where every branch is one block of
-the same pass, the cost is closer to the extra tokens alone.
+average removes. The extra branches cost their tokens: on the wgpu engine
+(native, E2B pruned) the 5-question ticket goes from 315 to 542 tokens and
+0.80 to 1.36 s at 3 orders; on llama.cpp the JGLUE runs above took
+2–2.5× per record.
 
 A Choice with more options than the label readout can letter (52) no
 longer errors: the options are asked in groups of at most 52 in the first
