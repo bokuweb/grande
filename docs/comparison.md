@@ -91,6 +91,8 @@ state again, branches only (the prefix stays resident in the KV cache).
 | grande browser (WebGPU) | Gemma 3 270M q4f16 | 5 Q ticket | 673 | 2.0 s | |
 | grande browser | Gemma 4 E2B q4f16 | 5 Q ticket | 673 | 4.2 s | |
 | grande browser | Gemma 4 E2B q4f16 | 8 Q contract | 2,263 | 11.4 s | |
+| **grande browser, trained** | grande-270m-ja q8 (211 MB) | 5 Q ticket | 571 | 449 ms | **267 ms** |
+| grande browser, trained | grande-270m-ja q8 | 8 Q contract | 2,102 | | 923 ms |
 | **reflex browser** (WebGPU) | Qwen3.5-0.8B q4f16 | 5 Q ticket (same JSON) | 1,114 / 324 warm | 6.7 s | 3.5 s |
 | reflex Python (published) | Qwen3.5-4B bf16, GB10 | 4 Q | | | ~100 ms |
 | kev (published) | 0.5B, M5 | 6 Q | | ~160 ms | |

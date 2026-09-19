@@ -19,7 +19,7 @@ function renderModelOptions() {
 for (const [k] of Object.entries(MODELS)) {
   const o = document.createElement("option");
   o.value = k;
-  if (k === (params.get("model") ?? "gemma-4-e2b")) o.selected = true;
+  if (k === (params.get("model") ?? "grande-270m-ja")) o.selected = true;
   $("model").append(o);
 }
 renderModelOptions();
@@ -217,7 +217,7 @@ function renderResults(request, resp) {
       <div class="q-head"><span class="q-id">${esc(id)}</span><span class="badge">${a.type}</span></div>
       ${q.instructions ? `<div class="q-inst">${esc(q.instructions)}</div>` : ""}
       <div class="opts">${opts}</div>
-      <div class="q-foot"><span>${summary}</span><span class="${mass < 0.9 ? "warn" : ""}" title="Probability mass on the candidate labels">mass ${mass.toFixed(3)}</span></div>
+      <div class="q-foot"><span>${summary}</span>${mass == null ? "" : `<span class="${mass < 0.9 ? "warn" : ""}" title="Probability mass on the candidate labels">mass ${mass.toFixed(3)}</span>`}</div>
     </div>`);
   }
   $("results").innerHTML = cards.join("");

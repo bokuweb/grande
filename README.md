@@ -10,7 +10,9 @@ one isolated branch per question, a readout at each branch's answer position.
 grande targets Japanese, Gemma 4, quantized local inference, and (later) the
 browser. Design notes live in `life/idea/local-jev`.
 
-**Demo:** https://bokuweb.github.io/grande/ (WebGPU; pick a model, load, run — nothing leaves the browser)
+**Demo:** https://bokuweb.github.io/grande/ (WebGPU; nothing leaves the browser).
+Default model is the trained `grande-270m-ja` (211 MB, 5 questions in ~270 ms);
+Gemma 4 E2B zero-shot is selectable.
 
 ## Status
 
@@ -39,6 +41,8 @@ browser. Design notes live in `life/idea/local-jev`.
 - [x] `grande mechanism`: isolation, packed vs separate, boundary forgery.
 - [x] browser demo (`web/`): `grande-core` as wasm + transformers.js on
       WebGPU, Gemma 3 270M / 1B and Gemma 4 E2B ONNX.
+- [x] trained pointer head in the browser: `tools/export_browser.py` (ONNX
+      q8, pruned embedding rows, id map), served from a GitHub release.
 - [x] `grande suite` (kev-style frozen suites), `tools/http_eval.py`
       (any `/v1/systemone` server), `tools/prune_vocab.py`.
 - [x] unified KV cache; resident prefix across requests over the same state.

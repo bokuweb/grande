@@ -38,6 +38,10 @@ jobs:
           # is acceptable for a demo.
           rm -f web/pkg/.gitignore
           ls -la web/pkg
+      - name: Fetch the trained browser model from the models release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./web/fetch-models.sh models-v1
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
