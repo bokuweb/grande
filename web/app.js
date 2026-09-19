@@ -12,6 +12,7 @@ let mode = "shared";
 let cached = new Set();
 // Models served from this site or a Hugging Face repo that turn out to be
 // in neither place (not published yet) stay listed but disabled.
+const DEFAULT_MODEL = "gemma-4-e2b";
 const unpublished = new Set();
 function renderModelOptions() {
   for (const o of $("model").options) {
@@ -23,7 +24,7 @@ function renderModelOptions() {
 for (const [k] of Object.entries(MODELS)) {
   const o = document.createElement("option");
   o.value = k;
-  if (k === (params.get("model") ?? "grande-270m-ja")) o.selected = true;
+  if (k === (params.get("model") ?? DEFAULT_MODEL)) o.selected = true;
   $("model").append(o);
 }
 renderModelOptions();
@@ -34,7 +35,7 @@ for (const [k, m] of Object.entries(MODELS)) {
     unpublished.add(k);
     renderModelOptions();
     if ($("model").value === k) {
-      $("model").value = "grande-270m-ja";
+      $("model").value = DEFAULT_MODEL;
       selectModel();
     }
   });

@@ -20,11 +20,11 @@ python3 -m http.server 8765 --directory web
 open "http://localhost:8765/?model=gemma-3-270m"
 ```
 
-`?model=` picks `grande-270m-ja` (default) / `grande-270m-ja-wgpu` (the
-trained pointer model, 0.2 / 0.3 GB), `gemma-4-e2b-wgpu` (2.8 GB, Gemma 4 E2B
-on the wgpu engine), `gemma-3-270m` (0.27 GB, smoke test), `gemma-3-1b` (0.76 GB),
-`gemma-4-e2b` (3.4 GB; half of it is the per-layer embedding table)
-or `gemma-4-e4b` (5.2 GB). Requires WebGPU (Chrome / Edge, Safari 26+).
+`?model=` picks `gemma-4-e2b` (default; 3.4 GB, half of it is the per-layer
+embedding table), `gemma-4-e4b` (5.2 GB), `gemma-4-e2b-wgpu` (2.8 GB, Gemma 4
+E2B on the wgpu engine), `grande-270m-ja` / `grande-270m-ja-wgpu` (the trained
+pointer model, 0.2 / 0.3 GB), `gemma-3-270m` (0.27 GB, smoke test) or
+`gemma-3-1b` (0.76 GB). Requires WebGPU (Chrome / Edge, Safari 26+).
 
 What runs where:
 

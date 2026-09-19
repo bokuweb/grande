@@ -35,7 +35,7 @@ export const MODELS = {
   // Trained pointer head (JNLI 0.71 / JCQA 0.71, 12k records) on a Gemma 3 270M
   // backbone with embedding rows pruned to a Japanese + English corpus. Served
   // from this site (./models/, fetched from a GitHub release at build time).
-  "grande-270m-ja": { id: "grande-270m-ja", local: true, kind: "pointer", layout: { layout: "pointer", state: "<unused0>", question: "<unused1>", opt: "<unused2>", opt_end: "<unused3>", decide: "<unused4>" }, dtype: "q8", size: "0.21 GB", note: "default, trained, fast" },
+  "grande-270m-ja": { id: "grande-270m-ja", local: true, kind: "pointer", layout: { layout: "pointer", state: "<unused0>", question: "<unused1>", opt: "<unused2>", opt_end: "<unused3>", decide: "<unused4>" }, dtype: "q8", size: "0.21 GB", note: "trained, fast" },
   "gemma-3-270m": { id: "onnx-community/gemma-3-270m-it-ONNX", kind: "causal", layout: GEMMA3, dtype: "q4f16", size: "0.27 GB", note: "smoke test only" },
   "gemma-3-1b": { id: "onnx-community/gemma-3-1b-it-ONNX", kind: "causal", layout: GEMMA3, dtype: "q4f16", size: "0.76 GB", note: "fast" },
   "gemma-4-e2b": { id: "onnx-community/gemma-4-E2B-it-ONNX", kind: "gemma4", layout: GEMMA4, dtype: "q4f16", size: "3.4 GB", note: "default", padding: "right" },
