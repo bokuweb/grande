@@ -8,34 +8,41 @@
 // heads (one for E2B, two for E4B). Q is read from the layer's fused
 // projection buffer (row stride q_stride), K and V from a K/V buffer
 // [t][kv_heads x HD | kv_heads x HD] (all K heads, then all V heads) that
-// may belong to an earlier layer (Gemma 4 shares K/V). A workgroup of 128
-// handles ROWS query rows of one KV head, wg.y: (ROWS / hpg) tokens x the
-// hpg query heads of that group, with their Q held as f16 in workgroup
-// memory, and streams that head's keys KB at a time (ROWS x KB = 128). A tile no row can see is skipped (keys after the block,
-// other branches). Otherwise each invocation computes one full (row, key)
-// score, then owns HD/KB output dims of one row for the online softmax and
-// P.V. HD, ROWS and KB are substituted by the engine: 8 x 16 at HD 256
-// (~12.5 KB of workgroup memory), 16 x 8 at HD 512 (~24.5 KB).
+// may belong to an earlier layer (Gemma 4 shares K/V). A workgroup of
+// ROWS x KB invocations handles ROWS query rows of one KV head, wg.y:
+// (ROWS / hpg) tokens x the hpg query heads of that group, with their Q held
+// as f16 in workgroup memory, and streams that head's keys KB at a time. A tile no row can see is skipped (keys after the block,
+// other branches). Otherwise the K tile is staged as f16, each invocation
+// computes one full (row, key) score, then the same tile buffer is refilled
+// with V and each invocation owns HD/KB output dims of one row for the
+// online softmax and P.V. Staging K and V as f16 (one union buffer) and
+// reading them as vec4 keeps the kernel off scalar global loads, which is
+// what bounded the previous version. HD, ROWS and KB are substituted by the
+// engine (16 x 8: 128 invocations, 13 KB at HD 256 / 25 KB at HD 512; see
+// attn_tile for the shapes that measured worse).
 
 struct Params { t: u32, heads: u32, window: u32, q_stride: u32, kv_heads: u32, _p0: u32, _p1: u32, _p2: u32 }
 
 @group(0) @binding(0) var<uniform> p: Params;
-@group(0) @binding(1) var<storage, read> q: array<f32>;
-@group(0) @binding(2) var<storage, read> kv: array<f32>;
+@group(0) @binding(1) var<storage, read> q: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> kv: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read> tok_meta: array<i32>;
-@group(0) @binding(4) var<storage, read_write> out: array<f32>;
+@group(0) @binding(4) var<storage, read_write> out: array<vec4<f32>>;
 
 const HD: u32 = 256u;
-const ROWS: u32 = 8u;      // query rows per workgroup = tokens * heads
+const ROWS: u32 = 16u;     // query rows per workgroup = tokens * heads
 const KB: u32 = 16u;       // keys per tile; also invocations per row
+const N: u32 = ROWS * KB;  // invocations
 const HP: u32 = HD / 2u;   // f16 pairs per head row
+const HQ: u32 = HD / 4u;   // vec4 per head row
 const CH: u32 = HD / KB;   // output dims per invocation
 const NV: u32 = CH / 4u;   // vec4 accumulators per invocation
 const NEG: f32 = -1.0e30;
 
 var<workgroup> qs: array<u32, ROWS * HP>;  // [ROWS][HP] f16 pairs
-var<workgroup> ks: array<u32, KB * HP>;    // [KB][HP] f16 pairs
-var<workgroup> s: array<f32, 128>;         // [ROWS][KB] masked scores
+var<workgroup> kvs: array<u32, KB * HP>;   // [KB][HP] f16 pairs: K, then V
+var<workgroup> s: array<f32, ROWS * KB>;   // [ROWS][KB] masked scores
+var<workgroup> ps: array<f32, ROWS * KB>;  // [ROWS][KB] exp(score - m), 0 if masked
 var<workgroup> kpos: array<i32, KB>;
 var<workgroup> kseq: array<i32, KB>;
 var<workgroup> qpos: array<i32, ROWS>;
@@ -46,16 +53,29 @@ fn visible(qp: i32, qs_: i32, kp: i32, ks_: i32) -> bool {
     return (ks_ == 0 || ks_ == qs_) && kp <= qp && (p.window == 0u || u32(qp - kp) < p.window);
 }
 
-@compute @workgroup_size(128)
+// Stage KB rows of K (half == 0) or V (half == 1) of KV head g, tile j0, as
+// f16 pairs. A kv row is 2 x kv_heads head rows: the K heads, then the V heads.
+fn stage_kv(li: u32, j0: u32, half: u32, g: u32) {
+    let stride4 = 2u * p.kv_heads * HQ;
+    let off4 = (half * p.kv_heads + g) * HQ;
+    for (var e = li; e < KB * HQ; e += N) {
+        let kk = e / HQ;
+        let d4 = e % HQ;
+        let j = j0 + kk;
+        var v = vec4<f32>(0.0);
+        if (j < p.t) { v = kv[j * stride4 + off4 + d4]; }
+        kvs[kk * HP + 2u * d4] = pack2x16float(v.xy);
+        kvs[kk * HP + 2u * d4 + 1u] = pack2x16float(v.zw);
+    }
+}
+
+@compute @workgroup_size(128) // ROWS * KB, substituted by the engine
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let heads = p.heads;
     let hpg = heads / p.kv_heads; // query heads per KV head
     let g = wg.y;                 // this workgroup's KV head
     let tb = ROWS / hpg;
     let tok0 = wg.x * tb;
-    let kv_stride = 2u * p.kv_heads * HD;
-    let kb0 = g * HD;                    // K head offset in a kv row
-    let vb0 = (p.kv_heads + g) * HD;     // V head offset in a kv row
 
     let row = li / KB;          // 0..ROWS, both roles
     let key = li % KB;          // score role
@@ -64,13 +84,14 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let head = g * hpg + row % hpg;
     let ok = tok < p.t;
 
-    // Q tile as f16 pairs: CH/2 pairs per invocation.
+    // Q tile as f16 pairs: this invocation's CH dims of its row.
     {
-        let qb = tok * p.q_stride + head * HD + chunk;
-        for (var j = 0u; j < CH / 2u; j++) {
-            var v = vec2<f32>(0.0);
-            if (ok) { v = vec2<f32>(q[qb + 2u * j], q[qb + 2u * j + 1u]); }
-            qs[row * HP + chunk / 2u + j] = pack2x16float(v);
+        let qb = (tok * p.q_stride + head * HD + chunk) / 4u;
+        for (var i = 0u; i < NV; i++) {
+            var v = vec4<f32>(0.0);
+            if (ok) { v = q[qb + i]; }
+            qs[row * HP + chunk / 2u + 2u * i] = pack2x16float(v.xy);
+            qs[row * HP + chunk / 2u + 2u * i + 1u] = pack2x16float(v.zw);
         }
     }
     if (li < tb) {
@@ -118,36 +139,39 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         if (!workgroupUniformLoad(&tile_any)) {
             continue;
         }
-        // K tile as f16 pairs.
-        for (var e = li; e < KB * HP; e += 128u) {
-            let kk = e / HP;
-            let d2 = e % HP;
-            let j = j0 + kk;
-            var v = vec2<f32>(0.0);
-            if (j < p.t) {
-                let b = j * kv_stride + kb0 + 2u * d2;
-                v = vec2<f32>(kv[b], kv[b + 1u]);
-            }
-            ks[e] = pack2x16float(v);
-        }
+        stage_kv(li, j0, 0u, g);
         workgroupBarrier();
 
         // One full score per invocation.
         {
-            var acc = 0.0;
+            // Four independent partial sums: one chain of HP dependent adds
+            // is latency-bound.
+            var a0 = 0.0;
+            var a1 = 0.0;
+            var a2 = 0.0;
+            var a3 = 0.0;
             let qb = row * HP;
             let kb = key * HP;
-            for (var i = 0u; i < HP; i++) {
-                acc += dot(unpack2x16float(qs[qb + i]), unpack2x16float(ks[kb + i]));
+            for (var i = 0u; i < HP; i += 4u) {
+                a0 += dot(unpack2x16float(qs[qb + i]), unpack2x16float(kvs[kb + i]));
+                a1 += dot(unpack2x16float(qs[qb + i + 1u]), unpack2x16float(kvs[kb + i + 1u]));
+                a2 += dot(unpack2x16float(qs[qb + i + 2u]), unpack2x16float(kvs[kb + i + 2u]));
+                a3 += dot(unpack2x16float(qs[qb + i + 3u]), unpack2x16float(kvs[kb + i + 3u]));
             }
+            let acc = (a0 + a1) + (a2 + a3);
             let vis = visible(qpos[row / hpg], qseq[row / hpg], kpos[key], kseq[key]);
             s[li] = select(NEG, acc, vis);
         }
         workgroupBarrier();
+        stage_kv(li, j0, 1u, g);
 
-        // Online softmax for this invocation's row, then P.V on its CH dims.
+        // Online softmax: every invocation of a row tracks the same running
+        // max m and sum l (same tiles, same order), so the rescale is
+        // computed redundantly but consistently; exp(score - m) is taken
+        // once per (row, key) by the invocation that scored it.
         var mt = NEG;
         for (var k = 0u; k < KB; k++) { mt = max(mt, s[row * KB + k]); }
+        var pr = 0.0;
         if (mt > NEG * 0.5) {
             if (mt > m) {
                 let f = exp(m - mt);
@@ -155,15 +179,23 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
                 for (var i = 0u; i < NV; i++) { o[i] *= f; }
                 m = mt;
             }
+            let sc = s[li];
+            if (sc > NEG * 0.5) { pr = exp(sc - m); }
+        }
+        ps[li] = pr;
+        workgroupBarrier();
+
+        // P.V on this invocation's CH dims of its row.
+        if (mt > NEG * 0.5) {
             for (var k = 0u; k < KB; k++) {
-                let sc = s[row * KB + k];
-                if (sc > NEG * 0.5) {
-                    let pr = exp(sc - m);
-                    l += pr;
-                    let vb = (j0 + k) * kv_stride + vb0 + chunk;
+                let pk = ps[row * KB + k];
+                if (pk > 0.0) {
+                    l += pk;
+                    let vb = k * HP + chunk / 2u;
                     for (var i = 0u; i < NV; i++) {
-                        let b = vb + 4u * i;
-                        o[i] += pr * vec4<f32>(kv[b], kv[b + 1u], kv[b + 2u], kv[b + 3u]);
+                        let a = unpack2x16float(kvs[vb + 2u * i]);
+                        let b = unpack2x16float(kvs[vb + 2u * i + 1u]);
+                        o[i] += pk * vec4<f32>(a.x, a.y, b.x, b.y);
                     }
                 }
             }
@@ -171,15 +203,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     }
 
     if (ok) {
-        let ob = tok * heads * HD + head * HD + chunk;
+        let ob = (tok * heads * HD + head * HD + chunk) / 4u;
         let inv = 1.0 / l;
         for (var i = 0u; i < NV; i++) {
-            let v = o[i] * inv;
-            let b = ob + 4u * i;
-            out[b] = v.x;
-            out[b + 1u] = v.y;
-            out[b + 2u] = v.z;
-            out[b + 3u] = v.w;
+            out[ob + i] = o[i] * inv;
         }
     }
 }

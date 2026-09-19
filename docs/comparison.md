@@ -102,6 +102,7 @@ state again, branches only (the prefix stays resident in the KV cache).
 | grande native, wgpu engine | gemma-4-e2b-wgpu Q4_0 | 5 Q ticket | 313 | 1.47 s | |
 | grande browser, wgpu engine, **f16-tile matmul** (pruned model; same session: previous kernels 1.18–1.42 s / 2.56–2.90 s) | gemma-4-e2b-wgpu-ja Q4_0 (1.2 GB) | 5 Q ticket / 8 Q contract | 313 / 639 | **1.02 s / 2.3 s** | |
 | grande native, wgpu engine, f16-tile matmul (previous kernels 1.53 s) | gemma-4-e2b-wgpu-ja Q4_0 | 5 Q ticket | 313 | **0.88 s** (1.12 s with `GRANDE_WGPU_CHECKED=1`, naga's bounds clamps on) | |
+| grande native, wgpu engine, + attention rewrite and 32-row matmul tiles | gemma-4-e2b-wgpu-ja Q4_0 | 5 Q ticket | 313 | **0.82 s** (GPU 782 ms: gate_up 393, down 202, qkv 55, o 51, attention 46, rest 35) | |
 | grande browser, wgpu engine, **E4B** (2 K/V heads; machine shared with a llama.cpp build, so an upper bound) | gemma-4-e4b-wgpu-ja Q4_0 (2.5 GB) | 5 Q ticket / 8 Q contract | 313 / 674 | 2.5 s / 7–10 s | |
 | grande native, wgpu engine, E4B (llama.cpp 2.2 s on the same GGUF, same conditions) | gemma-4-e4b-wgpu-ja Q4_0 | 5 Q ticket | 313 | 1.8 s | |
 | **reflex browser** (WebGPU) | Qwen3.5-0.8B q4f16 | 5 Q ticket (same JSON) | 1,114 / 324 warm | 6.7 s | 3.5 s |
@@ -245,3 +246,6 @@ Speed (E2B, M4):
 | wgpu matmul: f16-pair tiles, K step 32 (one Q4 block), 128-invocation workgroups, vec loads | native 1.53 → 1.12 s, browser 1.2–1.4 → 1.0 s (ticket); GPU time is 90% matmul, gate_up 714 → 533 ms, down 402 → 263 ms | done |
 | wgpu matmul: register prefetch of the next tile; f32 X tile | prefetch +20% (matmul) to +140% (gated: 64 accumulators + 44 staged registers spill); f32 X tile +30% | measured, rejected |
 | wgpu native: skip naga's per-index bounds clamps (`create_shader_module_trusted`; `GRANDE_WGPU_CHECKED=1` puts them back) | 1.12 → 0.88 s, same answers; the browser cannot (Tint's clamps are not optional) | done, default |
+| wgpu attention: K and V staged as f16 and read as vec4, exp once per (row, key), 4 score accumulators, 16 x 8 tiles | 88 → 46 ms over 35 layers (16 x 16: 67, 32 x 8: 101, 8 x 16: 68 at HD 256; the HD 512 layers gained most, 64 → 46 total) | done |
+| wgpu matmul: 32-row tiles (twice the workgroups on the small-N layers) | down 222 → 202 ms, o 56 → 51, pl_mm_gate 13 → 9; gated kernel unchanged at 64x64 / 32x128 / 256-invocation 4x4x2 (±3%) | done |
+| wgpu matmul: row tiles as the fast dispatch axis (weight-tile reuse); `enable f16` tiles with f16 FMAs and per-step f16 partials | +7%; +5% (the M4 has no double-rate f16, and unpack2x16float was already free) | measured, rejected |

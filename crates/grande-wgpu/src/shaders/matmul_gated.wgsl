@@ -1,8 +1,10 @@
 // act[M, F] = gelu_tanh(X * Wg^T) * (X * Wu^T): the gate and up projections
-// and the GeGLU in one kernel. Same f16-pair tiling as matmul.wgsl on a 64x64
-// output tile: 128 invocations each own 4 consecutive rows x 8 consecutive
-// cols of both products (64 accumulators). Only the activation is written.
-// Both weights share one storage type (QUANT, see weight.wgsl).
+// and the GeGLU in one kernel. Same f16-pair tiling as matmul.wgsl on a
+// 32x128 output tile: 128 invocations each own 4 consecutive rows x 8
+// consecutive cols of both products (64 accumulators); the first 64 stage the
+// gate tile and the rest the up tile. Only the activation is written. Both
+// weights share one storage type (QUANT, see weight.wgsl). A 64x64 tile and a
+// 256-invocation 4x4x2 variant measured the same on an M4 (+-3%).
 
 struct Params { m: u32, n: u32, k: u32, _pad: u32 }
 
@@ -14,21 +16,22 @@ struct Params { m: u32, n: u32, k: u32, _pad: u32 }
 @group(0) @binding(5) var<storage, read> su: array<u32>;
 @group(0) @binding(6) var<storage, read_write> y: array<f32>;
 
-const BM: u32 = 64u;
-const BN: u32 = 64u;
+const BM: u32 = 32u;
+const BN: u32 = 128u;
 const BK: u32 = 32u;
 const KP: u32 = BK / 2u;
-const G: u32 = 16u;  // vec4<u32> per kp row of every tile (BM / 4 = BN / 4)
+const XG: u32 = BM / 4u;  // vec4<u32> per kp row of xs
+const G: u32 = BN / 4u;   // vec4<u32> per kp row of gs / us
 
-var<workgroup> xs: array<vec4<u32>, KP * G>;
+var<workgroup> xs: array<vec4<u32>, KP * XG>;
 var<workgroup> gs: array<vec4<u32>, KP * G>;
 var<workgroup> us: array<vec4<u32>, KP * G>;
 
-// As matmul.wgsl: X is one k pair of two row quads per invocation; the
+// As matmul.wgsl: X is one k pair of one row quad per invocation; the
 // weight tiles are staged four columns x half the k pairs per invocation,
-// gate by invocations 0..32 and up by 32..64, with whole-vec4 stores.
+// gate by invocations 0..64 and up by 64..128, with whole-vec4 stores.
 struct Stage {
-    xr: array<vec4<u32>, 2>,
+    xr: array<vec4<u32>, 1>,
     wq: array<vec4<u32>, 8>,
     d: vec4<f32>,
 }
@@ -36,20 +39,20 @@ struct Stage {
 fn load_stage(li: u32, row0: u32, col0: u32, k0: u32) -> Stage {
     var s: Stage;
     let kp = li % KP;
-    for (var i = 0u; i < 2u; i++) {
-        let g = li / KP + 8u * i;
+    {
+        let g = li / KP;
         var v = vec4<u32>(0u);
         for (var j = 0u; j < 4u; j++) {
             let r = row0 + 4u * g + j;
             if (r < p.m) { v[j] = pack2x16float(x[(r * p.k + k0) / 2u + kp]); }
         }
-        s.xr[i] = v;
+        s.xr[0] = v;
     }
     s.d = vec4<f32>(0.0);
     for (var i = 0u; i < 8u; i++) { s.wq[i] = vec4<u32>(0u); }
-    if (li < 64u) {
-        let up = li >= 32u;
-        let g = (li % 32u) / 2u;
+    {
+        let up = li >= 64u;
+        let g = (li % 64u) / 2u;
         let h = li % 2u;
         for (var j = 0u; j < 4u; j++) {
             let n = col0 + 4u * g + j;
@@ -92,11 +95,9 @@ fn stage_pair(s: Stage, h: u32, j: u32, jj: u32) -> u32 {
 
 fn store_stage(li: u32, s: Stage) {
     let kp = li % KP;
-    for (var i = 0u; i < 2u; i++) {
-        xs[kp * G + li / KP + 8u * i] = s.xr[i];
-    }
-    if (li < 64u) {
-        let g = (li % 32u) / 2u;
+    xs[kp * XG + li / KP] = s.xr[0];
+    {
+        let g = (li % 64u) / 2u;
         let h = li % 2u;
         for (var jj = 0u; jj < 8u; jj++) {
             let v = vec4<u32>(
@@ -105,7 +106,7 @@ fn store_stage(li: u32, s: Stage) {
                 stage_pair(s, h, 2u, jj),
                 stage_pair(s, h, 3u, jj),
             );
-            if (li >= 32u) { us[(8u * h + jj) * G + g] = v; } else { gs[(8u * h + jj) * G + g] = v; }
+            if (li >= 64u) { us[(8u * h + jj) * G + g] = v; } else { gs[(8u * h + jj) * G + g] = v; }
         }
     }
 }
@@ -121,8 +122,8 @@ fn gelu(x: vec4<f32>) -> vec4<f32> {
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let row0 = wgid.y * BM;
     let col0 = wgid.x * BN;
-    let tr = li / 8u; // rows tr*4 .. tr*4+4
-    let tc = li % 8u; // cols tc*8 .. tc*8+8
+    let tr = li / 16u; // rows tr*4 .. tr*4+4
+    let tc = li % 16u; // cols tc*8 .. tc*8+8
     var g0lo = vec4<f32>(0.0); var g0hi = vec4<f32>(0.0); var u0lo = vec4<f32>(0.0); var u0hi = vec4<f32>(0.0);
     var g1lo = vec4<f32>(0.0); var g1hi = vec4<f32>(0.0); var u1lo = vec4<f32>(0.0); var u1hi = vec4<f32>(0.0);
     var g2lo = vec4<f32>(0.0); var g2hi = vec4<f32>(0.0); var u2lo = vec4<f32>(0.0); var u2hi = vec4<f32>(0.0);
@@ -133,7 +134,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_index)
         store_stage(li, load_stage(li, row0, col0, kt * BK));
         workgroupBarrier();
         for (var kp = 0u; kp < KP; kp++) {
-            let xa = xs[kp * G + tr];
+            let xa = xs[kp * XG + tr];
             let ga = gs[kp * G + 2u * tc];
             let gb = gs[kp * G + 2u * tc + 1u];
             let ua = us[kp * G + 2u * tc];

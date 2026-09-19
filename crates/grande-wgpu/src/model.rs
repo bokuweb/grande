@@ -219,10 +219,10 @@ impl Config {
             );
         }
         // The attention workgroup covers whole tokens of one KV head's query
-        // heads, 8 rows at a time (attention.wgsl).
-        if !matches!(self.heads / self.kv_heads, 1 | 2 | 4 | 8) {
+        // heads, ROWS = 16 rows at a time (attention.wgsl).
+        if !matches!(self.heads / self.kv_heads, 1 | 2 | 4 | 8 | 16) {
             bail!(
-                "query heads per KV head must divide 8 (got {} / {})",
+                "query heads per KV head must divide 16 (got {} / {})",
                 self.heads,
                 self.kv_heads
             );
