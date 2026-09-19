@@ -255,15 +255,17 @@ impl Kernels {
                 source: wgpu::ShaderSource::Wgsl(src.into()),
             };
             #[cfg(not(target_arch = "wasm32"))]
-            let unchecked = std::env::var("GRANDE_WGPU_UNCHECKED").is_ok();
+            let unchecked = std::env::var("GRANDE_WGPU_CHECKED").is_err();
             #[cfg(target_arch = "wasm32")]
             let unchecked = false;
             let module = if unchecked {
-                // Native only, opt-in: naga clamps every array index in the
+                // Native default: naga clamps every array index in the
                 // generated MSL / SPIR-V (`min(i, len - 1)`), which costs ~20%
-                // on the E2B pass (M4: 1.12 -> 0.88 s). The kernels guard m / n
-                // / k themselves, so an out-of-range access would be an engine
-                // bug; the clamps stay on by default until that is a promise.
+                // on the E2B pass (M4: 1.12 -> 0.88 s). The kernels guard
+                // m / n / k themselves and the shapes come from the engine, so
+                // an out-of-range access would be an engine bug; set
+                // GRANDE_WGPU_CHECKED=1 to get the clamps back when chasing
+                // one. wasm always runs Tint's checks.
                 unsafe {
                     self.device
                         .create_shader_module_trusted(desc, wgpu::ShaderRuntimeChecks::unchecked())
