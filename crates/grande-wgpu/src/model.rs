@@ -221,7 +221,7 @@ impl Config {
             if hd != 256 && hd != 512 {
                 bail!("layer {i}: head_dim must be 256 or 512 (got {hd})");
             }
-            if self.rope_dims[i] > hd || self.rope_dims[i] % 2 != 0 {
+            if self.rope_dims[i] > hd || !self.rope_dims[i].is_multiple_of(2) {
                 bail!(
                     "layer {i}: rope_dims {} for head_dim {hd}",
                     self.rope_dims[i]
@@ -234,10 +234,10 @@ impl Config {
                 );
             }
         }
-        if self.d % 32 != 0 || self.ff.iter().any(|f| f % 32 != 0) {
+        if !self.d.is_multiple_of(32) || self.ff.iter().any(|f| !f.is_multiple_of(32)) {
             bail!("hidden_size and intermediate_size must be multiples of 32");
         }
-        if self.per_layer_dim % 32 != 0 {
+        if !self.per_layer_dim.is_multiple_of(32) {
             bail!("hidden_size_per_layer_input must be a multiple of 32");
         }
         Ok(())
@@ -397,7 +397,7 @@ impl QTensor {
 
     /// Q8_0 quantization of `values` (the GGUF rule: scale = max|v| / 127).
     pub fn quantize_q8(shape: Vec<usize>, values: &[f32]) -> Result<Self> {
-        if values.len() % BLOCK != 0 {
+        if !values.len().is_multiple_of(BLOCK) {
             bail!("q8: {} values is not a multiple of {BLOCK}", values.len());
         }
         let mut data = Vec::with_capacity(values.len());
@@ -423,7 +423,7 @@ impl QTensor {
     /// Q4_0 quantization of `values` (the GGUF rule: scale = max / -8 where
     /// max is the signed value of largest magnitude).
     pub fn quantize_q4(shape: Vec<usize>, values: &[f32]) -> Result<Self> {
-        if values.len() % BLOCK != 0 {
+        if !values.len().is_multiple_of(BLOCK) {
             bail!("q4: {} values is not a multiple of {BLOCK}", values.len());
         }
         let mut data = Vec::with_capacity(values.len() / 2);

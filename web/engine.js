@@ -232,6 +232,8 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
       if (!probe?.ok) {
         base = `https://huggingface.co/${spec.hub}/resolve/main/`;
         here = false;
+        const hub = await fetch(`${base}config.json`, { method: "HEAD" }).catch(() => null);
+        if (!hub?.ok) throw new Error(`${spec.id}: not in ./models/ and https://huggingface.co/${spec.hub} is not published (see web/README.md)`);
       }
     }
     if (here) {

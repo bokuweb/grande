@@ -264,7 +264,8 @@ impl WgpuLoader {
             .inner
             .as_mut()
             .ok_or_else(|| JsError::new("loader already finished"))?;
-        let dtype = grande_wgpu::Dtype::parse(dtype).map_err(|e| JsError::new(&format!("{e:#}")))?;
+        let dtype =
+            grande_wgpu::Dtype::parse(dtype).map_err(|e| JsError::new(&format!("{e:#}")))?;
         let t = grande_wgpu::QTensor::from_raw(
             dtype,
             shape.into_iter().map(|x| x as usize).collect(),

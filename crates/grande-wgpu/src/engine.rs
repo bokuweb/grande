@@ -536,7 +536,7 @@ impl EngineBuilder {
         if t.shape.len() == 1 && t.dtype != Dtype::F16 {
             bail!("{name}: 1-D tensors must be f16");
         }
-        if t.shape.len() == 2 && t.shape[1] % 32 != 0 {
+        if t.shape.len() == 2 && !t.shape[1].is_multiple_of(32) {
             bail!(
                 "{name}: inner dimension {} is not a multiple of 32",
                 t.shape[1]
@@ -544,7 +544,7 @@ impl EngineBuilder {
         }
         let upload = |label: &str, bytes: &[u8]| {
             let mut padded = bytes.to_vec();
-            while padded.len() % 4 != 0 {
+            while !padded.len().is_multiple_of(4) {
                 padded.push(0);
             }
             self.device
