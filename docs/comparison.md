@@ -97,6 +97,9 @@ state again, branches only (the prefix stays resident in the KV cache).
 | grande browser, trained, **wgpu engine** (GPU shared with a training job; ONNX path interleaved: 0.86–1.35 s) | grande-270m-ja-wgpu f16 (320 MB) | 5 Q ticket | 240 | 0.17–0.55 s | |
 | grande browser, trained, wgpu engine (same conditions; ONNX 2.9–4.0 s) | grande-270m-ja-wgpu f16 | 8 Q contract | 522 | 0.41–0.74 s | |
 | grande browser, trained | grande-270m-ja q8 | 8 Q contract | 2,102 | | 923 ms |
+| **grande browser, wgpu engine** (one pass, no resident state) | gemma-4-e2b-wgpu Q4_0 (2.8 GB) | 5 Q ticket | 313 | 1.16 s | |
+| grande browser, wgpu engine | gemma-4-e2b-wgpu Q4_0 | 8 Q contract | 639 | 2.5 s | |
+| grande native, wgpu engine | gemma-4-e2b-wgpu Q4_0 | 5 Q ticket | 313 | 1.47 s | |
 | **reflex browser** (WebGPU) | Qwen3.5-0.8B q4f16 | 5 Q ticket (same JSON) | 1,114 / 324 warm | 6.7 s | 3.5 s |
 | reflex Python (published) | Qwen3.5-4B bf16, GB10 | 4 Q | | | ~100 ms |
 | kev (published) | 0.5B, M5 | 6 Q | | ~160 ms | |

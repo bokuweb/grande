@@ -1,8 +1,11 @@
-// Gemma RMSNorm: y = x * rsqrt(mean(x^2) + eps) * (1 + w), one workgroup per row.
-// residual = 1 adds the result into `out` (the post-attention / post-feedforward
-// norms feed the residual stream), otherwise `out` is overwritten.
+// Gemma RMSNorm: y = x * rsqrt(mean(x^2) + eps) * (offset + w), one workgroup
+// per row. offset is 1 for Gemma 3 (weights stored as w, applied as 1 + w)
+// and 0 for Gemma 4 / GGUF-derived weights. residual = 1 adds the result
+// into `out` (the post-attention / post-feedforward norms feed the residual
+// stream), otherwise `out` is overwritten; the row is then multiplied by
+// `scale` (Gemma 4's per-layer output scalar, 1 elsewhere).
 
-struct Params { t: u32, d: u32, eps: f32, residual: u32 }
+struct Params { t: u32, d: u32, eps: f32, residual: u32, offset: f32, scale: f32, _p0: u32, _p1: u32 }
 
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
@@ -31,11 +34,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) l: v
     for (var i = l.x; i < p.d; i += 256u) {
         let wv = unpack2x16float(w[i / 2u]);
         let wi = select(wv.x, wv.y, (i & 1u) == 1u);
-        let y = x[base + i] * inv * (1.0 + wi);
+        let y = x[base + i] * inv * (p.offset + wi);
         if (p.residual == 1u) {
-            out[base + i] = out[base + i] + y;
+            out[base + i] = (out[base + i] + y) * p.scale;
         } else {
-            out[base + i] = y;
+            out[base + i] = y * p.scale;
         }
     }
 }

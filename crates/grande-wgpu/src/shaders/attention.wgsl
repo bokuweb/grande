@@ -4,34 +4,40 @@
 // sliding-window layers) within the window. That is the isolation rule the
 // llama.cpp backend gets from its per-sequence KV cache.
 //
-// One KV head shared by `heads` query heads (Gemma 3 270M: 4 : 1). A workgroup
-// of 128 handles 16 query rows = (16 / heads) tokens x heads with their Q held
-// as f16 in workgroup memory, and streams keys 8 at a time. A tile no row can
-// see is skipped (keys after the block, other branches). Otherwise each
-// invocation computes one full (row, key) score, then owns 32 output dims of
-// one row for the online softmax and P.V (V read straight from the qkv
-// buffer). Workgroup memory ~12.5 KB, so several workgroups share a core.
+// One KV head shared by `heads` query heads. Q is read from the layer's fused
+// projection buffer (row stride q_stride), K and V from a K/V buffer
+// [t][2 x HD] that may belong to an earlier layer (Gemma 4 shares K/V). A
+// workgroup of 128 handles ROWS query rows = (ROWS / heads) tokens x heads
+// with their Q held as f16 in workgroup memory, and streams keys KB at a time
+// (ROWS x KB = 128). A tile no row can see is skipped (keys after the block,
+// other branches). Otherwise each invocation computes one full (row, key)
+// score, then owns HD/KB output dims of one row for the online softmax and
+// P.V. HD, ROWS and KB are substituted by the engine: 8 x 16 at HD 256
+// (~12.5 KB of workgroup memory), 16 x 8 at HD 512 (~24.5 KB).
 
-struct Params { t: u32, heads: u32, window: u32, _pad: u32 }
+struct Params { t: u32, heads: u32, window: u32, q_stride: u32 }
 
 @group(0) @binding(0) var<uniform> p: Params;
-@group(0) @binding(1) var<storage, read> qkv: array<f32>;
-@group(0) @binding(2) var<storage, read> tok_meta: array<i32>;
-@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+@group(0) @binding(1) var<storage, read> q: array<f32>;
+@group(0) @binding(2) var<storage, read> kv: array<f32>;
+@group(0) @binding(3) var<storage, read> tok_meta: array<i32>;
+@group(0) @binding(4) var<storage, read_write> out: array<f32>;
 
 const HD: u32 = 256u;
-const HP: u32 = 128u;  // f16 pairs per head row
-const ROWS: u32 = 16u; // query rows per workgroup = tokens * heads
-const KB: u32 = 8u;    // keys per tile
+const ROWS: u32 = 8u;      // query rows per workgroup = tokens * heads
+const KB: u32 = 16u;       // keys per tile; also invocations per row
+const HP: u32 = HD / 2u;   // f16 pairs per head row
+const CH: u32 = HD / KB;   // output dims per invocation
+const NV: u32 = CH / 4u;   // vec4 accumulators per invocation
 const NEG: f32 = -1.0e30;
 
-var<workgroup> qs: array<u32, 2048>;  // [ROWS][HP] f16 pairs
-var<workgroup> ks: array<u32, 1024>;  // [KB][HP] f16 pairs
-var<workgroup> s: array<f32, 128>;    // [ROWS][KB] masked scores
-var<workgroup> kpos: array<i32, 8>;
-var<workgroup> kseq: array<i32, 8>;
-var<workgroup> qpos: array<i32, 16>;
-var<workgroup> qseq: array<i32, 16>;
+var<workgroup> qs: array<u32, ROWS * HP>;  // [ROWS][HP] f16 pairs
+var<workgroup> ks: array<u32, KB * HP>;    // [KB][HP] f16 pairs
+var<workgroup> s: array<f32, 128>;         // [ROWS][KB] masked scores
+var<workgroup> kpos: array<i32, KB>;
+var<workgroup> kseq: array<i32, KB>;
+var<workgroup> qpos: array<i32, ROWS>;
+var<workgroup> qseq: array<i32, ROWS>;
 var<workgroup> tile_any: bool;
 
 fn visible(qp: i32, qs_: i32, kp: i32, ks_: i32) -> bool {
@@ -41,23 +47,22 @@ fn visible(qp: i32, qs_: i32, kp: i32, ks_: i32) -> bool {
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let heads = p.heads;
-    let stride = (heads + 2u) * HD;
     let tb = ROWS / heads;
     let tok0 = wg.x * tb;
 
-    let row = li / KB;          // 0..16, both roles
+    let row = li / KB;          // 0..ROWS, both roles
     let key = li % KB;          // score role
-    let chunk = (li % 8u) * 32u; // output role: 32 dims of `row`
+    let chunk = key * CH;       // output role: CH dims of `row`
     let tok = tok0 + row / heads;
     let head = row % heads;
     let ok = tok < p.t;
 
-    // Q tile as f16 pairs: 16 pairs per invocation.
+    // Q tile as f16 pairs: CH/2 pairs per invocation.
     {
-        let qb = tok * stride + head * HD + chunk;
-        for (var j = 0u; j < 16u; j++) {
+        let qb = tok * p.q_stride + head * HD + chunk;
+        for (var j = 0u; j < CH / 2u; j++) {
             var v = vec2<f32>(0.0);
-            if (ok) { v = vec2<f32>(qkv[qb + 2u * j], qkv[qb + 2u * j + 1u]); }
+            if (ok) { v = vec2<f32>(q[qb + 2u * j], q[qb + 2u * j + 1u]); }
             qs[row * HP + chunk / 2u + j] = pack2x16float(v);
         }
     }
@@ -74,14 +79,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 
     var m = NEG;
     var l = 0.0;
-    var o0 = vec4<f32>(0.0);
-    var o1 = vec4<f32>(0.0);
-    var o2 = vec4<f32>(0.0);
-    var o3 = vec4<f32>(0.0);
-    var o4 = vec4<f32>(0.0);
-    var o5 = vec4<f32>(0.0);
-    var o6 = vec4<f32>(0.0);
-    var o7 = vec4<f32>(0.0);
+    var o: array<vec4<f32>, NV>;
+    for (var i = 0u; i < NV; i++) { o[i] = vec4<f32>(0.0); }
 
     let ntiles = (p.t + KB - 1u) / KB;
     for (var tile = 0u; tile < ntiles; tile++) {
@@ -103,8 +102,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         if (li == 0u) {
             var any = false;
             for (var k = 0u; k < KB; k++) {
-                for (var q = 0u; q < tb; q++) {
-                    any = any || visible(qpos[q], qseq[q], kpos[k], kseq[k]);
+                for (var qi = 0u; qi < tb; qi++) {
+                    any = any || visible(qpos[qi], qseq[qi], kpos[k], kseq[k]);
                 }
             }
             tile_any = any;
@@ -112,15 +111,15 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         if (!workgroupUniformLoad(&tile_any)) {
             continue;
         }
-        // K tile as f16 pairs: 8 pairs per invocation.
+        // K tile as f16 pairs.
         for (var e = li; e < KB * HP; e += 128u) {
             let kk = e / HP;
             let d2 = e % HP;
             let j = j0 + kk;
             var v = vec2<f32>(0.0);
             if (j < p.t) {
-                let b = j * stride + heads * HD + 2u * d2;
-                v = vec2<f32>(qkv[b], qkv[b + 1u]);
+                let b = j * 2u * HD + 2u * d2;
+                v = vec2<f32>(kv[b], kv[b + 1u]);
             }
             ks[e] = pack2x16float(v);
         }
@@ -139,14 +138,14 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         }
         workgroupBarrier();
 
-        // Online softmax for this invocation's row, then P.V on its 32 dims.
+        // Online softmax for this invocation's row, then P.V on its CH dims.
         var mt = NEG;
         for (var k = 0u; k < KB; k++) { mt = max(mt, s[row * KB + k]); }
         if (mt > NEG * 0.5) {
             if (mt > m) {
                 let f = exp(m - mt);
                 l = l * f;
-                o0 *= f; o1 *= f; o2 *= f; o3 *= f; o4 *= f; o5 *= f; o6 *= f; o7 *= f;
+                for (var i = 0u; i < NV; i++) { o[i] *= f; }
                 m = mt;
             }
             for (var k = 0u; k < KB; k++) {
@@ -154,15 +153,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
                 if (sc > NEG * 0.5) {
                     let pr = exp(sc - m);
                     l += pr;
-                    let vb = (j0 + k) * stride + (heads + 1u) * HD + chunk;
-                    o0 += pr * vec4<f32>(qkv[vb], qkv[vb + 1u], qkv[vb + 2u], qkv[vb + 3u]);
-                    o1 += pr * vec4<f32>(qkv[vb + 4u], qkv[vb + 5u], qkv[vb + 6u], qkv[vb + 7u]);
-                    o2 += pr * vec4<f32>(qkv[vb + 8u], qkv[vb + 9u], qkv[vb + 10u], qkv[vb + 11u]);
-                    o3 += pr * vec4<f32>(qkv[vb + 12u], qkv[vb + 13u], qkv[vb + 14u], qkv[vb + 15u]);
-                    o4 += pr * vec4<f32>(qkv[vb + 16u], qkv[vb + 17u], qkv[vb + 18u], qkv[vb + 19u]);
-                    o5 += pr * vec4<f32>(qkv[vb + 20u], qkv[vb + 21u], qkv[vb + 22u], qkv[vb + 23u]);
-                    o6 += pr * vec4<f32>(qkv[vb + 24u], qkv[vb + 25u], qkv[vb + 26u], qkv[vb + 27u]);
-                    o7 += pr * vec4<f32>(qkv[vb + 28u], qkv[vb + 29u], qkv[vb + 30u], qkv[vb + 31u]);
+                    let vb = (j0 + k) * 2u * HD + HD + chunk;
+                    for (var i = 0u; i < NV; i++) {
+                        let b = vb + 4u * i;
+                        o[i] += pr * vec4<f32>(kv[b], kv[b + 1u], kv[b + 2u], kv[b + 3u]);
+                    }
                 }
             }
         }
@@ -171,20 +166,13 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     if (ok) {
         let ob = tok * heads * HD + head * HD + chunk;
         let inv = 1.0 / l;
-        store4(ob, o0 * inv);
-        store4(ob + 4u, o1 * inv);
-        store4(ob + 8u, o2 * inv);
-        store4(ob + 12u, o3 * inv);
-        store4(ob + 16u, o4 * inv);
-        store4(ob + 20u, o5 * inv);
-        store4(ob + 24u, o6 * inv);
-        store4(ob + 28u, o7 * inv);
+        for (var i = 0u; i < NV; i++) {
+            let v = o[i] * inv;
+            let b = ob + 4u * i;
+            out[b] = v.x;
+            out[b + 1u] = v.y;
+            out[b + 2u] = v.z;
+            out[b + 3u] = v.w;
+        }
     }
-}
-
-fn store4(b: u32, v: vec4<f32>) {
-    out[b] = v.x;
-    out[b + 1u] = v.y;
-    out[b + 2u] = v.z;
-    out[b + 3u] = v.w;
 }
