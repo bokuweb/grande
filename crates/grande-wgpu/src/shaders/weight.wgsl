@@ -36,3 +36,19 @@ fn dq4hi(q: u32, d: f32) -> vec4<f32> {
     let v = vec4<u32>((q >> 4u) & 0xfu, (q >> 12u) & 0xfu, (q >> 20u) & 0xfu, (q >> 28u) & 0xfu);
     return (vec4<f32>(v) - 8.0) * d;
 }
+
+// Two consecutive Q8 codes at bit offset b (0 or 16) of word q, scaled and
+// packed as an f16 pair.
+fn dq8_pair(q: u32, b: u32, d: f32) -> u32 {
+    let lo = f32(i32(q << (24u - b)) >> 24u) * d;
+    let hi = f32(i32(q << (16u - b)) >> 24u) * d;
+    return pack2x16float(vec2<f32>(lo, hi));
+}
+
+// Two Q4 codes at bit offsets s and s + 8 of word q (the nibble layout puts
+// consecutive elements one byte apart), scaled and packed as an f16 pair.
+fn dq4_pair(q: u32, s: u32, d: f32) -> u32 {
+    let lo = (f32((q >> s) & 0xfu) - 8.0) * d;
+    let hi = (f32((q >> (s + 8u)) & 0xfu) - 8.0) * d;
+    return pack2x16float(vec2<f32>(lo, hi));
+}

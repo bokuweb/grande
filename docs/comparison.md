@@ -100,6 +100,8 @@ state again, branches only (the prefix stays resident in the KV cache).
 | **grande browser, wgpu engine** (one pass, no resident state) | gemma-4-e2b-wgpu Q4_0 (2.8 GB) | 5 Q ticket | 313 | 1.16 s | |
 | grande browser, wgpu engine | gemma-4-e2b-wgpu Q4_0 | 8 Q contract | 639 | 2.5 s | |
 | grande native, wgpu engine | gemma-4-e2b-wgpu Q4_0 | 5 Q ticket | 313 | 1.47 s | |
+| grande browser, wgpu engine, **f16-tile matmul** (pruned model; same session: previous kernels 1.18–1.42 s / 2.56–2.90 s) | gemma-4-e2b-wgpu-ja Q4_0 (1.2 GB) | 5 Q ticket / 8 Q contract | 313 / 639 | **1.02 s / 2.3 s** | |
+| grande native, wgpu engine, f16-tile matmul (previous kernels 1.53 s) | gemma-4-e2b-wgpu-ja Q4_0 | 5 Q ticket | 313 | **1.12 s** (0.88 s with `GRANDE_WGPU_UNCHECKED=1`) | |
 | **reflex browser** (WebGPU) | Qwen3.5-0.8B q4f16 | 5 Q ticket (same JSON) | 1,114 / 324 warm | 6.7 s | 3.5 s |
 | reflex Python (published) | Qwen3.5-4B bf16, GB10 | 4 Q | | | ~100 ms |
 | kev (published) | 0.5B, M5 | 6 Q | | ~160 ms | |
@@ -231,3 +233,6 @@ Speed (E2B, M4):
 | smaller backbone | 270M is 11× faster than E2B (86 vs 1,010 ms warm) | done |
 | early exit (train with `--keep-layers`) | 270M 18 → 12 layers: 86 → 59 ms warm, −2 to −8 pts | done on 270M; E2B needs a GPU to train |
 | bigger GPU | prefill is compute-bound; a 4090-class GPU is ~30× an M4 | |
+| wgpu matmul: f16-pair tiles, K step 32 (one Q4 block), 128-invocation workgroups, vec loads | native 1.53 → 1.12 s, browser 1.2–1.4 → 1.0 s (ticket); GPU time is 90% matmul, gate_up 714 → 533 ms, down 402 → 263 ms | done |
+| wgpu matmul: register prefetch of the next tile; f32 X tile | prefetch +20% (matmul) to +140% (gated: 64 accumulators + 44 staged registers spill); f32 X tile +30% | measured, rejected |
+| wgpu native: skip naga's per-index bounds clamps (`GRANDE_WGPU_UNCHECKED=1`, `create_shader_module_trusted`) | 1.12 → 0.88 s, same answers; the browser cannot (Tint's clamps are not optional) | opt-in |
