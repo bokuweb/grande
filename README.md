@@ -11,8 +11,9 @@ grande targets Japanese, Gemma 4, quantized local inference, and (later) the
 browser. Design notes live in `life/idea/local-jev`.
 
 **Demo:** https://bokuweb.github.io/grande/ (WebGPU; nothing leaves the browser).
-Default model is the trained `grande-270m-ja` (211 MB, 5 questions in ~270 ms);
-Gemma 4 E2B zero-shot is selectable.
+Default model is Gemma 4 E2B zero-shot (3.4 GB, cached in the browser after
+the first visit); the trained `grande-270m-ja` (211 MB, 5 questions in
+~270 ms) is selectable.
 
 ## Status
 
