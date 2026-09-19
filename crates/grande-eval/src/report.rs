@@ -11,6 +11,61 @@ pub struct Row {
     pub pred: usize,
     pub candidate_mass: Option<f64>,
     pub ms: u128,
+    /// Predictions (original option index) under extra option orders, when
+    /// the run asked for permutations; the first entry is the natural order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permuted_preds: Vec<usize>,
+    /// Probabilities in original option order under each extra order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permuted_probs: Vec<Vec<f64>>,
+}
+
+/// Position-bias statistics over rows that carry permutations.
+#[derive(Debug, Clone, Serialize)]
+pub struct Permutation {
+    pub n: usize,
+    pub orders: usize,
+    /// Share of items whose argmax changed under at least one order.
+    pub flip_rate: f64,
+    /// Mean over items of the max L1 distance between any two orders'
+    /// distributions (original option indexing).
+    pub mean_max_l1: f64,
+}
+
+pub fn permutation(rows: &[Row]) -> Option<Permutation> {
+    let rows: Vec<&Row> = rows.iter().filter(|r| r.permuted_preds.len() > 1).collect();
+    if rows.is_empty() {
+        return None;
+    }
+    let orders = rows[0].permuted_preds.len();
+    let flips = rows
+        .iter()
+        .filter(|r| r.permuted_preds.iter().any(|&p| p != r.permuted_preds[0]))
+        .count();
+    let l1: f64 = rows
+        .iter()
+        .map(|r| {
+            let mut worst = 0.0f64;
+            for a in 0..r.permuted_probs.len() {
+                for b in a + 1..r.permuted_probs.len() {
+                    let d: f64 = r.permuted_probs[a]
+                        .iter()
+                        .zip(&r.permuted_probs[b])
+                        .map(|(x, y)| (x - y).abs())
+                        .sum();
+                    worst = worst.max(d);
+                }
+            }
+            worst
+        })
+        .sum::<f64>()
+        / rows.len() as f64;
+    Some(Permutation {
+        n: rows.len(),
+        orders,
+        flip_rate: flips as f64 / rows.len() as f64,
+        mean_max_l1: l1,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -85,6 +140,8 @@ pub struct Summary {
     pub test_scaled: Metrics,
     pub all_raw: Metrics,
     pub mean_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permutation: Option<Permutation>,
 }
 
 pub fn summarize(rows: &[Row]) -> Summary {
@@ -109,5 +166,6 @@ pub fn summarize(rows: &[Row]) -> Summary {
         test_scaled: metrics(&test, t),
         all_raw: metrics(rows, 1.0),
         mean_ms: rows.iter().map(|r| r.ms as f64).sum::<f64>() / rows.len().max(1) as f64,
+        permutation: permutation(rows),
     }
 }

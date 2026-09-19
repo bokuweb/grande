@@ -74,6 +74,10 @@ enum Cmd {
         out: PathBuf,
         #[arg(long, default_value_t = 2048)]
         n_ctx: u32,
+        /// Also re-ask each item under this many option orders (rotations,
+        /// alternating reversal) and report the argmax flip rate.
+        #[arg(long, default_value_t = 1)]
+        permute: usize,
     },
     /// Prefill throughput: a synthetic state of about N tokens and Q
     /// questions, packed, repeated a few times.
@@ -137,6 +141,7 @@ fn main() -> Result<()> {
             limit,
             out,
             n_ctx,
+            permute,
         } => {
             use grande_eval::jglue::{self, Task};
             use grande_eval::report::{summarize, Row};
@@ -202,13 +207,40 @@ fn main() -> Result<()> {
                 let (dists, diag) =
                     engine.distributions(&item.request, &Default::default(), Mode::Packed)?;
                 let (_, d) = &dists[0];
+                let pred = grande_core::math::argmax(&d.probs);
+                let mut permuted_preds = Vec::new();
+                let mut permuted_probs = Vec::new();
+                if permute > 1 {
+                    let k = d.probs.len();
+                    permuted_preds.push(pred);
+                    permuted_probs.push(d.probs.clone());
+                    for r in 1..permute {
+                        let mut order: Vec<usize> = (0..k).collect();
+                        order.rotate_left(r % k);
+                        if r % 2 == 1 {
+                            order.reverse();
+                        }
+                        let mut orders = indexmap::IndexMap::new();
+                        orders.insert("answer".to_string(), order.clone());
+                        let (pd, _) = engine.distributions(&item.request, &orders, Mode::Packed)?;
+                        let (pb, pdist) = &pd[0];
+                        let mut orig = vec![0.0; k];
+                        for (slot, &o) in pb.order.iter().enumerate() {
+                            orig[o] = pdist.probs[slot];
+                        }
+                        permuted_preds.push(grande_core::math::argmax(&orig));
+                        permuted_probs.push(orig);
+                    }
+                }
                 let row = Row {
                     id: item.id.clone(),
                     gold: item.gold,
                     logits: d.logits.clone(),
-                    pred: grande_core::math::argmax(&d.probs),
+                    pred,
                     candidate_mass: diag.candidate_mass.values().next().copied(),
                     ms: t.elapsed().as_millis(),
+                    permuted_preds,
+                    permuted_probs,
                 };
                 writeln!(file, "{}", serde_json::to_string(&row)?)?;
                 rows.push(row);
