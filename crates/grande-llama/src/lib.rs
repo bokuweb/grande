@@ -372,13 +372,6 @@ impl LlamaEngine {
         self.resident_prefix.as_deref() == Some(prefix)
     }
 
-    /// Drop the resident prefix (its serialized state stays cached). Lets a
-    /// benchmark measure a restore without switching states.
-    pub fn evict_resident(&mut self) {
-        self.resident_prefix = None;
-        self.ctx.clear_kv_cache();
-    }
-
     /// Decode the branches, and the prefix first when it is not resident, in
     /// as few `llama_decode` calls as `n_batch` allows (one, normally).
     ///
@@ -566,6 +559,13 @@ impl Backend for LlamaEngine {
 
     fn prefix_source(&self) -> Option<PrefixSource> {
         self.last_source
+    }
+
+    /// Drop the resident prefix; its serialized state stays cached, so the
+    /// next request over it measures a restore.
+    fn evict_resident(&mut self) {
+        self.resident_prefix = None;
+        self.ctx.clear_kv_cache();
     }
 }
 

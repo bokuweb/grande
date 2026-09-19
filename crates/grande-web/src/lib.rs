@@ -87,3 +87,83 @@ pub fn answer(
     };
     serde_json::to_string(&resp).map_err(|e| JsError::new(&e.to_string()))
 }
+
+/// The wgpu engine on WebGPU: the whole request (state prefix + isolated
+/// branches) is one forward pass, no KV-cache continuation, no padding.
+#[cfg(feature = "wgpu")]
+#[wasm_bindgen]
+pub struct WgpuEngine {
+    inner: grande_wgpu::Engine,
+}
+
+#[cfg(feature = "wgpu")]
+#[derive(Deserialize)]
+struct BranchIn {
+    tokens: Vec<u32>,
+    want: Vec<usize>,
+}
+
+#[cfg(feature = "wgpu")]
+#[wasm_bindgen]
+impl WgpuEngine {
+    /// `config` is the checkpoint's config.json, `weights` its
+    /// model.safetensors (f16 or f32). `capacity` is the packed-token budget
+    /// of the workspace, `max_rows` how many rows a request may read back.
+    pub async fn load(
+        config: &str,
+        weights: &[u8],
+        capacity: u32,
+        max_rows: u32,
+    ) -> Result<WgpuEngine, JsError> {
+        let w = grande_wgpu::Weights::load(config.as_bytes(), weights)
+            .map_err(|e| JsError::new(&format!("{e:#}")))?;
+        let inner = grande_wgpu::Engine::new(&w, capacity as usize, max_rows as usize)
+            .await
+            .map_err(|e| JsError::new(&format!("{e:#}")))?;
+        Ok(WgpuEngine { inner })
+    }
+
+    /// Hidden width and vocabulary size, as JSON.
+    pub fn config(&self) -> String {
+        let c = &self.inner.config;
+        format!("{{\"d\":{},\"vocab\":{},\"bos\":{}}}", c.d, c.vocab, c.bos)
+    }
+
+    /// Run one packed pass. `branches` is JSON `[{"tokens":[...],"want":[...]}]`
+    /// (want = branch-relative positions to read); `want` is `"hidden"` or
+    /// `"logits"`. Returns the rows concatenated, branch by branch, each of
+    /// width `d` (hidden) or `vocab` (logits).
+    pub async fn evaluate(
+        &self,
+        prefix: Vec<u32>,
+        branches: &str,
+        want: &str,
+    ) -> Result<Vec<f32>, JsError> {
+        let branches: Vec<BranchIn> =
+            serde_json::from_str(branches).map_err(|e| JsError::new(&format!("branches: {e}")))?;
+        let branches: Vec<grande_core::BranchTokens> = branches
+            .into_iter()
+            .map(|b| grande_core::BranchTokens {
+                tokens: b
+                    .tokens
+                    .into_iter()
+                    .map(|t| grande_core::Token(t as i32))
+                    .collect(),
+                want: b.want,
+            })
+            .collect();
+        let want = match want {
+            "logits" => grande_core::Want::Logits,
+            _ => grande_core::Want::Hidden,
+        };
+        let out = self
+            .inner
+            .evaluate(&prefix, &branches, want)
+            .await
+            .map_err(|e| JsError::new(&format!("{e:#}")))?;
+        Ok(out
+            .into_iter()
+            .flat_map(|b| b.rows.into_iter().flatten())
+            .collect())
+    }
+}

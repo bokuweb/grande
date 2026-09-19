@@ -20,6 +20,10 @@ const GEMMA3 = { layout: "label", turn_start: "<start_of_turn>", turn_end: "<end
 const GEMMA4 = { layout: "label", turn_start: "<|turn>", turn_end: "<turn|>", user: "user", model: "model" };
 
 export const MODELS = {
+  // The same trained checkpoint on grande's own wgpu engine (crates/grande-wgpu):
+  // state + every question in ONE forward pass with a block-causal mask, no
+  // ONNX Runtime. f16 safetensors served from this site.
+  "grande-270m-ja-wgpu": { id: "grande-270m-ja-wgpu", local: true, kind: "wgpu", layout: { layout: "pointer", state: "<unused0>", question: "<unused1>", opt: "<unused2>", opt_end: "<unused3>", decide: "<unused4>" }, size: "0.32 GB", note: "trained, wgpu engine: one pass" },
   // Trained pointer head (JNLI 0.71 / JCQA 0.71, 12k records) on a Gemma 3 270M
   // backbone with embedding rows pruned to a Japanese + English corpus. Served
   // from this site (./models/, fetched from a GitHub release at build time).
@@ -98,6 +102,29 @@ function pointerLogits(head, hidden, decideOff, optOffs) {
   });
 }
 
+// fetch through the same IndexedDB cache transformers.js uses, with progress.
+async function cachedFetch(url, onProgress) {
+  const hit = await idbCache.match(url);
+  if (hit) return hit;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url}: ${res.status}`);
+  const total = Number(res.headers.get("content-length") ?? 0);
+  const reader = res.body.getReader();
+  const chunks = [];
+  let loaded = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    loaded += value.length;
+    onProgress?.({ status: "progress", file: url.split("/").slice(-2).join("/"), loaded, total });
+  }
+  const blob = new Blob(chunks);
+  const out = new Response(blob, { status: 200, headers: { "content-length": String(blob.size) } });
+  await idbCache.put(url, out.clone()).catch(() => {});
+  return out;
+}
+
 let wasmReady = null;
 
 export async function loadEngine({ transformers, model = "gemma-3-1b", device = "webgpu", onProgress } = {}) {
@@ -114,8 +141,20 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
   navigator.storage?.persist?.().catch(() => {});
   const { AutoTokenizer, AutoModelForCausalLM, AutoProcessor, Gemma4ForConditionalGeneration, Tensor, DynamicCache } = transformers;
 
-  let tok, net, head = null, idMap = null;
-  if (spec.local) {
+  let tok, net, head = null, idMap = null, gpu = null;
+  if (spec.kind === "wgpu") {
+    transformers.env.allowLocalModels = true;
+    transformers.env.localModelPath = "./models/";
+    transformers.env.allowRemoteModels = false;
+    const base = new URL(`./models/${spec.id}/`, location.href).href;
+    tok = await AutoTokenizer.from_pretrained(spec.id, { progress_callback: onProgress });
+    transformers.env.allowRemoteModels = true;
+    head = await loadHead(`${base}head.safetensors`);
+    const config = await (await fetch(`${base}config.json`)).text();
+    const weights = new Uint8Array(await (await cachedFetch(`${base}model.safetensors`, onProgress)).arrayBuffer());
+    onProgress?.({ status: "ready" });
+    gpu = await grande.WgpuEngine.load(config, weights, 4096, 256);
+  } else if (spec.local) {
     // Same-origin model directory. transformers.js only probes local files when
     // localModelPath is NOT an absolute URL (its metadata check skips http(s)
     // paths), so keep it page-relative.
@@ -297,6 +336,29 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     return { ids, ends };
   }
 
+  // Pointer readout on the wgpu engine: prefix once, every branch isolated by
+  // the mask, one pass. Rows come back branch by branch, each option end then
+  // the decide token, as `d`-wide hidden states.
+  async function pointerWgpu(rendered) {
+    const prefix = packSegments(rendered.prefix).ids;
+    const branches = rendered.branches.map((b) => {
+      const { ids, ends } = packSegments(b.segments);
+      const want = b.marks.map(([seg, mark]) => (mark === "Last" ? ids.length - 1 : ends[seg]));
+      return { tokens: ids, want, k: b.keys.length };
+    });
+    const flat = await gpu.evaluate(Uint32Array.from(prefix), JSON.stringify(branches.map(({ tokens, want }) => ({ tokens, want }))), "hidden");
+    const D = head.d;
+    let off = 0;
+    const rows = branches.map((b) => {
+      const offs = b.want.map((_, i) => (off + i) * D);
+      off += b.want.length;
+      const decide = offs[offs.length - 1];
+      return { logits: pointerLogits(head, flat, decide, offs.slice(0, -1)), candidate_mass: null };
+    });
+    const tokens = prefix.length + branches.reduce((n, b) => n + b.tokens.length, 0);
+    return { rows, tokens, prefixTokens: prefix.length };
+  }
+
   // Pointer readout over one batched forward (right padding; pads sit after the
   // real tokens so causal attention never sees them). Every row re-reads the state.
   async function pointerBatched(rendered) {
@@ -338,12 +400,12 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
   async function answerNow(request, { temperature = 1.0, mode = "shared" } = {}) {
     const reqJson = JSON.stringify(request);
     const rendered = JSON.parse(grande.render(reqJson, JSON.stringify(spec.layout)));
-    if (spec.kind === "pointer") {
+    if (spec.kind === "pointer" || spec.kind === "wgpu") {
       const t0 = performance.now();
-      const { rows, tokens, prefixTokens } = await pointerBatched(rendered);
+      const { rows, tokens, prefixTokens } = spec.kind === "wgpu" ? await pointerWgpu(rendered) : await pointerBatched(rendered);
       const ms = performance.now() - t0;
       const resp = JSON.parse(grande.answer(reqJson, JSON.stringify(rows), temperature, spec.id, tokens));
-      return { ...resp, usage: { ...resp.usage, state_tokens: prefixTokens, questions: rows.length, mode: "batched", ms, forwards: 1 },
+      return { ...resp, usage: { ...resp.usage, state_tokens: prefixTokens, questions: rows.length, mode: spec.kind === "wgpu" ? "packed" : "batched", ms, forwards: 1 },
         diagnostics: { candidate_mass: {}, rows } };
     }
     const prefix = segmentsToText(rendered.prefix, bos);
