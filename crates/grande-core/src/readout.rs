@@ -64,6 +64,15 @@ pub struct Distribution {
     pub candidate_mass: Option<f64>,
 }
 
+impl Distribution {
+    /// Build a distribution from option logits already gathered by a caller
+    /// (a browser backend that read the label logits itself).
+    pub fn from_logits(logits: Vec<f32>, temperature: f32, candidate_mass: Option<f64>) -> Self {
+        let probs = softmax(&logits, temperature);
+        Distribution { logits, probs, candidate_mass }
+    }
+}
+
 impl Readout {
     pub fn want(&self) -> Want {
         match self {

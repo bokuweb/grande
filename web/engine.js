@@ -1,0 +1,145 @@
+// grande in the browser: transformers.js (ONNX Runtime Web, WebGPU) does the forward
+// pass, the wasm build of grande-core does everything that must match the native
+// runtime (validation, layout, labels, softmax / temperature / confidence, response).
+//
+//   const engine = await loadEngine({ transformers, model: "gemma-3-1b", onProgress });
+//   const resp = await engine.answer(request, { temperature: 1, mode: "batched" });
+//
+// Zero-shot label readout: every question is rendered as "state + question + lettered
+// options", ONE forward pass per request (batched, every row re-reads the state), and
+// only the label-token logits at the last position are read. No generation.
+
+import init, * as grande from "./pkg/grande.js";
+
+const GEMMA3 = { layout: "label", turn_start: "<start_of_turn>", turn_end: "<end_of_turn>", user: "user", model: "model" };
+const GEMMA4 = { layout: "label", turn_start: "<|turn>", turn_end: "<turn|>", user: "user", model: "model" };
+
+export const MODELS = {
+  "gemma-3-270m": { id: "onnx-community/gemma-3-270m-it-ONNX", kind: "causal", layout: GEMMA3, dtype: "q4f16", size: "0.27 GB", note: "smoke test only" },
+  "gemma-3-1b": { id: "onnx-community/gemma-3-1b-it-ONNX", kind: "causal", layout: GEMMA3, dtype: "q4f16", size: "0.76 GB", note: "default" },
+  "gemma-4-e2b": { id: "onnx-community/gemma-4-E2B-it-ONNX", kind: "gemma4", layout: GEMMA4, dtype: "q4f16", size: "3.1 GB", note: "PLE embeddings are half of it" },
+};
+
+const ZWNJ = "‌";
+// Mirror of grande-llama's neutralize_specials: caller text can never tokenize
+// into a control token, so option boundaries cannot be forged.
+export function neutralize(text) {
+  return text.replace(/<(?=[A-Za-z|/])/g, "<" + ZWNJ);
+}
+
+function segmentsToText(segments, bos) {
+  let out = "";
+  for (const s of segments) {
+    if (s.kind === "bos") out += bos;
+    else if (s.kind === "special") out += s.value;
+    else out += neutralize(s.value);
+  }
+  return out;
+}
+
+function logSumExp(row, ids) {
+  let m = -Infinity;
+  if (ids) for (const i of ids) m = Math.max(m, row[i]);
+  else for (let i = 0; i < row.length; i++) if (row[i] > m) m = row[i];
+  let s = 0;
+  if (ids) for (const i of ids) s += Math.exp(row[i] - m);
+  else for (let i = 0; i < row.length; i++) s += Math.exp(row[i] - m);
+  return m + Math.log(s);
+}
+
+let wasmReady = null;
+
+export async function loadEngine({ transformers, model = "gemma-3-1b", device = "webgpu", onProgress } = {}) {
+  wasmReady ??= init();
+  await wasmReady;
+  const spec = MODELS[model];
+  if (!spec) throw new Error(`unknown model ${model}`);
+  const { AutoTokenizer, AutoModelForCausalLM, AutoProcessor, Gemma4ForConditionalGeneration, Tensor } = transformers;
+
+  let tok, net;
+  if (spec.kind === "gemma4") {
+    const processor = await AutoProcessor.from_pretrained(spec.id, { progress_callback: onProgress });
+    tok = processor.tokenizer;
+    net = await Gemma4ForConditionalGeneration.from_pretrained(spec.id, { dtype: spec.dtype, device, progress_callback: onProgress });
+  } else {
+    tok = await AutoTokenizer.from_pretrained(spec.id, { progress_callback: onProgress });
+    net = await AutoModelForCausalLM.from_pretrained(spec.id, { dtype: spec.dtype, device, progress_callback: onProgress });
+  }
+  const bos = tok.bos_token ?? "<bos>";
+  const LABELS = grande.labels();
+  const labelIds = [];
+  for (const ch of LABELS) {
+    const ids = tok.encode(ch, { add_special_tokens: false });
+    if (ids.length !== 1) break;
+    labelIds.push(ids[0]);
+  }
+
+  function rowsFromLogits(logits, dims, keysPerRow) {
+    // logits: Float32Array/Float16Array [B, K, V]; read the last kept position per row.
+    const [B, K, V] = dims;
+    const rows = [];
+    for (let b = 0; b < B; b++) {
+      const last = logits.subarray((b * K + K - 1) * V, (b * K + K) * V);
+      const k = keysPerRow[b];
+      const ids = labelIds.slice(0, k);
+      const z = ids.map((i) => Number(last[i]));
+      const mass = Math.exp(logSumExp(last, ids) - logSumExp(last));
+      rows.push({ logits: z, candidate_mass: mass });
+    }
+    return rows;
+  }
+
+  // One batched forward: every row is "prefix + branch", left-padded so the last
+  // position is real, `num_logits_to_keep = 1` so the 262k-vocab projection runs at
+  // one position per row instead of every token.
+  async function batched(texts, keysPerRow) {
+    tok.padding_side = "left";
+    const inputs = tok(texts, { padding: true, truncation: false, add_special_tokens: false });
+    const out = await net.forward({ ...inputs, num_logits_to_keep: new Tensor("int64", [1n], []) });
+    let tokens = 0;
+    const mask = inputs.attention_mask.data;
+    for (let i = 0; i < mask.length; i++) if (Number(mask[i])) tokens++;
+    const rows = rowsFromLogits(out.logits.data, out.logits.dims, keysPerRow);
+    out.logits.dispose?.();
+    return { rows, tokens };
+  }
+
+  async function sequential(texts, keysPerRow) {
+    const rows = [];
+    let tokens = 0;
+    for (let b = 0; b < texts.length; b++) {
+      const inputs = tok(texts[b], { add_special_tokens: false });
+      const out = await net.forward({ ...inputs, num_logits_to_keep: new Tensor("int64", [1n], []) });
+      tokens += inputs.input_ids.dims[1];
+      rows.push(rowsFromLogits(out.logits.data, out.logits.dims, [keysPerRow[b]])[0]);
+      out.logits.dispose?.();
+    }
+    return { rows, tokens };
+  }
+
+  let queue = Promise.resolve();
+  const enqueue = (job) => { const p = queue.then(job, job); queue = p.catch(() => {}); return p; };
+
+  async function answerNow(request, { temperature = 1.0, mode = "batched" } = {}) {
+    const reqJson = JSON.stringify(request);
+    const rendered = JSON.parse(grande.render(reqJson, JSON.stringify(spec.layout)));
+    const prefix = segmentsToText(rendered.prefix, bos);
+    const texts = rendered.branches.map((b) => prefix + segmentsToText(b.segments, bos));
+    const keys = rendered.branches.map((b) => b.keys.length);
+    for (const k of keys) if (k > labelIds.length) throw new Error(`a question has ${k} options; this tokenizer supports ${labelIds.length} single-token labels`);
+    const t0 = performance.now();
+    const { rows, tokens } = mode === "sequential" ? await sequential(texts, keys) : await batched(texts, keys);
+    const ms = performance.now() - t0;
+    const resp = JSON.parse(grande.answer(reqJson, JSON.stringify(rows), temperature, spec.id, tokens));
+    const stateTokens = tok.encode(prefix, { add_special_tokens: false }).length;
+    return { ...resp, usage: { ...resp.usage, state_tokens: stateTokens, questions: rows.length, mode, ms, forwards: mode === "sequential" ? rows.length : 1 },
+      diagnostics: { candidate_mass: Object.fromEntries(rendered.branches.map((b, i) => [b.id, rows[i].candidate_mass])), rows } };
+  }
+
+  return {
+    model, spec, tokenizer: tok, net, device,
+    labels: LABELS.slice(0, labelIds.length),
+    answer: (request, opts) => enqueue(() => answerNow(request, opts)),
+    render: (request) => JSON.parse(grande.render(JSON.stringify(request), JSON.stringify(spec.layout))),
+  };
+}

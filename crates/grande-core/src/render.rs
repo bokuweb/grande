@@ -5,6 +5,7 @@
 //! meets a layout at inference that it did not see in training.
 
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::{content_text, state_text, Question, Request};
@@ -12,14 +13,16 @@ use crate::api::{content_text, state_text, Question, Request};
 /// A piece of text or a control token. Backends tokenize `Text` without
 /// parsing specials, and resolve `Special` by name, so user text can never
 /// forge a delimiter.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "lowercase")]
 pub enum Segment {
     Bos,
     Text(String),
     Special(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Kind {
     Noul,
     Choice,
@@ -27,7 +30,7 @@ pub enum Kind {
 }
 
 /// Which token of a segment the readout wants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mark {
     /// Last token of the `i`-th option's closing segment (pointer readout).
     OptEnd(usize),
@@ -37,7 +40,7 @@ pub enum Mark {
     Last,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderedBranch {
     pub id: String,
     pub kind: Kind,
@@ -51,7 +54,7 @@ pub struct RenderedBranch {
     pub marks: Vec<(usize, Mark)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rendered {
     pub prefix: Vec<Segment>,
     pub branches: Vec<RenderedBranch>,
@@ -59,7 +62,7 @@ pub struct Rendered {
 
 /// Delimiter control tokens for the pointer layout. Defaults reuse Gemma's
 /// reserved `<unused*>` tokens so no embedding rows have to be added.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Delimiters {
     pub state: String,
     pub question: String,
@@ -81,7 +84,8 @@ impl Default for Delimiters {
 }
 
 /// How the request is laid out for the model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "layout", rename_all = "lowercase")]
 pub enum Renderer {
     /// Zero-shot layout for an instruction-tuned chat model: the question and
     /// lettered options go in a user turn, the model turn is opened, and the
