@@ -3,7 +3,7 @@
 // runtime (validation, layout, labels, softmax / temperature / confidence, response).
 //
 //   const engine = await loadEngine({ transformers, model: "gemma-3-1b", onProgress });
-//   const resp = await engine.answer(request, { temperature: 1, mode: "shared", calibrate: true });
+//   const resp = await engine.answer(request, { temperature: 1, mode: "shared", calibrate: true, orders: 1 });
 //
 // Zero-shot label readout: the state is decoded once into a resident KV cache, every
 // question continues from it as an isolated branch ("state, then this question"), and
@@ -568,13 +568,12 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
   // live state stays resident.
   const CONTENT_FREE = grande.content_free_state();
   const baselineCache = new Map();
-  async function baselineRows(request, rendered, mode, contentFree) {
-    const keys = rendered.branches.map((b) => JSON.stringify([contentFree, b.segments, b.keys]));
+  async function baselineRows(cfPrefix, branches, mode, contentFree) {
+    const keys = branches.map((b) => JSON.stringify([contentFree, b.segments, b.keys]));
     const missing = keys.map((k, i) => (baselineCache.has(k) ? -1 : i)).filter((i) => i >= 0);
     let forwards = 0, tokens = 0;
     if (missing.length) {
-      const cf = JSON.parse(grande.render(JSON.stringify({ ...request, state: contentFree }), JSON.stringify(spec.layout)));
-      const r = await rowsFor({ prefix: cf.prefix, branches: missing.map((i) => cf.branches[i]) }, mode === "shared" ? "batched" : mode);
+      const r = await rowsFor({ prefix: cfPrefix, branches: missing.map((i) => branches[i]) }, mode === "shared" ? "batched" : mode);
       missing.forEach((i, j) => baselineCache.set(keys[i], r.rows[j]));
       forwards = r.forwards;
       tokens = r.tokens;
@@ -582,24 +581,45 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     return { rows: keys.map((k) => baselineCache.get(k)), forwards, tokens };
   }
 
+  // The branch plan is grande-core's (wasm), the same code as the native
+  // engine: with `orders` > 1 every Choice / Noul is asked under that many
+  // option orders in the same pass and the logits are averaged (position
+  // bias out); a Choice with more options than the readout can letter runs
+  // in two passes, groups first, then the finalists of every group together.
   // `calibrate`: false, true ("N/A" as the content-free state) or a string to
   // use as the content-free state instead.
-  async function answerNow(request, { temperature = 1.0, mode = "shared", calibrate = false } = {}) {
+  async function answerNow(request, { temperature = 1.0, mode = "shared", calibrate = false, orders = 1 } = {}) {
     const reqJson = JSON.stringify(request);
-    const rendered = JSON.parse(grande.render(reqJson, JSON.stringify(spec.layout)));
+    const layoutJson = JSON.stringify(spec.layout);
+    const cap = spec.readout === "label" ? labelIds.length : 0;
+    const plan = JSON.parse(grande.plan(reqJson, layoutJson, orders, cap));
+    const contentFree = typeof calibrate === "string" ? calibrate : CONTENT_FREE;
+    const cfPrefix = calibrate ? JSON.parse(grande.plan(JSON.stringify({ ...request, state: contentFree }), layoutJson, orders, cap)).prefix : null;
     const t0 = performance.now();
     // Baseline first: on a cold state its forwards would otherwise sit
     // between the state and its questions.
-    const base = calibrate ? await baselineRows(request, rendered, mode, typeof calibrate === "string" ? calibrate : CONTENT_FREE) : null;
-    const r = await rowsFor(rendered, mode);
+    const base = calibrate ? await baselineRows(cfPrefix, plan.branches, mode, contentFree) : null;
+    const r = await rowsFor(plan, mode);
+    const rows = JSON.stringify(r.rows);
+    const baseRows = base ? JSON.stringify(base.rows) : undefined;
+    // Second pass: the finalists of every grouped Choice (none for most requests).
+    const second = JSON.parse(grande.plan_second(reqJson, layoutJson, orders, cap, rows, temperature, baseRows));
+    let r2 = null, base2 = null;
+    if (second.branches.length) {
+      base2 = calibrate ? await baselineRows(cfPrefix, second.branches, mode, contentFree) : null;
+      r2 = await rowsFor({ prefix: plan.prefix, branches: second.branches }, mode);
+    }
     const ms = performance.now() - t0;
-    const { rows } = r;
-    const tokens = r.tokens + (base?.tokens ?? 0);
-    const resp = JSON.parse(grande.answer(reqJson, JSON.stringify(rows), temperature, spec.id, tokens, base ? JSON.stringify(base.rows) : undefined));
-    const stateTokens = r.state_tokens ?? tok.encode(segmentsToText(rendered.prefix, bos), { add_special_tokens: false }).length;
-    return { ...resp, usage: { ...resp.usage, state_tokens: stateTokens, questions: rows.length, mode: r.mode, ms, forwards: r.forwards + (base?.forwards ?? 0),
-        ...(r.warm === undefined ? {} : { state_resident: r.warm }), ...(base ? { calibrated: "contextual", baseline_forwards: base.forwards } : {}) },
-      diagnostics: { candidate_mass: Object.fromEntries(rendered.branches.map((b, i) => [b.id, rows[i].candidate_mass])), rows, ...(base ? { baseline: base.rows } : {}) } };
+    const tokens = r.tokens + (base?.tokens ?? 0) + (r2?.tokens ?? 0) + (base2?.tokens ?? 0);
+    const forwards = r.forwards + (base?.forwards ?? 0) + (r2?.forwards ?? 0) + (base2?.forwards ?? 0);
+    const out = JSON.parse(grande.answer(reqJson, layoutJson, orders, cap, rows, r2 ? JSON.stringify(r2.rows) : undefined, temperature, spec.id, tokens,
+      baseRows, base2 ? JSON.stringify(base2.rows) : undefined));
+    const stateTokens = r.state_tokens ?? tok.encode(segmentsToText(plan.prefix, bos), { add_special_tokens: false }).length;
+    const questions = Object.keys(request.questions).length;
+    return { ...out.response, usage: { ...out.response.usage, state_tokens: stateTokens, questions, branches: r.rows.length + (r2?.rows.length ?? 0), orders, mode: r.mode, ms,
+        forwards, passes: 1 + (r2 ? 1 : 0),
+        ...(r.warm === undefined ? {} : { state_resident: r.warm }), ...(base ? { calibrated: "contextual", baseline_forwards: base.forwards + (base2?.forwards ?? 0) } : {}) },
+      diagnostics: { ...out.diagnostics, rows: r.rows, ...(r2 ? { rows2: r2.rows } : {}), ...(base ? { baseline: base.rows } : {}) } };
   }
 
   return {

@@ -35,8 +35,13 @@ and vision encoder shards (270 MB for E2B) are never fetched.
 What runs where:
 
 - `grande-core` (wasm): request validation, the rendered layout (Gemma 3 and
-  Gemma 4 turn markers), option labels, temperature / softmax / confidence,
-  the TypeSafe-shaped response. Same crate as the native runtime.
+  Gemma 4 turn markers), the branch plan (`plan` / `plan_second`: option
+  orders to average, the group and finalist passes of a Choice with more
+  than 52 options), option labels, temperature / softmax / confidence, the
+  TypeSafe-shaped response. Same crate as the native runtime, so **Orders**
+  in the page is `--orders` and a 77-way Choice runs the same two stages as
+  `grande serve` (the page shows `2-stage N` and the order `spread` per
+  question).
 - `engine.js`: tokenizes the rendered segments (control tokens in caller text
   are neutralized the same way as native), decodes the state once into a KV
   cache, continues every question from it with `num_logits_to_keep = 1`, and
