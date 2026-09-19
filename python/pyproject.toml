@@ -1,0 +1,15 @@
+[project]
+name = "grande-train"
+version = "0.1.0"
+description = "Training side of grande: LoRA + pointer head on Gemma 4 with the packed branch layout."
+requires-python = ">=3.12"
+dependencies = [
+  "torch>=2.6",
+  "transformers>=5.0",
+  "peft>=0.15",
+  "safetensors>=0.5",
+  "numpy",
+]
+
+[tool.setuptools]
+packages = ["grande_train"]
