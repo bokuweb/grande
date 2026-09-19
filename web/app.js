@@ -37,10 +37,18 @@ $("clear").addEventListener("click", async () => {
   await refreshCache();
   selectModel();
 });
+const groups = new Map();
 for (const [k, p] of Object.entries(PRESETS)) {
   const o = document.createElement("option");
   o.value = k; o.textContent = p.label;
-  $("preset").append(o);
+  if (!p.group) { $("preset").append(o); continue; }
+  if (!groups.has(p.group)) {
+    const g = document.createElement("optgroup");
+    g.label = p.group;
+    groups.set(p.group, g);
+    $("preset").append(g);
+  }
+  groups.get(p.group).append(o);
 }
 
 // JSON syntax highlighting: a <pre> behind a transparent <textarea>. Not a

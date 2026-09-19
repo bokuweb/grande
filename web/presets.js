@@ -1,5 +1,7 @@
+// Demo presets. `group` becomes an <optgroup>; the tests are last on purpose.
 export const PRESETS = {
   ticket: {
+    group: "Business",
     label: "Support ticket triage (ja)",
     state: {
       ticket: { subject: "振込が失敗します", body: "今週に入ってから売上の振込が3回連続で失敗しています。2回メールを送りましたが返事がありません。外注先への支払いが止まっていて困っています。金曜までに直らなければ他社に乗り換えます。" },
@@ -14,6 +16,7 @@ export const PRESETS = {
     },
   },
   contract: {
+    group: "Business",
     label: "Contract clause review (ja)",
     state: {
       document: "業務委託契約書",
@@ -33,7 +36,223 @@ export const PRESETS = {
       needs_lawyer_review: { type: "noul", instructions: "この条項は弁護士による確認が必要か" },
     },
   },
+  minutes: {
+    group: "Business",
+    label: "Meeting minutes — decisions and follow-ups (ja)",
+    state: {
+      meeting: "週次プロダクト定例",
+      date: "2026-09-17",
+      attendees: ["田中（PM）", "佐藤（開発）", "鈴木（デザイン）", "高橋（営業）"],
+      notes: "・v2.3 のリリースは 9/30 から 10/7 に延期することで合意。理由は決済周りの QA が終わっていないため。\n・高橋から、大口顧客 A 社が請求書の PDF 出力を強く要望しているとの報告。佐藤が工数を見積もり、来週の定例で判断する。\n・鈴木が新しいオンボーディング画面のモックを共有。おおむね好評だが、田中から文言が長すぎるとの指摘あり。鈴木が金曜までに修正版を出す。\n・次回の定例は祝日のため火曜に変更。",
+    },
+    questions: {
+      release_decided: { type: "noul", instructions: "リリース日について正式な決定がなされたか" },
+      release_date: { type: "choice", instructions: "v2.3 の新しいリリース予定日はいつか", criteria: { sep30: "9月30日", oct7: "10月7日", undecided: "未定・記載なし" } },
+      pdf_owner: { type: "choice", instructions: "請求書 PDF 出力の見積もりを担当するのは誰か", criteria: { tanaka: "田中", sato: "佐藤", suzuki: "鈴木", takahashi: "高橋", nobody: "担当者は決まっていない" } },
+      pdf_decided: { type: "noul", instructions: "請求書 PDF 出力の実装は今回の会議で決定されたか" },
+      mock_revision_due: { type: "choice", instructions: "オンボーディング画面の修正版の期限はいつか", criteria: { friday: "金曜", next_meeting: "次回定例", none: "期限は決まっていない" } },
+      open_items: { type: "score", instructions: "次回までに持ち越しのアクションはいくつあるか", criteria: ["0", "1", "2", "3", "4以上"] },
+      tone: { type: "choice", instructions: "この会議の雰囲気は全体としてどうか", criteria: { positive: "前向き・順調", neutral: "事務的", tense: "緊張・問題が多い" } },
+    },
+  },
+  expense: {
+    group: "Business",
+    label: "Expense claim check (ja)",
+    state: {
+      policy: "交通費は実費。会食は1人あたり5,000円まで、参加者名の記載が必須。領収書は提出日から30日以内のものに限る。",
+      claim: { submitted: "2026-09-18", date: "2026-08-02", amount: 28600, category_by_employee: "会食", description: "取引先 B 社との打ち合わせ後の会食（4名）。参加者: 当社 山本・伊藤、B 社 中村様・小林様", receipt_attached: true },
+    },
+    questions: {
+      category: { type: "choice", instructions: "この経費の種類として最も適切なものはどれか", criteria: { transport: "交通費", meal: "会食・接待", supplies: "備品・消耗品", travel: "出張・宿泊", other: "その他" } },
+      within_per_head: { type: "noul", instructions: "1人あたりの金額は規程の上限（5,000円）以内か" },
+      participants_listed: { type: "noul", instructions: "参加者名は記載されているか" },
+      receipt_in_window: { type: "noul", instructions: "領収書の日付は提出日から30日以内か" },
+      decision: { type: "choice", instructions: "この申請はどう処理すべきか", criteria: { approve: "承認", reject: "却下", ask: "申請者に確認・差し戻し" } },
+      risk: { type: "score", instructions: "規程違反の疑いはどの程度か", criteria: ["なし", "軽微", "要確認", "明確な違反"] },
+    },
+  },
+  resume: {
+    group: "Business",
+    label: "Résumé screening (ja)",
+    state: {
+      position: "バックエンドエンジニア（Go / Kubernetes、決済基盤）。必須: Go 3年以上、本番運用経験。歓迎: 決済・金融ドメイン、SRE 経験。",
+      candidate: "2019年〜 EC スタートアップでサーバサイド（Ruby on Rails）を2年。2021年〜 現職の SaaS 企業で Go によるマイクロサービス開発と Kubernetes 上での運用を担当（4年）。オンコール対応、SLO 設計、決済プロバイダ連携（Stripe）の実装経験あり。英語: 読み書き可、会話は日常レベル。",
+    },
+    questions: {
+      go_years: { type: "choice", instructions: "候補者の Go の実務経験年数に最も近いものはどれか", criteria: { none: "なし", under1: "1年未満", y1_3: "1〜3年", y3_5: "3〜5年", over5: "5年以上" } },
+      meets_required: { type: "noul", instructions: "必須要件（Go 3年以上、本番運用経験）を満たしているか" },
+      payments_domain: { type: "noul", instructions: "決済・金融ドメインの経験があるか" },
+      sre: { type: "noul", instructions: "SRE に相当する経験（オンコール、SLO など）があるか" },
+      seniority: { type: "choice", instructions: "候補者のレベル感はどれか", criteria: { junior: "ジュニア", mid: "ミドル", senior: "シニア", staff: "スタッフ以上" } },
+      next_step: { type: "choice", instructions: "次のステップとして適切なのはどれか", criteria: { interview: "面接に進める", hold: "保留・追加情報を求める", decline: "見送り" } },
+    },
+  },
+  invite: {
+    group: "Business",
+    label: "Scheduling email — what is settled? (ja)",
+    state: {
+      from: "nakamura@example.co.jp",
+      subject: "Re: Re: 次回打ち合わせの日程",
+      body: "山田様\n\nご調整ありがとうございます。それでは 9/25（木）15:00〜16:00 で確定とさせてください。場所は御社にお伺いします。議題は先日お送りした提案書の第3章についてで、こちらからは私と部長の岡本が参加します。\n\n当日は受付で「中村」とお伝えいただければと伺っておりますが、入館証など事前に必要なものがあればお知らせください。\n\nよろしくお願いいたします。\n中村",
+    },
+    questions: {
+      confirmed: { type: "noul", instructions: "日時は確定したか" },
+      when: { type: "choice", instructions: "確定した日時はどれか", criteria: { sep25_15: "9/25 15:00", sep25_16: "9/25 16:00", sep26_15: "9/26 15:00", unclear: "確定していない" } },
+      where: { type: "choice", instructions: "会議の場所はどこか", criteria: { our_office: "受信者（山田）側のオフィス", their_office: "送信者（中村）側のオフィス", online: "オンライン", unclear: "不明" } },
+      headcount: { type: "score", instructions: "送信者側から何人参加するか", criteria: ["1人", "2人", "3人", "4人以上"] },
+      needs_reply: { type: "noul", instructions: "受信者はこのメールに返信する必要があるか" },
+      action_for_recipient: { type: "choice", instructions: "受信者が取るべき次のアクションはどれか", criteria: { send_invite: "カレンダー招待を送る", answer_question: "入館手続きについて回答する", reschedule: "日程の再調整を提案する", none: "特になし" } },
+    },
+  },
+  review: {
+    group: "Text & content",
+    label: "Product review — rating and aspects (ja)",
+    state: {
+      product: "ワイヤレスイヤホン XR-2",
+      review: "音質は価格帯を考えれば十分。ノイズキャンセリングは電車ではまあまあ効くが、カフェの話し声はほぼ消えない。ケースが思ったより大きくてポケットに入れると気になる。一番の不満はバッテリーで、公称8時間なのに実際は5時間持たない。サポートに問い合わせたら丁寧だったが「仕様です」で終わり。値段が半分なら文句なし。",
+    },
+    questions: {
+      stars: { type: "score", instructions: "このレビューを5段階評価にするといくつか", criteria: ["1: 非常に不満", "2: 不満", "3: 普通", "4: 満足", "5: 非常に満足"] },
+      recommend: { type: "noul", instructions: "レビュアーはこの製品を人に勧めると思われるか" },
+      main_complaint: { type: "choice", instructions: "最大の不満点は何か", criteria: { sound: "音質", anc: "ノイズキャンセリング", size: "ケースの大きさ", battery: "バッテリー", support: "サポート対応", price: "価格" } },
+      battery_claim_met: { type: "noul", instructions: "バッテリーは公称スペックどおり持ったか" },
+      support_positive: { type: "noul", instructions: "サポートの対応自体は好意的に評価されているか" },
+      price_sensitive: { type: "noul", instructions: "レビュアーは価格が高いと感じているか" },
+    },
+  },
+  phishing: {
+    group: "Text & content",
+    label: "Email — phishing signals (ja)",
+    state: {
+      from: "security-alert@rakuten-support-center.xyz",
+      subject: "【重要】お客様のアカウントが一時停止されました",
+      body: "お客様のアカウントで不審なログインが検出されたため、セキュリティ保護のためアカウントを一時停止いたしました。24時間以内に以下のリンクから本人確認を完了しない場合、アカウントは永久に削除されます。\n\n▶ 本人確認はこちら: http://rakuten-support-center.xyz/verify?id=88213\n\nご本人確認にはクレジットカード番号と有効期限の入力が必要です。",
+    },
+    questions: {
+      is_phishing: { type: "noul", instructions: "このメールはフィッシングである可能性が高いか" },
+      urgency_pressure: { type: "noul", instructions: "期限や脅しで急がせる表現が使われているか" },
+      asks_credentials: { type: "noul", instructions: "パスワードやカード番号などの機密情報の入力を求めているか" },
+      sender_domain_suspicious: { type: "noul", instructions: "送信元ドメインは正規のものではないように見えるか" },
+      impersonated: { type: "choice", instructions: "どの組織をかたっているか", criteria: { rakuten: "楽天", amazon: "Amazon", bank: "銀行", government: "官公庁", none: "特定の組織ではない" } },
+      action: { type: "choice", instructions: "受信者が取るべき行動はどれか", criteria: { ignore: "無視・削除", report: "報告・ブロック", verify_official: "公式サイトから直接確認", click: "リンクを開く" } },
+    },
+  },
+  moderation: {
+    group: "Text & content",
+    label: "Community post moderation (ja)",
+    state: {
+      community_rules: "誹謗中傷・個人情報の投稿・宣伝目的の投稿・無関係な投稿を禁止。批判は内容に対して行うこと。",
+      post: "このアプリの新しいアップデート、正直ひどい。起動が3倍遅くなったし、前のバージョンに戻せない。開発チームは何をテストしてるんだ？ ちなみに同じ悩みの人は「LiteLaunch」ってアプリを使うと軽くなるよ、リンクはプロフに貼ってある。",
+    },
+    questions: {
+      violation: { type: "choice", instructions: "この投稿はどのルールに抵触するか", criteria: { harassment: "誹謗中傷", personal_info: "個人情報", promotion: "宣伝目的", off_topic: "無関係", none: "違反なし" } },
+      attacks_person: { type: "noul", instructions: "特定の個人を攻撃しているか（製品や仕事への批判ではなく）" },
+      has_promo_link: { type: "noul", instructions: "他のサービスへの誘導・宣伝が含まれているか" },
+      legit_feedback: { type: "noul", instructions: "宣伝部分を除けば、製品への正当なフィードバックを含んでいるか" },
+      severity: { type: "score", instructions: "違反の深刻度はどの程度か", criteria: ["問題なし", "軽微", "中程度", "重大"] },
+      action: { type: "choice", instructions: "モデレーターが取るべき対応はどれか", criteria: { keep: "そのまま残す", edit_request: "宣伝部分の削除を依頼", remove: "投稿を削除", ban: "投稿者を停止" } },
+    },
+  },
+  news: {
+    group: "Text & content",
+    label: "News snippet — topic and stance (ja)",
+    state: {
+      headline: "国内大手3行、送金手数料を来春から引き下げへ　フィンテック勢の攻勢受け",
+      lead: "国内の大手銀行3行は18日、個人向けの他行宛て送金手数料を2027年4月から現行の半額程度に引き下げると発表した。スマートフォン決済事業者が手数料無料の送金サービスで若年層を取り込んでいることへの対抗策とみられる。ある行の幹部は「手数料収入の減少は避けられないが、口座の流出を止める方が優先だ」と話した。",
+    },
+    questions: {
+      topic: { type: "choice", instructions: "この記事の主なトピックはどれか", criteria: { finance: "金融・銀行", tech: "テクノロジー", politics: "政治", sports: "スポーツ", entertainment: "エンタメ", science: "科学" } },
+      region: { type: "choice", instructions: "記事の対象地域はどこか", criteria: { japan: "日本国内", asia: "アジア", us: "米国", europe: "欧州", global: "世界全体" } },
+      is_announcement: { type: "noul", instructions: "企業や団体による正式な発表を伝える記事か" },
+      timing: { type: "choice", instructions: "記事の主な出来事はいつ起きる（起きた）か", criteria: { past: "すでに起きた", future: "これから起きる予定", ongoing: "進行中" } },
+      cause: { type: "choice", instructions: "記事が示唆する引き下げの理由はどれか", criteria: { regulation: "規制・行政指導", competition: "競合への対抗", cost: "コスト削減", demand: "顧客からの要望" } },
+      sentiment_for_consumers: { type: "choice", instructions: "一般消費者にとってこのニュースはどうか", criteria: { good: "良いニュース", bad: "悪いニュース", neutral: "中立" } },
+    },
+  },
+  grounding: {
+    group: "Text & content",
+    label: "RAG answer — is it grounded? (ja)",
+    state: {
+      source: "【社内規程 第12条 有給休暇】年次有給休暇は入社6か月経過後に10日付与し、以後1年ごとに労働基準法の定めに従い加算する。取得は原則として3営業日前までに申請すること。未消化分は翌年度に限り繰り越せる。半日単位の取得は年10回まで認める。",
+      question: "有給は時間単位で取れますか？また、繰り越しは何年までできますか？",
+      draft_answer: "はい、有給休暇は時間単位でも取得できます（年10回まで）。未消化分は翌々年度まで繰り越しが可能です。申請は3営業日前までにお願いします。",
+    },
+    questions: {
+      hourly_supported: { type: "choice", instructions: "「時間単位で取得できる」という回答は資料に照らしてどうか", criteria: { supported: "資料が裏付けている", contradicted: "資料と矛盾する", not_in_source: "資料に記載がない" } },
+      carryover_supported: { type: "choice", instructions: "「翌々年度まで繰り越せる」という回答は資料に照らしてどうか", criteria: { supported: "資料が裏付けている", contradicted: "資料と矛盾する", not_in_source: "資料に記載がない" } },
+      deadline_supported: { type: "choice", instructions: "「申請は3営業日前まで」という回答は資料に照らしてどうか", criteria: { supported: "資料が裏付けている", contradicted: "資料と矛盾する", not_in_source: "資料に記載がない" } },
+      answers_question: { type: "noul", instructions: "回答案は質問の両方の論点に答えているか" },
+      safe_to_send: { type: "noul", instructions: "この回答案をそのまま送ってよいか" },
+      error_count: { type: "score", instructions: "回答案に含まれる誤りはいくつか", criteria: ["0", "1", "2", "3以上"] },
+    },
+  },
+  bug: {
+    group: "Engineering",
+    label: "Bug report triage (ja)",
+    state: {
+      title: "iOS で PDF を開くとアプリが落ちる",
+      body: "iPhone 15（iOS 18.6）、アプリ 4.2.1。ホーム画面 → 書類タブ → 10MB 以上の PDF をタップすると 2 秒ほど固まってクラッシュします。5MB 程度の PDF は開けます。4.2.0 では問題なかったので昨日のアップデートで壊れたと思います。毎回再現します。Android の同僚は問題ないそうです。",
+      labels_available: ["ios", "android", "backend", "web"],
+    },
+    questions: {
+      component: { type: "choice", instructions: "この不具合の担当コンポーネントはどれか", criteria: { ios: "iOS アプリ", android: "Android アプリ", backend: "バックエンド", web: "Web" } },
+      severity: { type: "score", instructions: "深刻度はどの程度か", criteria: ["低: 見た目の問題", "中: 回避策あり", "高: 主要機能が使えない", "致命的: クラッシュ・データ損失"] },
+      reproducible: { type: "noul", instructions: "再現手順が具体的に書かれているか" },
+      regression: { type: "noul", instructions: "以前のバージョンでは動いていた（リグレッション）と報告されているか" },
+      size_related: { type: "noul", instructions: "ファイルサイズに依存する不具合と考えられるか" },
+      missing_info: { type: "choice", instructions: "追加で最も必要な情報はどれか", criteria: { logs: "クラッシュログ", sample_file: "再現用のファイル", device: "端末・OS 情報", steps: "再現手順", none: "十分な情報がある" } },
+      priority: { type: "choice", instructions: "対応の優先度はどれか", criteria: { hotfix: "即時修正（ホットフィックス）", next_release: "次のリリースで修正", backlog: "バックログ", wontfix: "対応しない" } },
+    },
+  },
+  log: {
+    group: "Engineering",
+    label: "Incident log — what happened? (ja)",
+    state: {
+      alert: "api-gateway p99 latency > 2s for 5m",
+      log_excerpt: "14:02:11 WARN  db-pool  connections exhausted (50/50), queueing\n14:02:14 ERROR order-svc  timeout after 3000ms calling inventory-svc\n14:02:14 ERROR order-svc  timeout after 3000ms calling inventory-svc\n14:02:30 INFO  deploy  inventory-svc v2.8.0 rolled out to 100% (started 13:58)\n14:03:05 WARN  inventory-svc  slow query: SELECT ... FROM stock WHERE sku IN (...) [4210ms]\n14:06:40 INFO  deploy  inventory-svc rolled back to v2.7.3\n14:08:02 INFO  db-pool  connections 12/50",
+    },
+    questions: {
+      root_cause_service: { type: "choice", instructions: "根本原因に最も近いサービスはどれか", criteria: { gateway: "api-gateway", order: "order-svc", inventory: "inventory-svc", db: "データベース", network: "ネットワーク" } },
+      deploy_related: { type: "noul", instructions: "直前のデプロイが原因と考えられるか" },
+      resolved: { type: "noul", instructions: "ログの範囲内で障害は収束したか" },
+      resolution: { type: "choice", instructions: "収束のきっかけは何か", criteria: { rollback: "ロールバック", scale_up: "スケールアップ", restart: "再起動", self_healed: "自然回復", unresolved: "収束していない" } },
+      customer_impact: { type: "score", instructions: "顧客影響の大きさはどの程度か", criteria: ["なし", "一部の遅延", "一部の失敗", "広範囲の失敗"] },
+      followup: { type: "choice", instructions: "最優先のフォローアップはどれか", criteria: { query: "遅いクエリの修正・インデックス", pool: "コネクションプールの拡張", canary: "カナリアデプロイの導入", timeout: "タイムアウト設定の見直し" } },
+    },
+  },
+  ticket_en: {
+    group: "English",
+    label: "Support ticket triage (en)",
+    state: {
+      ticket: { subject: "Payout failed three times", body: "Since Monday every payout to my bank has failed. I emailed twice and got no reply. My contractors haven't been paid and I'm getting angry messages from them. If this isn't fixed by Friday I'm moving to another provider." },
+      customer: { plan: "pro", tenure_months: 27 },
+    },
+    questions: {
+      queue: { type: "choice", instructions: "Which team should own this ticket?", criteria: { payments: "payouts, refunds, billing, failed charges", account: "login, profile, permissions, 2FA", other: "anything else" } },
+      escalate: { type: "noul", instructions: "Should this be escalated to a manager right now?" },
+      urgency: { type: "score", instructions: "How urgent is this?", criteria: ["low: can wait a few days", "medium: should be handled today", "high: money or service is blocked right now"] },
+      refund_requested: { type: "noul", instructions: "Does the customer explicitly ask for a refund?" },
+      churn_risk: { type: "noul", instructions: "Does the customer threaten to leave?" },
+    },
+  },
+  grounding_en: {
+    group: "English",
+    label: "RAG answer — is it grounded? (en)",
+    state: {
+      source: "Return policy: items can be returned within 30 days of delivery for a full refund if unused and in original packaging. Opened electronics are subject to a 15% restocking fee. Shipping costs are non-refundable. Gift cards cannot be returned.",
+      question: "Can I return opened headphones after 3 weeks, and will I get shipping back?",
+      draft_answer: "Yes, you can return them within 30 days. Since they're opened electronics, a 15% restocking fee applies. Shipping is refunded in full.",
+    },
+    questions: {
+      window_supported: { type: "choice", instructions: "The claim 'you can return them within 30 days' is…", criteria: { supported: "supported by the source", contradicted: "contradicted by the source", not_in_source: "not covered by the source" } },
+      fee_supported: { type: "choice", instructions: "The claim about the 15% restocking fee is…", criteria: { supported: "supported by the source", contradicted: "contradicted by the source", not_in_source: "not covered by the source" } },
+      shipping_supported: { type: "choice", instructions: "The claim 'shipping is refunded in full' is…", criteria: { supported: "supported by the source", contradicted: "contradicted by the source", not_in_source: "not covered by the source" } },
+      safe_to_send: { type: "noul", instructions: "Is the draft answer safe to send as is?" },
+      error_count: { type: "score", instructions: "How many errors does the draft contain?", criteria: ["0", "1", "2", "3 or more"] },
+    },
+  },
   isolation: {
+    group: "Tests",
     label: "Isolation test — secret in a sibling question (ja)",
     state: { memo: "本日の会議は15時から第2会議室で行います。資料は事前に共有済みです。" },
     questions: {
@@ -43,12 +262,27 @@ export const PRESETS = {
     },
   },
   isolation_state: {
+    group: "Tests",
     label: "Isolation test — secret in state (ja)",
     state: { memo: "本日の会議は15時から第2会議室で行います。資料は事前に共有済みです。合言葉は「青い象」です。" },
     questions: {
       q1: { type: "noul", instructions: "この会議は15時に始まるか" },
       q2: { type: "noul", instructions: "合言葉は「青い象」であるか" },
       q3: { type: "choice", instructions: "会議の場所はどこか", criteria: { room1: "第1会議室", room2: "第2会議室", online: "オンライン", unknown: "記載なし" } },
+    },
+  },
+  unknowns: {
+    group: "Tests",
+    label: "Calibration test — questions the state cannot answer (ja)",
+    state: { memo: "本日の会議は15時から第2会議室で行います。資料は事前に共有済みです。" },
+    questions: {
+      blue_elephant: { type: "noul", instructions: "合言葉は「青い象」であるか" },
+      red_dog: { type: "noul", instructions: "合言葉は「赤い犬」であるか" },
+      tanaka: { type: "noul", instructions: "社長の名前は田中であるか" },
+      at16: { type: "noul", instructions: "この会議は16時に始まるか" },
+      at15: { type: "noul", instructions: "この会議は15時に始まるか" },
+      shared: { type: "noul", instructions: "資料は事前に共有されているか" },
+      room1: { type: "noul", instructions: "会議は第1会議室で行われるか" },
     },
   },
 };
