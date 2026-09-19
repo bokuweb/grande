@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/grande-core", "crates/grande-llama", "crates/grande-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/bokuweb/grande"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+indexmap = { version = "2", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+llama-cpp-2 = { version = "0.1.156", default-features = false }
+
+[profile.release]
+debug = 1

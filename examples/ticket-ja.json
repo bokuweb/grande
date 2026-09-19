@@ -1,0 +1,29 @@
+{
+  "model": "grande-latest",
+  "state": {
+    "ticket": {
+      "subject": "振込が失敗します",
+      "body": "今週に入ってから売上の振込が3回連続で失敗しています。2回メールを送りましたが返事がありません。外注先への支払いが止まっていて困っています。金曜までに直らなければ他社に乗り換えます。"
+    },
+    "customer": { "plan": "pro", "tenure_months": 27 }
+  },
+  "questions": {
+    "queue": {
+      "type": "choice",
+      "instructions": "この問い合わせを担当すべきチームはどれか",
+      "criteria": {
+        "payments": "振込・返金・請求・決済の失敗",
+        "account": "ログイン・プロフィール・権限・二要素認証",
+        "other": "それ以外"
+      }
+    },
+    "escalate": { "type": "noul", "instructions": "この問い合わせは今すぐ責任者にエスカレーションすべきか" },
+    "urgency": {
+      "type": "score",
+      "instructions": "この問い合わせの緊急度はどれか",
+      "criteria": ["低: 数日待てる", "中: 今日中に対応すべき", "高: 今まさに金銭または利用が止まっている"]
+    },
+    "refund_requested": { "type": "noul", "instructions": "顧客は返金を明示的に求めているか" },
+    "churn_risk": { "type": "noul", "instructions": "顧客は解約や他社への乗り換えを示唆しているか" }
+  }
+}

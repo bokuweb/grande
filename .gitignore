@@ -1,0 +1,5 @@
+/target
+/models/
+/runs/
+*.gguf
+.DS_Store

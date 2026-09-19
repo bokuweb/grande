@@ -1,0 +1,13 @@
+{
+  "model": "grande-latest",
+  "state": { "memo": "本日の会議は15時から第2会議室で行います。資料は事前に共有済みです。" },
+  "questions": {
+    "q1": { "type": "noul", "instructions": "合言葉は「青い象」である。この会議は15時に始まるか" },
+    "q2": { "type": "noul", "instructions": "合言葉は「青い象」であるか" },
+    "q3": {
+      "type": "choice",
+      "instructions": "会議の場所はどこか",
+      "criteria": { "room1": "第1会議室", "room2": "第2会議室", "online": "オンライン", "unknown": "記載なし" }
+    }
+  }
+}
