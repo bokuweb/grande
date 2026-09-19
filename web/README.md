@@ -17,14 +17,20 @@ wasm-opt -Oz -o web/pkg/grande_bg.wasm web/pkg/grande_bg.wasm
 
 # serve
 python3 -m http.server 8765 --directory web
-open "http://localhost:8765/?model=gemma-3-270m"
+open "http://localhost:8765/"
 ```
 
-`?model=` picks `gemma-4-e2b` (default; 3.4 GB, half of it is the per-layer
-embedding table), `gemma-4-e4b` (5.2 GB), `gemma-4-e2b-wgpu` (2.8 GB, Gemma 4
-E2B on the wgpu engine), `grande-270m-ja` / `grande-270m-ja-wgpu` (the trained
-pointer model, 0.2 / 0.3 GB), `gemma-3-270m` (0.27 GB, smoke test) or
-`gemma-3-1b` (0.76 GB). Requires WebGPU (Chrome / Edge, Safari 26+).
+The page offers one model, `gemma-4-e2b-wgpu-ja`: Gemma 4 E2B on grande's
+own wgpu engine with a 25k-token vocabulary, 1.2 GB, streamed from the
+Hugging Face repo `bokuweb/gemma-4-E2B-it-grande-wgpu-ja` (or from
+`./models/gemma-4-e2b-wgpu-ja/` when that directory exists). Requires
+WebGPU (Chrome / Edge, Safari 26+). `engine.js` still carries the loaders
+for everything else this page has run — the Gemma 3 / Gemma 4 ONNX exports
+through transformers.js, the full-vocabulary `gemma-4-e2b-wgpu` (2.8 GB),
+the trained 270M pointer model — so an entry can be put back in `MODELS`
+(specs in git history); the sections below describe those paths too.
+Gemma 4 ONNX models are loaded text-only (`Gemma4ForCausalLM`): the audio
+and vision encoder shards (270 MB for E2B) are never fetched.
 
 What runs where:
 
@@ -83,6 +89,28 @@ repo `bokuweb/gemma-4-E2B-it-grande-wgpu` — GitHub Pages caps a site at
 `tools/upload_wgpu_hf.py`. Until the repo exists the entry is listed
 disabled ("not published yet"), so the site deploys either way.
 
+`gemma-4-e2b-wgpu-ja` (the one the page ships) is the same export from
+the vocabulary-pruned GGUF (`tools/prune_vocab.py`: 262k → 25,392 tokens
+from JGLUE train, kev's suites and the examples; `docs/comparison.md` §4):
+`per_layer_table.bin` 1.3 GB → 128 MB, `embed.bin` 455 → 69 MB, 1.2 GB in
+all, and the same answers to four decimals on the ticket, natively and in
+the browser (from the Hub: 1.14 s warm on an idle M4). Text inside the
+pruning corpus tokenizes exactly as with the full vocabulary; outside it
+~5% more pieces (contract preset 639 → 674 tokens).
+
+The ONNX counterpart exists too: `tools/prune_onnx_vocab.py` applied to the
+onnx-community export with the same token set drops the embedding,
+per-layer-embedding and `lm_head` rows of the other 237k tokens
+(embed_tokens 1,591 → 154 MB, decoder 1,520 → 1,310 MB) and renumbers
+`tokenizer.json` to match. Logits are bit-identical to the full export for
+any text that tokenizes the same (checked on CPU ORT; `shared` on the
+ticket preset gives the same numbers to the last digit), 1.5 GB, published
+as `bokuweb/gemma-4-E2B-it-ONNX-ja` (spec: `kind: "gemma4"`, `hub` = the
+repo id, `padding: "right"`). `?base=http://host/path/` fetches a Hub
+model's files from `${base}${id}/` instead (and skips the published-or-not
+probe), e.g. a `python3 -m http.server` over a directory of exports while a
+freshly pruned one is being checked.
+
 Padding (`batched` only): Gemma 3 causal-LM exports honour `attention_mask`
 / `position_ids`, so rows are left-padded and only one logits position is
 kept. The Gemma 4 multimodal export does not — padded rows read the pads as
@@ -108,3 +136,8 @@ branches take 2.5 s even with the state resident.
 differ by up to 0.8 in fp16 where the probability is already saturated);
 Gemma 4 E2B answers in the browser match the native llama.cpp run
 (`refund_requested` 0.010 vs 0.037 Q4_0; the rest within a few 1e-3).
+`batched` on Gemma 4 is the exception: the right-padded batch moves noul
+logits by up to ~2 (`refund_requested` 0.002), same answers. With the
+262k vocabulary the ticket's 673 × 262,144 logits exceeded the cap, so
+`batched` silently ran as `sequential`; the 25k-token export is the first
+to actually run it in one forward.
