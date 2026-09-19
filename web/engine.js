@@ -24,7 +24,11 @@ export const MODELS = {
   // The same trained checkpoint on grande's own wgpu engine (crates/grande-wgpu):
   // state + every question in ONE forward pass with a block-causal mask, no
   // ONNX Runtime. f16 safetensors served from this site.
-  "grande-270m-ja-wgpu": { id: "grande-270m-ja-wgpu", local: true, kind: "wgpu", layout: { layout: "pointer", state: "<unused0>", question: "<unused1>", opt: "<unused2>", opt_end: "<unused3>", decide: "<unused4>" }, size: "0.32 GB", note: "trained, wgpu engine: one pass" },
+  "grande-270m-ja-wgpu": { id: "grande-270m-ja-wgpu", local: true, kind: "wgpu", readout: "pointer", layout: { layout: "pointer", state: "<unused0>", question: "<unused1>", opt: "<unused2>", opt_end: "<unused3>", decide: "<unused4>" }, size: "0.32 GB", note: "trained, wgpu engine: one pass" },
+  // Gemma 4 E2B (Q4_0, from the GGUF via tools/export_wgpu_gguf.py) on the same
+  // engine: zero-shot label readout, state + every question in one pass. The
+  // 1.3 GB per-layer token table stays in JS memory and is gathered per request.
+  "gemma-4-e2b-wgpu": { id: "gemma-4-e2b-wgpu", local: true, kind: "wgpu", readout: "label", manifest: true, layout: GEMMA4, size: "2.8 GB", note: "wgpu engine: one pass" },
   // Trained pointer head (JNLI 0.71 / JCQA 0.71, 12k records) on a Gemma 3 270M
   // backbone with embedding rows pruned to a Japanese + English corpus. Served
   // from this site (./models/, fetched from a GitHub release at build time).
@@ -126,6 +130,80 @@ async function cachedFetch(url, onProgress) {
   return out;
 }
 
+// An exported model directory (tools/export_wgpu_gguf.py): manifest.json lists
+// tensors per file; each file is fetched (and cached) once and pushed into the
+// engine tensor by tensor, so only one file is in memory at a time. The
+// per-layer token table (Gemma 4) is kept in JS and gathered per request.
+async function loadManifest(base, config, onProgress) {
+  const manifest = await (await fetch(`${base}manifest.json`)).json();
+  const loader = await grande.WgpuLoader.open(config);
+  const total = manifest.files.length + (manifest.per_layer_table ? 1 : 0);
+  let done = 0;
+  for (const file of manifest.files) {
+    const buf = new Uint8Array(await (await cachedFetch(`${base}${file.path}`, onProgress)).arrayBuffer());
+    for (const t of file.tensors) {
+      loader.push(t.name, t.dtype, Uint32Array.from(t.shape), buf.subarray(t.offset, t.offset + t.nbytes),
+        t.scales_nbytes ? buf.subarray(t.scales_offset, t.scales_offset + t.scales_nbytes) : new Uint8Array(0));
+    }
+    onProgress?.({ status: "upload", file: file.path, loaded: ++done, total });
+  }
+  let plTable = null;
+  const pl = manifest.per_layer_table;
+  if (pl) {
+    const buf = new Uint8Array(await (await cachedFetch(`${base}${pl.path}`, onProgress)).arrayBuffer());
+    plTable = { dtype: pl.dtype, rows: pl.shape[0], width: pl.shape[1], data: buf.subarray(pl.offset, pl.offset + pl.nbytes),
+      scales: buf.subarray(pl.scales_offset, pl.scales_offset + pl.scales_nbytes) };
+    onProgress?.({ status: "upload", file: pl.path, loaded: ++done, total });
+  }
+  onProgress?.({ status: "ready" });
+  return { gpu: loader.finish(4096, 256), plTable };
+}
+
+// f16 <-> f32 without Float16Array (Chrome < 135, Firefox < 129).
+function f16ToF32(h) {
+  const s = (h & 0x8000) ? -1 : 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
+  if (e === 0) return s * m * 2 ** -24;
+  if (e === 31) return m ? NaN : s * Infinity;
+  return s * (1 + m / 1024) * 2 ** (e - 15);
+}
+const f32Buf = new Float32Array(1), u32Buf = new Uint32Array(f32Buf.buffer);
+function f32ToF16(v) {
+  f32Buf[0] = v;
+  const x = u32Buf[0], sign = (x >>> 16) & 0x8000;
+  let e = ((x >>> 23) & 0xff) - 127 + 15, m = x & 0x7fffff;
+  if (e >= 31) return sign | 0x7c00;
+  if (e <= 0) { if (e < -10) return sign; m = (m | 0x800000) >> (1 - e); return sign | ((m + 0x1000) >> 13); }
+  return sign | (e << 10) | ((m + 0x1000) >> 13);
+}
+
+// Gather + dequantize the per-layer token table rows for `ids`: f16
+// little-endian [ids][width], what WgpuEngine.evaluate_rows expects.
+function gatherPerLayer(table, ids) {
+  const { width, data, scales, dtype } = table;
+  const blocks = width / 32;
+  const hasF16 = typeof Float16Array !== "undefined";
+  const out = hasF16 ? new Float16Array(ids.length * width) : new Uint16Array(ids.length * width);
+  const put = hasF16 ? (i, v) => { out[i] = v; } : (i, v) => { out[i] = f32ToF16(v); };
+  const sc = new Uint16Array(scales.buffer, scales.byteOffset, scales.byteLength / 2);
+  const bpb = dtype === "q8" ? 32 : 16; // payload bytes per block
+  for (let t = 0; t < ids.length; t++) {
+    const row = ids[t];
+    let o = t * width;
+    for (let b = 0; b < blocks; b++) {
+      const d = f16ToF32(sc[row * blocks + b]);
+      const p = (row * blocks + b) * bpb;
+      if (dtype === "q8") {
+        for (let j = 0; j < 32; j++) put(o++, ((data[p + j] << 24) >> 24) * d);
+      } else {
+        for (let j = 0; j < 16; j++) put(o + j, ((data[p + j] & 0xf) - 8) * d);
+        for (let j = 0; j < 16; j++) put(o + 16 + j, ((data[p + j] >> 4) - 8) * d);
+        o += 32;
+      }
+    }
+  }
+  return new Uint8Array(out.buffer);
+}
+
 let wasmReady = null;
 
 export async function loadEngine({ transformers, model = "gemma-3-1b", device = "webgpu", onProgress } = {}) {
@@ -142,7 +220,7 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
   navigator.storage?.persist?.().catch(() => {});
   const { AutoTokenizer, AutoModelForCausalLM, AutoProcessor, Gemma4ForConditionalGeneration, Tensor, DynamicCache } = transformers;
 
-  let tok, net, head = null, idMap = null, gpu = null;
+  let tok, net, head = null, idMap = null, gpu = null, plTable = null;
   if (spec.kind === "wgpu") {
     transformers.env.allowLocalModels = true;
     transformers.env.localModelPath = "./models/";
@@ -150,11 +228,16 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     const base = new URL(`./models/${spec.id}/`, location.href).href;
     tok = await AutoTokenizer.from_pretrained(spec.id, { progress_callback: onProgress });
     transformers.env.allowRemoteModels = true;
-    head = await loadHead(`${base}head.safetensors`);
     const config = await (await fetch(`${base}config.json`)).text();
-    const weights = new Uint8Array(await (await cachedFetch(`${base}model.safetensors`, onProgress)).arrayBuffer());
-    onProgress?.({ status: "ready" });
-    gpu = await grande.WgpuEngine.load(config, weights, 4096, 256);
+    if (spec.manifest) {
+      ({ gpu, plTable } = await loadManifest(base, config, onProgress));
+    } else {
+      head = await loadHead(`${base}head.safetensors`);
+      const weights = new Uint8Array(await (await cachedFetch(`${base}model.safetensors`, onProgress)).arrayBuffer());
+      onProgress?.({ status: "ready" });
+      gpu = await grande.WgpuEngine.load(config, weights, 4096, 256);
+    }
+    await gpu.warmup();
   } else if (spec.local) {
     // Same-origin model directory. transformers.js only probes local files when
     // localModelPath is NOT an absolute URL (its metadata check skips http(s)
@@ -337,6 +420,30 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     return { ids, ends };
   }
 
+  // Per-layer embedding rows for a packed request (Gemma 4), or undefined.
+  function perLayerRows(prefix, branches) {
+    if (!plTable) return undefined;
+    const ids = prefix.concat(...branches.map((b) => b.tokens));
+    return gatherPerLayer(plTable, ids);
+  }
+
+  // Zero-shot label readout on the wgpu engine: one pass, the full-vocabulary
+  // logits at each branch's last token come back, and the option labels'
+  // logits plus the candidate mass are read from them (same as the ONNX path).
+  async function labelWgpu(rendered) {
+    const prefix = packSegments(rendered.prefix).ids;
+    const branches = rendered.branches.map((b) => {
+      const { ids } = packSegments(b.segments);
+      return { tokens: ids, want: [ids.length - 1], k: b.keys.length };
+    });
+    const flat = await gpu.evaluate_rows(Uint32Array.from(prefix), JSON.stringify(branches.map(({ tokens, want }) => ({ tokens, want }))), "logits",
+      perLayerRows(prefix, branches));
+    const V = flat.length / branches.length;
+    const rows = branches.map((b, i) => readRow(flat, [branches.length, 1, V], i, 0, b.k));
+    const tokens = prefix.length + branches.reduce((n, b) => n + b.tokens.length, 0);
+    return { rows, tokens, prefixTokens: prefix.length };
+  }
+
   // Pointer readout on the wgpu engine: prefix once, every branch isolated by
   // the mask, one pass. Rows come back branch by branch, each option end then
   // the decide token, as `d`-wide hidden states.
@@ -347,7 +454,8 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
       const want = b.marks.map(([seg, mark]) => (mark === "Last" ? ids.length - 1 : ends[seg]));
       return { tokens: ids, want, k: b.keys.length };
     });
-    const flat = await gpu.evaluate(Uint32Array.from(prefix), JSON.stringify(branches.map(({ tokens, want }) => ({ tokens, want }))), "hidden");
+    const flat = await gpu.evaluate_rows(Uint32Array.from(prefix), JSON.stringify(branches.map(({ tokens, want }) => ({ tokens, want }))), "hidden",
+      perLayerRows(prefix, branches));
     const D = head.d;
     let off = 0;
     const rows = branches.map((b) => {
@@ -402,7 +510,8 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
   // `mode`; the pointer readouts have one path each.
   async function rowsFor(rendered, mode) {
     if (spec.kind === "pointer" || spec.kind === "wgpu") {
-      const { rows, tokens, prefixTokens } = spec.kind === "wgpu" ? await pointerWgpu(rendered) : await pointerBatched(rendered);
+      for (const b of rendered.branches) if (spec.readout === "label" && b.keys.length > labelIds.length) throw new Error(`a question has ${b.keys.length} options; this tokenizer supports ${labelIds.length} single-token labels`);
+      const { rows, tokens, prefixTokens } = spec.kind !== "wgpu" ? await pointerBatched(rendered) : spec.readout === "label" ? await labelWgpu(rendered) : await pointerWgpu(rendered);
       return { rows, tokens, forwards: 1, state_tokens: prefixTokens, mode: spec.kind === "wgpu" ? "packed" : "batched" };
     }
     const prefix = segmentsToText(rendered.prefix, bos);

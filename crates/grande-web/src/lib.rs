@@ -154,10 +154,23 @@ impl WgpuEngine {
         Ok(WgpuEngine { inner })
     }
 
-    /// Hidden width and vocabulary size, as JSON.
+    /// Hidden width, vocabulary size, BOS id, per-layer embedding width and
+    /// layer count, as JSON.
     pub fn config(&self) -> String {
         let c = &self.inner.config;
-        format!("{{\"d\":{},\"vocab\":{},\"bos\":{}}}", c.d, c.vocab, c.bos)
+        format!(
+            "{{\"d\":{},\"vocab\":{},\"bos\":{},\"per_layer_dim\":{},\"layers\":{}}}",
+            c.d, c.vocab, c.bos, c.per_layer_dim, c.layers
+        )
+    }
+
+    /// Run a two-token request so the first real one does not pay for the
+    /// workspace's first touch.
+    pub async fn warmup(&self) -> Result<(), JsError> {
+        self.inner
+            .warmup()
+            .await
+            .map_err(|e| JsError::new(&format!("{e:#}")))
     }
 
     /// Run one packed pass. `branches` is JSON `[{"tokens":[...],"want":[...]}]`
@@ -169,6 +182,19 @@ impl WgpuEngine {
         prefix: Vec<u32>,
         branches: &str,
         want: &str,
+    ) -> Result<Vec<f32>, JsError> {
+        self.evaluate_rows(prefix, branches, want, None).await
+    }
+
+    /// `evaluate` for models with per-layer embeddings (Gemma 4): the caller
+    /// gathers the per-layer token table rows for prefix + branch tokens,
+    /// f16 little-endian `[tokens][layers x P]`.
+    pub async fn evaluate_rows(
+        &self,
+        prefix: Vec<u32>,
+        branches: &str,
+        want: &str,
+        per_layer_rows: Option<Vec<u8>>,
     ) -> Result<Vec<f32>, JsError> {
         let branches: Vec<BranchIn> =
             serde_json::from_str(branches).map_err(|e| JsError::new(&format!("branches: {e}")))?;
@@ -189,12 +215,82 @@ impl WgpuEngine {
         };
         let out = self
             .inner
-            .evaluate(&prefix, &branches, want)
+            .evaluate_rows(&prefix, &branches, want, per_layer_rows.as_deref())
             .await
             .map_err(|e| JsError::new(&format!("{e:#}")))?;
         Ok(out
             .into_iter()
             .flat_map(|b| b.rows.into_iter().flatten())
             .collect())
+    }
+}
+
+/// Streams an exported model directory (tools/export_wgpu_gguf.py) into the
+/// wgpu engine one tensor at a time, so a multi-GB checkpoint never has to
+/// sit in wasm memory whole.
+#[cfg(feature = "wgpu")]
+#[wasm_bindgen]
+pub struct WgpuLoader {
+    inner: Option<grande_wgpu::EngineBuilder>,
+}
+
+#[cfg(feature = "wgpu")]
+#[wasm_bindgen]
+impl WgpuLoader {
+    /// `config` is the directory's config.json.
+    pub async fn open(config: &str) -> Result<WgpuLoader, JsError> {
+        let v: serde_json::Value =
+            serde_json::from_str(config).map_err(|e| JsError::new(&format!("config: {e}")))?;
+        let cfg =
+            grande_wgpu::Config::from_json(&v).map_err(|e| JsError::new(&format!("{e:#}")))?;
+        let inner = grande_wgpu::EngineBuilder::new(cfg)
+            .await
+            .map_err(|e| JsError::new(&format!("{e:#}")))?;
+        Ok(WgpuLoader { inner: Some(inner) })
+    }
+
+    /// Upload one tensor: `dtype` is "f16" / "q8" / "q4", `shape` its
+    /// dimensions, `data` the payload and `scales` the f16 block scales
+    /// (empty for f16), both as the manifest lays them out.
+    pub fn push(
+        &mut self,
+        name: &str,
+        dtype: &str,
+        shape: Vec<u32>,
+        data: Vec<u8>,
+        scales: Vec<u8>,
+    ) -> Result<(), JsError> {
+        let b = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| JsError::new("loader already finished"))?;
+        let dtype = grande_wgpu::Dtype::parse(dtype).map_err(|e| JsError::new(&format!("{e:#}")))?;
+        let t = grande_wgpu::QTensor::from_raw(
+            dtype,
+            shape.into_iter().map(|x| x as usize).collect(),
+            data,
+            scales,
+        )
+        .map_err(|e| JsError::new(&format!("{name}: {e:#}")))?;
+        b.push(name, &t)
+            .map_err(|e| JsError::new(&format!("{name}: {e:#}")))
+    }
+
+    /// Names still to push.
+    pub fn missing(&self) -> Vec<String> {
+        self.inner.as_ref().map(|b| b.missing()).unwrap_or_default()
+    }
+
+    /// Allocate the workspace and wire the engine. `capacity` is the
+    /// packed-token budget, `max_rows` how many rows a request may read back.
+    pub fn finish(&mut self, capacity: u32, max_rows: u32) -> Result<WgpuEngine, JsError> {
+        let b = self
+            .inner
+            .take()
+            .ok_or_else(|| JsError::new("loader already finished"))?;
+        let inner = b
+            .finish(capacity as usize, max_rows as usize)
+            .map_err(|e| JsError::new(&format!("{e:#}")))?;
+        Ok(WgpuEngine { inner })
     }
 }
