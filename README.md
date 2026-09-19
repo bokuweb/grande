@@ -57,7 +57,16 @@ vocabulary: 1.2 GB streamed from the Hub once and cached in the browser,
       WebGPU from the same kernels. Parity with llama.cpp on the trained 270M
       and on E2B Q4_0; `grande --model <checkpoint dir>` and the
       `gemma-4-e2b-wgpu-ja` browser model (1.2 GB after vocabulary pruning).
-- [ ] IIA test, permutation flip rate on a JGLUE sample
+- [x] `--orders N`: every Choice / Noul asked under N option orders in the
+      same pass, logits averaged (position bias out); `order_spread` in the
+      diagnostics. Permutation flip rate on JGLUE below.
+- [x] two-stage Choice: more options than the label readout can letter
+      (52) are asked in groups, the top of each group re-asked together in a
+      second pass; banking77 (77-way) scored on kev's suite.
+- [x] state rendered as `path: value` lines (`ticket.messages[0].text: …`),
+      so questions can point at nested fields and conversation arrays the
+      way TypeSafe's docs do; Python renderer mirrors it.
+- [ ] IIA test
 
 ## First numbers (2026-09-19, M-series Mac, Metal)
 
@@ -130,7 +139,7 @@ See [docs/comparison.md](docs/comparison.md). Short version, same M4:
   at 73–77 ms per record, and a 12-layer vocab-pruned 256 MB version
   0.685 / 0.630 at 26–34 ms.
 - kev's English suite (identical questions): kev 0.797, Jev 0.808, grande
-  E2B zero-shot 0.677 (banking77 excluded).
+  E2B zero-shot 0.678 (banking77, two-stage, 0.575).
 - Browser, same 5-question Japanese ticket: grande E2B 2.8 s cold / 2.5 s
   with the state resident (was 4.2 s re-reading the state per question) and
   all 5 right; reflex 0.8B 6.7 s cold / 3.5 s warm and 3 of 5 wrong.
@@ -273,6 +282,43 @@ in 0.41–0.74 s against 2.9–4.0 s; natively it is still 2–3× behind
 llama.cpp's Metal kernels at ~500–900 tokens and ~10× at 2,500 (the
 attention over a long prefix is where the kernel is weakest). Native stays
 on llama.cpp; the browser is where this engine pays off.
+## Order averaging and two-stage Choice
+
+Position bias is real on a zero-shot label readout: the same Noul reads
+differently with `true` listed first or second (on the ticket example,
+`churn_risk` moves by 0.33 between orders). `--orders N` (probe, jglue,
+suite, serve) asks every Choice and Noul under N option orders — the
+identity, its rotations, then their reversals — as extra branches of the
+same pass and averages the option logits, so the state is still read once.
+`order_spread` in the diagnostics (`X-Grande-Order-Spread-Max` from the
+server) is the largest |Δp| any option showed between two orders, i.e. the
+bias that was averaged out. Score levels are never permuted.
+
+JGLUE valid, first 300 records, E2B Q4_0, label readout, no temperature
+(`grande jglue --limit 300 [--orders 3]`):
+
+| | JNLI acc | JNLI ECE | JNLI NLL | JCQA acc | JCQA ECE | JCQA NLL | ms / record |
+|---|---|---|---|---|---|---|---|
+| 1 order | 0.530 | 0.341 | 1.493 | 0.857 | 0.051 | 0.471 | ~400 / 319 |
+| 3 orders | **0.567** | **0.275** | **1.184** | **0.860** | **0.041** | **0.385** | 980 / 720 |
+
+Under 3 orders (`--permute 3`) the JNLI argmax flips on 14% of records and
+the distributions differ by 0.34 in L1 on average, which is what the
+average removes. The branches are not free on llama.cpp (2–2.5× the time
+per record here); on the wgpu engine, where every branch is one block of
+the same pass, the cost is closer to the extra tokens alone.
+
+A Choice with more options than the label readout can letter (52) no
+longer errors: the options are asked in groups of at most 52 in the first
+pass, the top options of every group (as many as fit under 52 together)
+are asked once more against each other in a second pass, and the answer's
+probabilities are the second pass's, with the eliminated options at 0.
+`two_stage` in the diagnostics lists the finalists. On kev's banking77
+(77 intents) this scores 0.575 zero-shot against kev 0.800 / Jev 0.838;
+the group stage loses the gold intent in 6 of 80 records, the rest are
+second-stage misses (see [docs/comparison.md](docs/comparison.md)). The
+pointer readout has no cap and never needs this.
+
 ## Notes
 
 - Gemma's tokenizer splits digits (`10` → 2 tokens, `254` → 3), so the label

@@ -143,15 +143,77 @@ pub fn content_text(v: &Value) -> String {
     }
 }
 
-/// Render `state` as a block of labelled lines when it is an object, so
-/// questions can refer to keys by name; otherwise as [`content_text`].
+/// Render `state` as one `path: value` line per leaf, so a question can
+/// point at any part of it with the same dot-and-index path TypeSafe's docs
+/// use (`` `ticket.messages[0].text` ``). A string state passes through; an
+/// object or array is flattened depth-first in request order, so a
+/// conversation array reads as `[0].role: user` / `[0].content: …`. Empty
+/// containers and scalars are leaves and render as [`content_text`].
 pub fn state_text(v: &Value) -> String {
     match v {
-        Value::Object(map) => map
-            .iter()
-            .map(|(k, v)| format!("{k}: {}", content_text(v)))
-            .collect::<Vec<_>>()
-            .join("\n"),
+        Value::Object(_) | Value::Array(_) => {
+            let mut lines = Vec::new();
+            flatten_state("", v, &mut lines);
+            lines.join("\n")
+        }
         other => content_text(other),
+    }
+}
+
+fn flatten_state(path: &str, v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Object(map) if !map.is_empty() => {
+            for (k, x) in map {
+                let p = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
+                flatten_state(&p, x, out);
+            }
+        }
+        Value::Array(items) if !items.is_empty() => {
+            for (i, x) in items.iter().enumerate() {
+                flatten_state(&format!("{path}[{i}]"), x, out);
+            }
+        }
+        leaf if path.is_empty() => out.push(content_text(leaf)),
+        leaf => out.push(format!("{path}: {}", content_text(leaf))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn flat_object_renders_key_lines() {
+        let s = state_text(&json!({"premise": "雨だ", "hypothesis": "濡れる"}));
+        assert_eq!(s, "premise: 雨だ\nhypothesis: 濡れる");
+    }
+
+    #[test]
+    fn nested_and_arrays_render_as_paths() {
+        let s = state_text(&json!({
+            "ticket": {"id": 7, "messages": [{"role": "user", "text": "hi"}]},
+            "tags": ["a", "b"],
+            "empty": {},
+            "none": null
+        }));
+        assert_eq!(
+            s,
+            "ticket.id: 7\nticket.messages[0].role: user\nticket.messages[0].text: hi\n\
+             tags[0]: a\ntags[1]: b\nempty: {}\nnone: "
+        );
+    }
+
+    #[test]
+    fn conversation_array_at_top_level() {
+        let s = state_text(&json!([{"role": "customer", "content": "Why twice?"}]));
+        assert_eq!(s, "[0].role: customer\n[0].content: Why twice?");
+        assert_eq!(state_text(&json!([])), "[]");
+        assert_eq!(state_text(&json!({})), "{}");
+        assert_eq!(state_text(&json!("plain")), "plain");
     }
 }
