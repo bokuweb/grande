@@ -80,7 +80,7 @@ struct QkParams {
     v_norm: u32,
     offset: f32,
     q_stride: u32,
-    _p0: u32,
+    kv_heads: u32,
     _p1: u32,
 }
 
@@ -91,6 +91,10 @@ struct AttnParams {
     heads: u32,
     window: u32,
     q_stride: u32,
+    kv_heads: u32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
 }
 
 #[repr(C)]
@@ -676,11 +680,15 @@ impl EngineBuilder {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        // K/V per layer that owns one: [capacity][2 x hd].
+        // K/V per layer that owns one: [capacity][2 x kv_heads x hd].
         let kv_bufs: Vec<Option<wgpu::Buffer>> = (0..l_count)
             .map(|l| {
-                cfg.has_kv(l)
-                    .then(|| f32_buf(&format!("kv.{l}"), capacity * 2 * cfg.head_dim[l]))
+                cfg.has_kv(l).then(|| {
+                    f32_buf(
+                        &format!("kv.{l}"),
+                        capacity * 2 * cfg.kv_heads * cfg.head_dim[l],
+                    )
+                })
             })
             .collect();
         // Per-layer inputs: gathered table rows (f16 pairs) and the combined
@@ -1222,7 +1230,7 @@ impl Engine {
                     v_norm: cfg.v_norm as u32,
                     offset: cfg.norm_offset,
                     q_stride: l.qkv_width as u32,
-                    _p0: 0,
+                    kv_heads: cfg.kv_heads as u32,
                     _p1: 0,
                 });
                 run("qk_prep", &l.qk, off, (t as u32, 1));
@@ -1231,13 +1239,19 @@ impl Engine {
                     heads: cfg.heads as u32,
                     window: if l.sliding { cfg.window as u32 } else { 0 },
                     q_stride: l.qkv_width as u32,
+                    kv_heads: cfg.kv_heads as u32,
+                    _p0: 0,
+                    _p1: 0,
+                    _p2: 0,
                 });
+                // One workgroup per ROWS query rows of one KV head (wg.y).
                 let (rows, _) = attn_tile(l.hd);
+                let hpg = cfg.heads / cfg.kv_heads;
                 run(
                     "attention",
                     &l.attn,
                     off,
-                    (div_ceil(t * cfg.heads, rows), 1),
+                    (div_ceil(t * hpg, rows), cfg.kv_heads as u32),
                 );
                 let attn_w = cfg.heads * l.hd;
                 let off = params.push(mm(d, attn_w));

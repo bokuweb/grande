@@ -4,8 +4,8 @@ The quantized weights are kept as they are (Q8_0 / Q4_0 codes) but repacked
 into the engine's layout: per tensor, the f16 block scales in one contiguous
 run and the codes in another, so both are 4-byte aligned storage buffers.
 f32 / bf16 tensors become f16. q / k / v are fused into one `qkv` tensor per
-layer; layers that share an earlier layer's K/V (Gemma 4) drop their unused
-k / v. The per-layer token table (Gemma 4) goes to its own file, gathered by
+layer, [q heads | k heads | v heads] (E4B has two K/V heads); layers that
+share an earlier layer's K/V (Gemma 4) drop their unused k / v. The per-layer token table (Gemma 4) goes to its own file, gathered by
 the host per request rather than uploaded to the GPU.
 
 Output directory:
@@ -211,7 +211,7 @@ def main():
         w.tensor(f"blk.{l}.attn_norm", t("attn_norm"), [d])
         parts = [t("attn_q")] + ([t("attn_k"), t("attn_v")] if has_kv else [])
         kind, blocks = concat_quant(parts)
-        width = heads * hd + (2 * hd if has_kv else 0)
+        width = heads * hd + (2 * kv_heads * hd if has_kv else 0)
         if kind in BLOCK_BYTES:
             w.quant(f"blk.{l}.qkv", kind, blocks, [width, d])
         else:

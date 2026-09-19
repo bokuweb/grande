@@ -4,18 +4,20 @@
 // sliding-window layers) within the window. That is the isolation rule the
 // llama.cpp backend gets from its per-sequence KV cache.
 //
-// One KV head shared by `heads` query heads. Q is read from the layer's fused
+// `kv_heads` KV heads, each shared by `heads / kv_heads` consecutive query
+// heads (one for E2B, two for E4B). Q is read from the layer's fused
 // projection buffer (row stride q_stride), K and V from a K/V buffer
-// [t][2 x HD] that may belong to an earlier layer (Gemma 4 shares K/V). A
-// workgroup of 128 handles ROWS query rows = (ROWS / heads) tokens x heads
-// with their Q held as f16 in workgroup memory, and streams keys KB at a time
-// (ROWS x KB = 128). A tile no row can see is skipped (keys after the block,
+// [t][kv_heads x HD | kv_heads x HD] (all K heads, then all V heads) that
+// may belong to an earlier layer (Gemma 4 shares K/V). A workgroup of 128
+// handles ROWS query rows of one KV head, wg.y: (ROWS / hpg) tokens x the
+// hpg query heads of that group, with their Q held as f16 in workgroup
+// memory, and streams that head's keys KB at a time (ROWS x KB = 128). A tile no row can see is skipped (keys after the block,
 // other branches). Otherwise each invocation computes one full (row, key)
 // score, then owns HD/KB output dims of one row for the online softmax and
 // P.V. HD, ROWS and KB are substituted by the engine: 8 x 16 at HD 256
 // (~12.5 KB of workgroup memory), 16 x 8 at HD 512 (~24.5 KB).
 
-struct Params { t: u32, heads: u32, window: u32, q_stride: u32 }
+struct Params { t: u32, heads: u32, window: u32, q_stride: u32, kv_heads: u32, _p0: u32, _p1: u32, _p2: u32 }
 
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> q: array<f32>;
@@ -47,14 +49,19 @@ fn visible(qp: i32, qs_: i32, kp: i32, ks_: i32) -> bool {
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let heads = p.heads;
-    let tb = ROWS / heads;
+    let hpg = heads / p.kv_heads; // query heads per KV head
+    let g = wg.y;                 // this workgroup's KV head
+    let tb = ROWS / hpg;
     let tok0 = wg.x * tb;
+    let kv_stride = 2u * p.kv_heads * HD;
+    let kb0 = g * HD;                    // K head offset in a kv row
+    let vb0 = (p.kv_heads + g) * HD;     // V head offset in a kv row
 
     let row = li / KB;          // 0..ROWS, both roles
     let key = li % KB;          // score role
     let chunk = key * CH;       // output role: CH dims of `row`
-    let tok = tok0 + row / heads;
-    let head = row % heads;
+    let tok = tok0 + row / hpg;
+    let head = g * hpg + row % hpg;
     let ok = tok < p.t;
 
     // Q tile as f16 pairs: CH/2 pairs per invocation.
@@ -118,7 +125,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
             let j = j0 + kk;
             var v = vec2<f32>(0.0);
             if (j < p.t) {
-                let b = j * 2u * HD + 2u * d2;
+                let b = j * kv_stride + kb0 + 2u * d2;
                 v = vec2<f32>(kv[b], kv[b + 1u]);
             }
             ks[e] = pack2x16float(v);
@@ -133,7 +140,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
             for (var i = 0u; i < HP; i++) {
                 acc += dot(unpack2x16float(qs[qb + i]), unpack2x16float(ks[kb + i]));
             }
-            let vis = visible(qpos[row / heads], qseq[row / heads], kpos[key], kseq[key]);
+            let vis = visible(qpos[row / hpg], qseq[row / hpg], kpos[key], kseq[key]);
             s[li] = select(NEG, acc, vis);
         }
         workgroupBarrier();
@@ -153,7 +160,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
                 if (sc > NEG * 0.5) {
                     let pr = exp(sc - m);
                     l += pr;
-                    let vb = (j0 + k) * 2u * HD + HD + chunk;
+                    let vb = (j0 + k) * kv_stride + vb0 + chunk;
                     for (var i = 0u; i < NV; i++) {
                         let b = vb + 4u * i;
                         o[i] += pr * vec4<f32>(kv[b], kv[b + 1u], kv[b + 2u], kv[b + 3u]);
