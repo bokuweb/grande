@@ -55,6 +55,11 @@ enum Cmd {
         head: Option<PathBuf>,
         #[arg(long, default_value_t = 1.0)]
         temperature: f32,
+        /// Contextual calibration: also ask every question over this
+        /// content-free state and subtract the model's prior over the
+        /// options (Zhao et al. 2021). Pass without a value for "N/A".
+        #[arg(long, num_args = 0..=1, default_missing_value = grande_core::calibration::CONTENT_FREE)]
+        baseline: Option<String>,
         #[arg(long, default_value_t = 8192)]
         n_ctx: u32,
         #[arg(long, default_value_t = 999)]
@@ -92,6 +97,11 @@ enum Cmd {
         /// scaffolding (fewer branch tokens).
         #[arg(long)]
         terse: bool,
+        /// Contextual calibration: also ask every question over this
+        /// content-free state and subtract the model's prior over the
+        /// options (Zhao et al. 2021). Pass without a value for "N/A".
+        #[arg(long, num_args = 0..=1, default_missing_value = grande_core::calibration::CONTENT_FREE)]
+        baseline: Option<String>,
     },
     /// Prefill throughput: a synthetic state of about N tokens and Q
     /// questions, packed, repeated a few times.
@@ -142,6 +152,11 @@ enum Cmd {
         head: Option<PathBuf>,
         #[arg(long, default_value_t = 1.0)]
         temperature: f32,
+        /// Contextual calibration: also ask every question over this
+        /// content-free state and subtract the model's prior over the
+        /// options (Zhao et al. 2021). Pass without a value for "N/A".
+        #[arg(long, num_args = 0..=1, default_missing_value = grande_core::calibration::CONTENT_FREE)]
+        baseline: Option<String>,
         #[arg(long, default_value_t = 8192)]
         n_ctx: u32,
         /// RAM for serialized states of recently seen documents (MB). A
@@ -279,6 +294,7 @@ fn main() -> Result<()> {
             permute,
             head,
             terse,
+            baseline,
         } => {
             use grande_eval::jglue::{self, Task};
             use grande_eval::report::{summarize, Row};
@@ -341,6 +357,7 @@ fn main() -> Result<()> {
                 "gemma_label"
             };
             let mut engine = Engine::new(backend, renderer, readout, name.clone());
+            engine.baseline = baseline;
             let mut rows = Vec::with_capacity(items.len());
             let mut file = std::io::BufWriter::new(std::fs::File::create(&rows_path)?);
             use std::io::Write;
@@ -379,6 +396,7 @@ fn main() -> Result<()> {
                     id: item.id.clone(),
                     gold: item.gold,
                     logits: d.logits.clone(),
+                    baseline: d.baseline.clone(),
                     pred,
                     candidate_mass: diag.candidate_mass.values().next().copied(),
                     ms: t.elapsed().as_millis(),
@@ -638,6 +656,7 @@ fn main() -> Result<()> {
             port,
             api_key,
             temperature,
+            baseline,
             n_ctx,
             state_cache_mb,
             state_cache_dir,
@@ -662,6 +681,7 @@ fn main() -> Result<()> {
             let (renderer, readout) = readout_for(&backend, head.as_ref())?;
             let mut engine = Engine::new(backend, renderer, readout, name.clone());
             engine.temperature = temperature;
+            engine.baseline = baseline;
             let state = std::sync::Arc::new(grande_server::AppState {
                 engine: std::sync::Mutex::new(engine),
                 api_key,
@@ -787,6 +807,7 @@ fn main() -> Result<()> {
                         id: format!("{}/{}", rec.id, branch.id),
                         gold,
                         logits: d.logits.clone(),
+                        baseline: d.baseline.clone(),
                         pred: grande_core::math::argmax(&d.probs),
                         candidate_mass: diag.candidate_mass.get(&branch.id).copied(),
                         ms,
@@ -892,6 +913,7 @@ fn main() -> Result<()> {
             mode,
             head,
             temperature,
+            baseline,
             n_ctx,
             n_gpu_layers,
             swa_full,
@@ -919,6 +941,7 @@ fn main() -> Result<()> {
             let (renderer, readout) = readout_for(&*backend, head.as_ref())?;
             let mut engine = Engine::new(backend, renderer, readout, name);
             engine.temperature = temperature;
+            engine.baseline = baseline;
 
             match mode {
                 ModeArg::Packed | ModeArg::Separate => {
@@ -937,6 +960,9 @@ fn main() -> Result<()> {
                     );
                     for (id, m) in &diag.candidate_mass {
                         eprintln!("  candidate_mass {id}: {m:.4}");
+                    }
+                    for (id, b) in &diag.baseline {
+                        eprintln!("  baseline {id}: {b:?}");
                     }
                 }
                 ModeArg::Check => {
