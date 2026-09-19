@@ -215,16 +215,22 @@ pub mod safetensors {
         let raw = bytes.get(a..b).ok_or_else(|| bad("offsets out of range"))?;
         let data: Vec<f32> = match dtype {
             "F32" => raw
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect(),
             "F16" => raw
-                .chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| f16_to_f32(u16::from_le_bytes(*c)))
                 .collect(),
             "BF16" => raw
-                .chunks_exact(2)
-                .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| f32::from_bits(u32::from(u16::from_le_bytes(*c)) << 16))
                 .collect(),
             other => return Err(bad(format!("unsupported dtype {other}"))),
         };
