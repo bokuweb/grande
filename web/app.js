@@ -51,6 +51,7 @@ $("load").addEventListener("click", async () => {
         } else if (info.status === "ready") setStatus("初期化中…", 100);
       },
     });
+    window.grandeEngine = engine; // for the console
     setStatus(`${engine.spec.id} 読み込み完了（WebGPU, ${engine.spec.dtype}）`, 100);
     $("run").disabled = false;
   } catch (e) {

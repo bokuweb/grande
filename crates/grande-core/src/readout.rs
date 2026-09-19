@@ -69,7 +69,11 @@ impl Distribution {
     /// (a browser backend that read the label logits itself).
     pub fn from_logits(logits: Vec<f32>, temperature: f32, candidate_mass: Option<f64>) -> Self {
         let probs = softmax(&logits, temperature);
-        Distribution { logits, probs, candidate_mass }
+        Distribution {
+            logits,
+            probs,
+            candidate_mass,
+        }
     }
 }
 

@@ -17,7 +17,7 @@ const GEMMA4 = { layout: "label", turn_start: "<|turn>", turn_end: "<turn|>", us
 export const MODELS = {
   "gemma-3-270m": { id: "onnx-community/gemma-3-270m-it-ONNX", kind: "causal", layout: GEMMA3, dtype: "q4f16", size: "0.27 GB", note: "smoke test only" },
   "gemma-3-1b": { id: "onnx-community/gemma-3-1b-it-ONNX", kind: "causal", layout: GEMMA3, dtype: "q4f16", size: "0.76 GB", note: "default" },
-  "gemma-4-e2b": { id: "onnx-community/gemma-4-E2B-it-ONNX", kind: "gemma4", layout: GEMMA4, dtype: "q4f16", size: "3.1 GB", note: "PLE embeddings are half of it" },
+  "gemma-4-e2b": { id: "onnx-community/gemma-4-E2B-it-ONNX", kind: "gemma4", layout: GEMMA4, dtype: "q4f16", size: "3.4 GB", note: "PLE embeddings are half of it", padding: "right" },
 };
 
 const ZWNJ = "‌";
@@ -74,30 +74,32 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     labelIds.push(ids[0]);
   }
 
-  function rowsFromLogits(logits, dims, keysPerRow) {
-    // logits: Float32Array/Float16Array [B, K, V]; read the last kept position per row.
-    const [B, K, V] = dims;
-    const rows = [];
-    for (let b = 0; b < B; b++) {
-      const last = logits.subarray((b * K + K - 1) * V, (b * K + K) * V);
-      const k = keysPerRow[b];
-      const ids = labelIds.slice(0, k);
-      const z = ids.map((i) => Number(last[i]));
-      const mass = Math.exp(logSumExp(last, ids) - logSumExp(last));
-      rows.push({ logits: z, candidate_mass: mass });
-    }
-    return rows;
+  function readRow(logits, dims, b, position, k) {
+    const [, K, V] = dims;
+    const last = logits.subarray((b * K + position) * V, (b * K + position + 1) * V);
+    const ids = labelIds.slice(0, k);
+    const z = ids.map((i) => Number(last[i]));
+    const mass = Math.exp(logSumExp(last, ids) - logSumExp(last));
+    return { logits: z, candidate_mass: mass };
   }
 
-  // One batched forward: every row is "prefix + branch", left-padded so the last
-  // position is real, `num_logits_to_keep = 1` so the 262k-vocab projection runs at
-  // one position per row instead of every token.
+  function rowsFromLogits(logits, dims, keysPerRow) {
+    // logits [B, K, V]; read the last kept position per row.
+    return keysPerRow.map((k, b) => readRow(logits, dims, b, dims[1] - 1, k));
+  }
+
+  // One batched forward. Two flavours:
+  //  - left padding + num_logits_to_keep = 1: the 262k-vocab projection runs at one
+  //    position per row. Works when the graph honours attention_mask / position_ids
+  //    for padded rows (Gemma 3 causal LM).
+  //  - right padding + logits at every position: pads sit after the real tokens, so
+  //    causal attention never sees them even if the graph ignores the mask (the
+  //    Gemma 4 multimodal export). Costs B × L × V logits, so it is capped.
+  const RIGHT_PAD_MAX_LOGITS = 64 * 1024 * 1024; // elements; ~128 MB in fp16
   async function batched(texts, keysPerRow) {
+    if (spec.padding === "right") return batchedRight(texts, keysPerRow);
     tok.padding_side = "left";
     const inputs = tok(texts, { padding: true, truncation: false, add_special_tokens: false });
-    // Positions must be derived from the mask so a left-padded row starts at 0 at
-    // its first real token. Gemma3ForCausalLM does this itself; the multimodal
-    // Gemma 4 wrapper does not, and without it every padded row is garbage.
     const [B, L] = inputs.attention_mask.dims;
     const mask = inputs.attention_mask.data;
     const pos = new BigInt64Array(B * L);
@@ -113,6 +115,27 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     let tokens = 0;
     for (let i = 0; i < mask.length; i++) if (Number(mask[i])) tokens++;
     const rows = rowsFromLogits(out.logits.data, out.logits.dims, keysPerRow);
+    out.logits.dispose?.();
+    return { rows, tokens };
+  }
+
+  async function batchedRight(texts, keysPerRow) {
+    tok.padding_side = "right";
+    const inputs = tok(texts, { padding: true, truncation: false, add_special_tokens: false });
+    const [B, L] = inputs.attention_mask.dims;
+    const V = net.config.text_config?.vocab_size ?? net.config.vocab_size ?? 262144;
+    if (B * L * V > RIGHT_PAD_MAX_LOGITS) return sequential(texts, keysPerRow);
+    const mask = inputs.attention_mask.data;
+    const lens = [];
+    let tokens = 0;
+    for (let b = 0; b < B; b++) {
+      let n = 0;
+      for (let i = 0; i < L; i++) if (Number(mask[b * L + i])) n++;
+      lens.push(n);
+      tokens += n;
+    }
+    const out = await net.forward({ ...inputs, num_logits_to_keep: new Tensor("int64", [BigInt(L)], []) });
+    const rows = keysPerRow.map((k, b) => readRow(out.logits.data, out.logits.dims, b, lens[b] - 1, k));
     out.logits.dispose?.();
     return { rows, tokens };
   }

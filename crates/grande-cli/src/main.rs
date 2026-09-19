@@ -446,8 +446,14 @@ fn main() -> Result<()> {
                 ),
                 Mode::Packed,
             )?;
-            let iso_ok = (in_sibling - absent).abs() < 0.1 && in_state > in_sibling + 0.3;
-            println!("isolation        sibling {in_sibling:.3}  absent {absent:.3}  state {in_state:.3}   {}", if iso_ok { "PASS" } else { "FAIL" });
+            // Isolation is "sibling == absent". Whether the model can use the
+            // secret when it IS in the state is a capability, reported separately.
+            let iso_ok = (in_sibling - absent).abs() < 0.05;
+            println!(
+                "isolation        sibling {in_sibling:.3}  absent {absent:.3}  state {in_state:.3}   {}  (state effect {:+.3})",
+                if iso_ok { "PASS" } else { "FAIL" },
+                in_state - absent
+            );
             // 2. Packed vs separate on the same request.
             let req = build(memo, "この会議は15時に始まるか");
             let (packed, _) = engine.distributions(&req, &orders, Mode::Packed)?;
