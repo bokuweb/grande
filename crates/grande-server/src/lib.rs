@@ -122,6 +122,9 @@ fn diag_headers(diag: &grande_core::Diagnostics, model: &str, ms: u128) -> Heade
         diag.branch_tokens.iter().sum::<usize>().to_string(),
     );
     put(&mut h, "x-grande-passes", diag.passes.to_string());
+    if !diag.baseline.is_empty() {
+        put(&mut h, "x-grande-calibrated", "contextual".to_string());
+    }
     if let Some(src) = diag.prefix_source {
         put(&mut h, "x-grande-state", src.as_str().to_string());
     }

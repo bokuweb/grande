@@ -1,5 +1,7 @@
 //! Glue: render → tokenize/pack → evaluate → read out → typed answers.
 
+use std::collections::HashMap;
+
 use indexmap::IndexMap;
 use serde::Serialize;
 
@@ -17,10 +19,14 @@ pub struct Diagnostics {
     pub branch_tokens: Vec<usize>,
     /// Label readout only.
     pub candidate_mass: IndexMap<String, f64>,
-    /// Number of `evaluate` calls (1 when packed).
+    /// Number of `evaluate` calls (1 when packed; +1 for a baseline pass
+    /// that was not served from the cache).
     pub passes: usize,
     /// Where the backend got the state from (resident / ram / disk / decoded).
     pub prefix_source: Option<PrefixSource>,
+    /// Contextual calibration only: per question, the option logits over
+    /// the content-free state that were subtracted.
+    pub baseline: IndexMap<String, Vec<f32>>,
 }
 
 /// How branches are evaluated.
@@ -39,6 +45,14 @@ pub struct Engine<B: Backend> {
     pub readout: Readout,
     pub temperature: f32,
     pub model: String,
+    /// Contextual calibration: when set, every question is also asked over
+    /// this content-free state and the option logits it yields are
+    /// subtracted from the live ones (see [`crate::calibration::contextual`]).
+    /// The baseline depends on the question alone, so it is cached per
+    /// rendered branch: a fixed question set over changing states pays for
+    /// it once.
+    pub baseline: Option<String>,
+    baseline_cache: HashMap<String, Vec<f32>>,
 }
 
 /// A tokenized request ready for the backend.
@@ -56,7 +70,55 @@ impl<B: Backend> Engine<B> {
             readout,
             temperature: 1.0,
             model: model.into(),
+            baseline: None,
+            baseline_cache: HashMap::new(),
         }
+    }
+
+    /// Option logits for every branch over the content-free state `cf`,
+    /// from the cache where possible. Returns whether the backend was called.
+    fn baseline_logits(
+        &mut self,
+        req: &Request,
+        rendered: &Rendered,
+        packed: &Packed,
+        label_ids: &[Token],
+        cf: &str,
+    ) -> Result<(Vec<Vec<f32>>, bool)> {
+        let keys: Vec<String> = rendered
+            .branches
+            .iter()
+            .map(|b| serde_json::to_string(&(cf, &b.segments, &b.keys)).unwrap_or_default())
+            .collect();
+        let missing: Vec<usize> = (0..keys.len())
+            .filter(|&i| !self.baseline_cache.contains_key(&keys[i]))
+            .collect();
+        let evaluated = !missing.is_empty();
+        if evaluated {
+            let mut cf_req = req.clone();
+            cf_req.state = serde_json::Value::String(cf.to_string());
+            let cf_prefix = self.renderer.render(&cf_req).prefix;
+            let (cf_prefix, _) = self.tokenize_segments(&cf_prefix)?;
+            let branches: Vec<BranchTokens> = missing
+                .iter()
+                .map(|&i| packed.branches[i].clone())
+                .collect();
+            let outs = self
+                .backend
+                .evaluate(&cf_prefix, &branches, self.readout.want())?;
+            for (&i, out) in missing.iter().zip(outs) {
+                let dist =
+                    self.readout
+                        .distribution(&rendered.branches[i], &out, label_ids, 1.0)?;
+                self.baseline_cache.insert(keys[i].clone(), dist.logits);
+            }
+        }
+        Ok((
+            keys.iter()
+                .map(|k| self.baseline_cache[k].clone())
+                .collect(),
+            evaluated,
+        ))
     }
 
     fn tokenize_segments(&self, segments: &[Segment]) -> Result<(Vec<Token>, Vec<usize>)> {
@@ -139,9 +201,20 @@ impl<B: Backend> Engine<B> {
             branch_tokens: packed.branches.iter().map(|b| b.tokens.len()).collect(),
             ..Default::default()
         };
+        // The baseline pass goes first so the live state, not "N/A", is what
+        // stays resident in the backend.
+        let baseline = match self.baseline.clone() {
+            Some(cf) => {
+                let (b, evaluated) =
+                    self.baseline_logits(req, &rendered, &packed, &label_ids, &cf)?;
+                diag.passes += usize::from(evaluated);
+                Some(b)
+            }
+            None => None,
+        };
         let outputs = match mode {
             Mode::Packed => {
-                diag.passes = 1;
+                diag.passes += 1;
                 self.backend
                     .evaluate(&packed.prefix, &packed.branches, want)?
             }
@@ -154,18 +227,22 @@ impl<B: Backend> Engine<B> {
                         want,
                     )?);
                 }
-                diag.passes = packed.branches.len();
+                diag.passes += packed.branches.len();
                 outs
             }
         };
         diag.prefix_source = self.backend.prefix_source();
         let mut result = Vec::with_capacity(outputs.len());
-        for (branch, out) in rendered.branches.into_iter().zip(outputs) {
-            let dist = self
-                .readout
-                .distribution(&branch, &out, &label_ids, self.temperature)?;
+        for (i, (branch, out)) in rendered.branches.into_iter().zip(outputs).enumerate() {
+            let mut dist =
+                self.readout
+                    .distribution(&branch, &out, &label_ids, self.temperature)?;
             if let Some(m) = dist.candidate_mass {
                 diag.candidate_mass.insert(branch.id.clone(), m);
+            }
+            if let Some(b) = &baseline {
+                dist.calibrate(b[i].clone(), self.temperature);
+                diag.baseline.insert(branch.id.clone(), b[i].clone());
             }
             result.push((branch, dist));
         }
@@ -235,5 +312,104 @@ pub fn to_answer(q: &Question, branch: &RenderedBranch, dist: &Distribution) -> 
             }
         }
         _ => unreachable!("renderer kind must match the question type"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::BranchOutput;
+    use std::cell::Cell;
+
+    /// A backend with a fixed "yes" lean: every label-readout row puts label
+    /// A 3 logits above B, plus a bonus for A when the prefix contains the
+    /// evidence token. Counts `evaluate` calls.
+    struct Leaning {
+        calls: Cell<usize>,
+    }
+
+    const EVIDENCE: i32 = 999;
+
+    impl Backend for Leaning {
+        fn tokenize(&self, text: &str) -> Result<Vec<Token>> {
+            Ok(text
+                .split_whitespace()
+                .map(|w| {
+                    Token(match w {
+                        "A" => 1,
+                        "B" => 2,
+                        "evidence" => EVIDENCE,
+                        _ => 3,
+                    })
+                })
+                .collect())
+        }
+        fn special(&self, _: &str) -> Result<Token> {
+            Ok(Token(2))
+        }
+        fn bos(&self) -> Token {
+            Token(0)
+        }
+        fn n_embd(&self) -> usize {
+            1
+        }
+        fn n_vocab(&self) -> usize {
+            4
+        }
+        fn evaluate(
+            &mut self,
+            prefix: &[Token],
+            branches: &[BranchTokens],
+            _: Want,
+        ) -> Result<Vec<BranchOutput>> {
+            self.calls.set(self.calls.get() + 1);
+            let seen = prefix.iter().any(|t| t.0 == EVIDENCE);
+            Ok(branches
+                .iter()
+                .map(|_| BranchOutput {
+                    // row[1] = label A, row[2] = label B (see `tokenize`).
+                    rows: vec![vec![0.0, 3.0 + if seen { 6.0 } else { 0.0 }, 0.0, 0.0]],
+                })
+                .collect())
+        }
+    }
+
+    fn request(state: &str) -> Request {
+        serde_json::from_value(serde_json::json!({
+            "state": state,
+            "questions": {"q": {"type": "noul", "instructions": "is it so"}}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn baseline_removes_the_lean_and_is_cached() {
+        let backend = Leaning {
+            calls: Cell::new(0),
+        };
+        let mut engine = Engine::new(backend, Renderer::gemma_label(), Readout::Label, "t");
+        // Uncalibrated: the lean reads as 95% yes with nothing in the state.
+        let (d, _) = engine
+            .distributions(&request("nothing here"), &IndexMap::new(), Mode::Packed)
+            .unwrap();
+        assert!(d[0].1.probs[0] > 0.9);
+
+        engine.baseline = Some("N/A".into());
+        let (d, diag) = engine
+            .distributions(&request("nothing here"), &IndexMap::new(), Mode::Packed)
+            .unwrap();
+        assert!((d[0].1.probs[0] - 0.5).abs() < 1e-9, "{:?}", d[0].1.probs);
+        assert_eq!(diag.passes, 2);
+        assert_eq!(diag.baseline["q"], vec![3.0, 0.0]);
+
+        // Same question over a state with evidence: the baseline is served
+        // from the cache (one pass) and the evidence survives calibration.
+        let calls = engine.backend.calls.get();
+        let (d, diag) = engine
+            .distributions(&request("the evidence"), &IndexMap::new(), Mode::Packed)
+            .unwrap();
+        assert_eq!(engine.backend.calls.get(), calls + 1);
+        assert_eq!(diag.passes, 1);
+        assert!(d[0].1.probs[0] > 0.99);
     }
 }

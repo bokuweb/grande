@@ -1,6 +1,7 @@
 //! From backend rows to a distribution over the rendered options.
 
 use crate::backend::{Backend, BranchOutput, Token, Want};
+use crate::calibration::contextual;
 use crate::math::{dot, log_sum_exp, softmax};
 use crate::render::{Mark, RenderedBranch};
 use crate::{Error, Result};
@@ -55,8 +56,13 @@ pub enum Readout {
 /// Probabilities over the branch's rendered options plus diagnostics.
 #[derive(Debug, Clone)]
 pub struct Distribution {
-    /// Raw option logits before temperature (kept so callers can refit).
+    /// Option logits before temperature, kept so callers can refit. When
+    /// `baseline` is set they are already contextually calibrated (the raw
+    /// readout is `logits + baseline`), so a refit sees what `probs` saw.
     pub logits: Vec<f32>,
+    /// The same options' logits over a content-free state, when the
+    /// distribution was contextually calibrated.
+    pub baseline: Option<Vec<f32>>,
     pub probs: Vec<f64>,
     /// Label readout only: share of full-vocabulary probability mass that
     /// landed on the label tokens. Low values mean the model wanted to say
@@ -71,9 +77,18 @@ impl Distribution {
         let probs = softmax(&logits, temperature);
         Distribution {
             logits,
+            baseline: None,
             probs,
             candidate_mass,
         }
+    }
+
+    /// Contextual calibration against the same options' logits over a
+    /// content-free state (see [`crate::calibration::contextual`]).
+    pub fn calibrate(&mut self, baseline: Vec<f32>, temperature: f32) {
+        self.logits = contextual(&self.logits, &baseline);
+        self.probs = softmax(&self.logits, temperature);
+        self.baseline = Some(baseline);
     }
 }
 
@@ -126,6 +141,7 @@ impl Readout {
                 let probs = softmax(&logits, temperature);
                 Ok(Distribution {
                     logits,
+                    baseline: None,
                     probs,
                     candidate_mass: Some((lse_labels - lse_all).exp()),
                 })
@@ -152,6 +168,7 @@ impl Readout {
                 let probs = softmax(&logits, temperature);
                 Ok(Distribution {
                     logits,
+                    baseline: None,
                     probs,
                     candidate_mass: None,
                 })

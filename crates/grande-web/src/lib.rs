@@ -3,6 +3,7 @@
 //! identical to the native runtime: validation, the rendered layout, label
 //! assignment, softmax / temperature / confidence, and the response shape.
 
+use grande_core::calibration::CONTENT_FREE;
 use grande_core::engine::to_answer;
 use grande_core::readout::{Distribution, LABELS};
 use grande_core::{Renderer, Request, Response, Usage};
@@ -37,9 +38,31 @@ struct Row {
     candidate_mass: Option<f64>,
 }
 
+/// The content-free state for contextual calibration (`"N/A"`).
+#[wasm_bindgen]
+pub fn content_free_state() -> String {
+    CONTENT_FREE.to_string()
+}
+
+fn parse_rows(rows: &str, req: &Request, what: &str) -> Result<Vec<Row>, JsError> {
+    let rows: Vec<Row> =
+        serde_json::from_str(rows).map_err(|e| JsError::new(&format!("{what}: {e}")))?;
+    if rows.len() != req.questions.len() {
+        return Err(JsError::new(&format!(
+            "{} {what} for {} questions",
+            rows.len(),
+            req.questions.len()
+        )));
+    }
+    Ok(rows)
+}
+
 /// Assemble the TypeSafe-shaped response. `rows` is a JSON array with one
 /// entry per branch (request order): the option logits the backend read at
 /// the branch's answer position, plus an optional candidate-mass diagnostic.
+/// `baseline_rows`, same shape, are the logits of the same branches over the
+/// content-free state; when given, each answer is contextually calibrated
+/// (its logits minus the baseline's) before the softmax.
 #[wasm_bindgen]
 pub fn answer(
     request: &str,
@@ -47,22 +70,19 @@ pub fn answer(
     temperature: f32,
     model: &str,
     input_tokens: u32,
+    baseline_rows: Option<String>,
 ) -> Result<String, JsError> {
     let req: Request =
         serde_json::from_str(request).map_err(|e| JsError::new(&format!("request: {e}")))?;
-    let rows: Vec<Row> =
-        serde_json::from_str(rows).map_err(|e| JsError::new(&format!("rows: {e}")))?;
-    if rows.len() != req.questions.len() {
-        return Err(JsError::new(&format!(
-            "{} rows for {} questions",
-            rows.len(),
-            req.questions.len()
-        )));
-    }
+    let rows = parse_rows(rows, &req, "rows")?;
+    let baseline = match &baseline_rows {
+        Some(b) => Some(parse_rows(b, &req, "baseline rows")?),
+        None => None,
+    };
     // Any layout gives the same keys/order for the default (unpermuted) render.
     let rendered = Renderer::gemma_pointer().render(&req);
     let mut answers = IndexMap::new();
-    for (branch, row) in rendered.branches.iter().zip(rows) {
+    for (i, (branch, row)) in rendered.branches.iter().zip(rows).enumerate() {
         if row.logits.len() != branch.keys.len() {
             return Err(JsError::new(&format!(
                 "branch {}: {} logits for {} options",
@@ -71,7 +91,18 @@ pub fn answer(
                 branch.keys.len()
             )));
         }
-        let dist = Distribution::from_logits(row.logits, temperature, row.candidate_mass);
+        let mut dist = Distribution::from_logits(row.logits, temperature, row.candidate_mass);
+        if let Some(b) = &baseline {
+            if b[i].logits.len() != dist.logits.len() {
+                return Err(JsError::new(&format!(
+                    "branch {}: {} baseline logits for {} options",
+                    branch.id,
+                    b[i].logits.len(),
+                    dist.logits.len()
+                )));
+            }
+            dist.calibrate(b[i].logits.clone(), temperature);
+        }
         answers.insert(
             branch.id.clone(),
             to_answer(&req.questions[&branch.id], branch, &dist),

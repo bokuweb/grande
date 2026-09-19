@@ -177,7 +177,7 @@ async function run() {
   $("usage").innerHTML = `<span class="chip">Running…</span>`;
   try {
     const request = { state: parseState($("state").value), questions: JSON.parse($("questions").value) };
-    const resp = await engine.answer(request, { temperature: Number($("temp").value), mode });
+    const resp = await engine.answer(request, { temperature: Number($("temp").value), mode, calibrate: $("calibrate").checked });
     renderResults(request, resp);
   } catch (e) {
     $("usage").innerHTML = `<span class="err">${esc(e.message)}</span>`;
@@ -197,6 +197,7 @@ function renderResults(request, resp) {
   const u = resp.usage;
   const state = u.state_resident === undefined ? `state ${u.state_tokens}` : u.state_resident ? `state ${u.state_tokens} resident` : `state ${u.state_tokens} cold`;
   const chips = [`${u.ms.toFixed(0)} ms`, u.mode, `${u.forwards} forward${u.forwards === 1 ? "" : "s"}`, `${u.input_tokens} tokens (${state})`, `${u.questions} question${u.questions === 1 ? "" : "s"}`];
+  if (u.calibrated) chips.push(u.baseline_forwards ? `calibrated (baseline ${u.baseline_forwards} forward${u.baseline_forwards === 1 ? "" : "s"})` : "calibrated (baseline cached)");
   $("usage").innerHTML = chips.map((c) => `<span class="chip">${esc(c)}</span>`).join("");
   const cards = [];
   for (const [id, a] of Object.entries(resp.answers)) {

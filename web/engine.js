@@ -3,7 +3,7 @@
 // runtime (validation, layout, labels, softmax / temperature / confidence, response).
 //
 //   const engine = await loadEngine({ transformers, model: "gemma-3-1b", onProgress });
-//   const resp = await engine.answer(request, { temperature: 1, mode: "shared" });
+//   const resp = await engine.answer(request, { temperature: 1, mode: "shared", calibrate: true });
 //
 // Zero-shot label readout: the state is decoded once into a resident KV cache, every
 // question continues from it as an isolated branch ("state, then this question"), and
@@ -11,7 +11,8 @@
 // Modes: "shared" (above), "batched" (one forward where every row re-reads the
 // state) and "sequential" (one forward per question) are kept for comparison.
 // The trained pointer model (a hidden-state export without a KV cache) always
-// runs batched.
+// runs batched. `calibrate` subtracts the model's prior over the options (the
+// same questions over a content-free state) before the softmax.
 
 import init, * as grande from "./pkg/grande.js";
 import { idbCache } from "./cache.js";
@@ -397,33 +398,63 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
   let queue = Promise.resolve();
   const enqueue = (job) => { const p = queue.then(job, job); queue = p.catch(() => {}); return p; };
 
-  async function answerNow(request, { temperature = 1.0, mode = "shared" } = {}) {
-    const reqJson = JSON.stringify(request);
-    const rendered = JSON.parse(grande.render(reqJson, JSON.stringify(spec.layout)));
+  // Rows for every branch of a rendered request. Label readout honours
+  // `mode`; the pointer readouts have one path each.
+  async function rowsFor(rendered, mode) {
     if (spec.kind === "pointer" || spec.kind === "wgpu") {
-      const t0 = performance.now();
       const { rows, tokens, prefixTokens } = spec.kind === "wgpu" ? await pointerWgpu(rendered) : await pointerBatched(rendered);
-      const ms = performance.now() - t0;
-      const resp = JSON.parse(grande.answer(reqJson, JSON.stringify(rows), temperature, spec.id, tokens));
-      return { ...resp, usage: { ...resp.usage, state_tokens: prefixTokens, questions: rows.length, mode: spec.kind === "wgpu" ? "packed" : "batched", ms, forwards: 1 },
-        diagnostics: { candidate_mass: {}, rows } };
+      return { rows, tokens, forwards: 1, state_tokens: prefixTokens, mode: spec.kind === "wgpu" ? "packed" : "batched" };
     }
     const prefix = segmentsToText(rendered.prefix, bos);
     const branchTexts = rendered.branches.map((b) => segmentsToText(b.segments, bos));
     const texts = branchTexts.map((t) => prefix + t);
     const keys = rendered.branches.map((b) => b.keys.length);
     for (const k of keys) if (k > labelIds.length) throw new Error(`a question has ${k} options; this tokenizer supports ${labelIds.length} single-token labels`);
+    if (mode === "sequential") return { ...(await sequential(texts, keys)), forwards: texts.length, mode };
+    if (mode === "batched") return { ...(await batched(texts, keys)), forwards: 1, mode };
+    return { ...(await shared(prefix, branchTexts, keys)), mode };
+  }
+
+  // Contextual calibration (Zhao et al. 2021): the same branches over the
+  // content-free state "N/A" give the model's prior over the options, which
+  // grande.answer subtracts in logit space. The prior depends on the question
+  // alone, so it is cached per rendered branch; a fixed question set over
+  // changing states pays for it once. Never runs through `shared`, so the
+  // live state stays resident.
+  const CONTENT_FREE = grande.content_free_state();
+  const baselineCache = new Map();
+  async function baselineRows(request, rendered, mode, contentFree) {
+    const keys = rendered.branches.map((b) => JSON.stringify([contentFree, b.segments, b.keys]));
+    const missing = keys.map((k, i) => (baselineCache.has(k) ? -1 : i)).filter((i) => i >= 0);
+    let forwards = 0, tokens = 0;
+    if (missing.length) {
+      const cf = JSON.parse(grande.render(JSON.stringify({ ...request, state: contentFree }), JSON.stringify(spec.layout)));
+      const r = await rowsFor({ prefix: cf.prefix, branches: missing.map((i) => cf.branches[i]) }, mode === "shared" ? "batched" : mode);
+      missing.forEach((i, j) => baselineCache.set(keys[i], r.rows[j]));
+      forwards = r.forwards;
+      tokens = r.tokens;
+    }
+    return { rows: keys.map((k) => baselineCache.get(k)), forwards, tokens };
+  }
+
+  // `calibrate`: false, true ("N/A" as the content-free state) or a string to
+  // use as the content-free state instead.
+  async function answerNow(request, { temperature = 1.0, mode = "shared", calibrate = false } = {}) {
+    const reqJson = JSON.stringify(request);
+    const rendered = JSON.parse(grande.render(reqJson, JSON.stringify(spec.layout)));
     const t0 = performance.now();
-    let r;
-    if (mode === "sequential") r = { ...(await sequential(texts, keys)), forwards: texts.length };
-    else if (mode === "batched") r = { ...(await batched(texts, keys)), forwards: 1 };
-    else r = await shared(prefix, branchTexts, keys);
+    // Baseline first: on a cold state its forwards would otherwise sit
+    // between the state and its questions.
+    const base = calibrate ? await baselineRows(request, rendered, mode, typeof calibrate === "string" ? calibrate : CONTENT_FREE) : null;
+    const r = await rowsFor(rendered, mode);
     const ms = performance.now() - t0;
-    const { rows, tokens } = r;
-    const resp = JSON.parse(grande.answer(reqJson, JSON.stringify(rows), temperature, spec.id, tokens));
-    const stateTokens = r.state_tokens ?? tok.encode(prefix, { add_special_tokens: false }).length;
-    return { ...resp, usage: { ...resp.usage, state_tokens: stateTokens, questions: rows.length, mode, ms, forwards: r.forwards, ...(r.warm === undefined ? {} : { state_resident: r.warm }) },
-      diagnostics: { candidate_mass: Object.fromEntries(rendered.branches.map((b, i) => [b.id, rows[i].candidate_mass])), rows } };
+    const { rows } = r;
+    const tokens = r.tokens + (base?.tokens ?? 0);
+    const resp = JSON.parse(grande.answer(reqJson, JSON.stringify(rows), temperature, spec.id, tokens, base ? JSON.stringify(base.rows) : undefined));
+    const stateTokens = r.state_tokens ?? tok.encode(segmentsToText(rendered.prefix, bos), { add_special_tokens: false }).length;
+    return { ...resp, usage: { ...resp.usage, state_tokens: stateTokens, questions: rows.length, mode: r.mode, ms, forwards: r.forwards + (base?.forwards ?? 0),
+        ...(r.warm === undefined ? {} : { state_resident: r.warm }), ...(base ? { calibrated: "contextual", baseline_forwards: base.forwards } : {}) },
+      diagnostics: { candidate_mass: Object.fromEntries(rendered.branches.map((b, i) => [b.id, rows[i].candidate_mass])), rows, ...(base ? { baseline: base.rows } : {}) } };
   }
 
   return {

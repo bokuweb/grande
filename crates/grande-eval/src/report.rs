@@ -7,7 +7,11 @@ use serde::Serialize;
 pub struct Row {
     pub id: String,
     pub gold: usize,
+    /// Option logits as scored (contextually calibrated when `baseline` is set).
     pub logits: Vec<f32>,
+    /// The content-free baseline that was subtracted, when the run had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<Vec<f32>>,
     pub pred: usize,
     pub candidate_mass: Option<f64>,
     pub ms: u128,

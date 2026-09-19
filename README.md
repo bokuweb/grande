@@ -161,6 +161,36 @@ difference.
   --state-cache-mb 512 --state-cache-dir .cache/states
 ```
 
+`--baseline` (probe, serve, jglue) turns on contextual calibration: every
+question is also asked over a content-free state (`N/A` by default, or the
+text you pass) and the option logits that yields — the model's prior over
+the options — are subtracted from the live ones before the softmax (Zhao et
+al. 2021). It depends on the question alone, so it is cached per rendered
+branch: a fixed question set over changing states pays one extra pass. The
+raw readout is `logits + baseline`; both are in the diagnostics.
+
+What it does and does not fix (E2B Q4_0, JGLUE valid, first 200; 100
+calibration / 100 test):
+
+| | JNLI acc | JNLI ECE raw → T | JNLI NLL raw | JCQA acc | JCQA ECE raw → T |
+|---|---|---|---|---|---|
+| raw | 0.540 | 0.326 → 0.063 (T 2.64) | 1.364 | **0.860** | 0.067 → 0.078 |
+| `--baseline` | 0.540 | **0.174** → 0.083 (T 1.42) | **1.028** | 0.770 | 0.097 → 0.077 |
+
+It removes a bias that lives in the *labels*: the letter pull on a fixed
+3-way question (JNLI ECE halves with no temperature fitted) and the yes /
+no lean on a Noul the state says nothing about (E2B reads "is the password
+blue elephant" over a memo about a meeting as 2–18% *yes* across seven such
+questions; with the baseline all are ≤ 0.3%, and the letter *A* stops
+pulling a Choice). It does not know the difference between "no evidence"
+and "evidence against", so a Noul the model already answers weakly is
+flattened too (資料は共有済み 0.998 → 0.747), and when the *options* carry
+the content — JCQA's five answer strings — the content-free prior is part
+of the answer and subtracting it costs 9 points. Use it for a fixed
+question set with letter labels or yes / no over documents; leave it off
+for commonsense-style choices. A fitted temperature is still the better
+tool where a labelled split exists.
+
 The server keeps the current state resident and every other state it has
 seen serialized: an LRU in RAM (`--state-cache-mb`, 512 MB ≈ 55k tokens of
 E2B state) and, with `--state-cache-dir`, a file per state keyed by model
