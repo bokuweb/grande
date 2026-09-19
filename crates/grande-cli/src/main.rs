@@ -134,6 +134,9 @@ enum Cmd {
         /// Bearer key; omit to disable auth (local use).
         #[arg(long, env = "GRANDE_API_KEY")]
         api_key: Option<String>,
+        /// Pointer head weights (safetensors); switches to the packed layout.
+        #[arg(long)]
+        head: Option<PathBuf>,
         #[arg(long, default_value_t = 1.0)]
         temperature: f32,
         #[arg(long, default_value_t = 8192)]
@@ -622,6 +625,7 @@ fn main() -> Result<()> {
             n_ctx,
             state_cache_mb,
             state_cache_dir,
+            head,
         } => {
             let backend = LlamaEngine::load(
                 &model,
@@ -630,6 +634,7 @@ fn main() -> Result<()> {
                     n_batch: n_ctx,
                     state_cache_bytes: state_cache_mb << 20,
                     state_cache_dir,
+                    embeddings: head.is_some(),
                     ..Default::default()
                 },
             )?;
@@ -638,12 +643,8 @@ fn main() -> Result<()> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("model")
                 .to_lowercase();
-            let mut engine = Engine::new(
-                backend,
-                Renderer::gemma_label(),
-                Readout::Label,
-                name.clone(),
-            );
+            let (renderer, readout) = readout_for(&backend, head.as_ref())?;
+            let mut engine = Engine::new(backend, renderer, readout, name.clone());
             engine.temperature = temperature;
             let state = std::sync::Arc::new(grande_server::AppState {
                 engine: std::sync::Mutex::new(engine),
