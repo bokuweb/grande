@@ -48,6 +48,28 @@ def text_backbone(model):
     return m
 
 
+def truncate_layers(backbone, text_cfg, n: int):
+    """Early exit as a smaller model: drop decoder layers after `n`. The final
+    norm then reads layer n's output, the head trains on that, and the merged
+    checkpoint converts to a GGUF with n layers — no runtime support needed."""
+    layers = backbone.layers
+    if n >= len(layers):
+        return
+    backbone.layers = layers[:n]
+    text_cfg.num_hidden_layers = n
+    if getattr(text_cfg, "layer_types", None):
+        text_cfg.layer_types = list(text_cfg.layer_types)[:n]
+    backbone.config.num_hidden_layers = n
+    if getattr(backbone.config, "layer_types", None):
+        backbone.config.layer_types = list(backbone.config.layer_types)[:n]
+
+
+def save(model, out: Path, lora: int | None):
+    save_file({k: v.detach().cpu().contiguous() for k, v in model.head.state_dict().items()}, str(out / "head.safetensors"))
+    if lora:
+        model.lm.save_pretrained(str(out / "adapter"))
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--base", default="google/gemma-4-E2B")
@@ -60,6 +82,8 @@ def main():
     p.add_argument("--batch", type=int, default=4)
     p.add_argument("--out", required=True)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--save-every", type=int, default=500, help="checkpoint the head and adapter every N steps")
+    p.add_argument("--keep-layers", type=int, help="early exit: keep only the first N decoder layers (the head reads layer N's output)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     a = p.parse_args()
 
@@ -71,6 +95,8 @@ def main():
     text_cfg = getattr(cfg, "text_config", cfg)
     full = AutoModelForCausalLM.from_pretrained(a.base, dtype=torch.float32)
     backbone = text_backbone(full)
+    if a.keep_layers:
+        truncate_layers(backbone, text_cfg, a.keep_layers)
     model = DecisionModel(backbone, text_cfg.hidden_size, lora_r=a.lora, sliding_window=getattr(text_cfg, "sliding_window", None)).to(a.device)
 
     records = []
@@ -108,9 +134,9 @@ def main():
                 print(msg)
                 log.write(msg + "\n")
                 log.flush()
-    save_file({k: v.detach().cpu().contiguous() for k, v in model.head.state_dict().items()}, str(out / "head.safetensors"))
-    if a.lora:
-        model.lm.save_pretrained(str(out / "adapter"))
+            if a.save_every and step % a.save_every == 0:
+                save(model, out, a.lora)
+    save(model, out, a.lora)
     json.dump(vars(a), open(out / "config.json", "w"), indent=2)
     print(f"saved to {out}")
 

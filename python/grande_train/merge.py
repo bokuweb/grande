@@ -10,7 +10,9 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .train import backbone_path, text_backbone
+import json
+
+from .train import backbone_path, text_backbone, truncate_layers
 
 
 def prune_added_tokens(out: str, vocab_size: int | None):
@@ -61,6 +63,16 @@ def main():
     full = AutoModelForCausalLM.from_pretrained(a.base, dtype=torch.float32)
     path = backbone_path(full)
     backbone = text_backbone(full)
+    run_cfg = json.load(open(f"{a.run}/config.json"))
+    if run_cfg.get("keep_layers"):
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(a.base)
+        text_cfg = getattr(cfg, "text_config", cfg)
+        truncate_layers(backbone, text_cfg, run_cfg["keep_layers"])
+        full.config.num_hidden_layers = run_cfg["keep_layers"]
+        if getattr(full.config, "layer_types", None):
+            full.config.layer_types = list(full.config.layer_types)[: run_cfg["keep_layers"]]
     merged = PeftModel.from_pretrained(backbone, f"{a.run}/adapter").merge_and_unload()
     parent = full
     for attr in path[:-1]:
