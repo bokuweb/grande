@@ -61,6 +61,12 @@ pub struct LlamaEngine {
     n_seq_max: usize,
 }
 
+// SAFETY: every use of the context and model goes through `&mut self` or
+// `&self` on one `LlamaEngine`; callers that share it across threads wrap it
+// in a `Mutex`, so llama.cpp never sees concurrent access to one context.
+// Moving the engine between threads is fine: nothing inside is thread-affine.
+unsafe impl Send for LlamaEngine {}
+
 impl Drop for LlamaEngine {
     fn drop(&mut self) {
         // SAFETY: ctx is dropped exactly once here, before the model it

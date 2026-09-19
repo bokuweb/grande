@@ -26,6 +26,12 @@ enum ModeArg {
     Check,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum TaskArg {
+    Jnli,
+    Jcqa,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Answer a request JSON file (TypeSafe `/v1/systemone` shape).
@@ -46,6 +52,54 @@ enum Cmd {
         /// on Gemma 4 (verified: same numbers either way); costs memory.
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         swa_full: bool,
+    },
+    /// Run a JGLUE task (JNLI / JCommonsenseQA valid split) and report
+    /// accuracy, NLL, Brier, ECE before and after temperature scaling.
+    Jglue {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, value_enum)]
+        task: TaskArg,
+        /// JSONL file (JGLUE v1.3 format). Downloaded to .cache/jglue if absent.
+        #[arg(long)]
+        data: Option<PathBuf>,
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Output directory for rows.jsonl and summary.json.
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 2048)]
+        n_ctx: u32,
+    },
+    /// Prefill throughput: a synthetic state of about N tokens and Q
+    /// questions, packed, repeated a few times.
+    Bench {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, default_value_t = 2000)]
+        state_tokens: usize,
+        #[arg(long, default_value_t = 12)]
+        questions: usize,
+        #[arg(long, default_value_t = 3)]
+        rounds: usize,
+        #[arg(long, default_value_t = 16384)]
+        n_ctx: u32,
+    },
+    /// Serve the TypeSafe-compatible API.
+    Serve {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Bearer key; omit to disable auth (local use).
+        #[arg(long, env = "GRANDE_API_KEY")]
+        api_key: Option<String>,
+        #[arg(long, default_value_t = 1.0)]
+        temperature: f32,
+        #[arg(long, default_value_t = 8192)]
+        n_ctx: u32,
     },
     /// Print a GGUF metadata value (e.g. tokenizer.chat_template).
     Meta {
@@ -72,6 +126,228 @@ fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     match Cli::parse().cmd {
+        Cmd::Jglue {
+            model,
+            task,
+            data,
+            limit,
+            out,
+            n_ctx,
+        } => {
+            use grande_eval::jglue::{self, Task};
+            use grande_eval::report::{summarize, Row};
+            let task = match task {
+                TaskArg::Jnli => Task::Jnli,
+                TaskArg::Jcqa => Task::Jcqa,
+            };
+            let data = match data {
+                Some(p) => p,
+                None => {
+                    let dir = PathBuf::from(".cache/jglue");
+                    std::fs::create_dir_all(&dir)?;
+                    let p = dir.join(format!("{}-valid.jsonl", task.name()));
+                    if !p.exists() {
+                        let url = task.url("valid");
+                        eprintln!("downloading {url}");
+                        let status = std::process::Command::new("curl")
+                            .args(["-sL", "-o"])
+                            .arg(&p)
+                            .arg(&url)
+                            .status()?;
+                        anyhow::ensure!(status.success(), "download failed");
+                    }
+                    p
+                }
+            };
+            let mut items = jglue::load(task, &data)?;
+            if let Some(n) = limit {
+                items.truncate(n);
+            }
+            std::fs::create_dir_all(&out)?;
+            let rows_path = out.join("rows.jsonl");
+            anyhow::ensure!(
+                !rows_path.exists(),
+                "{} exists; choose a fresh --out",
+                rows_path.display()
+            );
+            let backend = LlamaEngine::load(
+                &model,
+                Options {
+                    n_ctx,
+                    n_batch: n_ctx,
+                    ..Default::default()
+                },
+            )?;
+            let name = model
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model")
+                .to_lowercase();
+            let mut engine = Engine::new(
+                backend,
+                Renderer::gemma_label(),
+                Readout::Label,
+                name.clone(),
+            );
+            let mut rows = Vec::with_capacity(items.len());
+            let mut file = std::io::BufWriter::new(std::fs::File::create(&rows_path)?);
+            use std::io::Write;
+            let t0 = Instant::now();
+            for (i, item) in items.iter().enumerate() {
+                let t = Instant::now();
+                let (dists, diag) =
+                    engine.distributions(&item.request, &Default::default(), Mode::Packed)?;
+                let (_, d) = &dists[0];
+                let row = Row {
+                    id: item.id.clone(),
+                    gold: item.gold,
+                    logits: d.logits.clone(),
+                    pred: grande_core::math::argmax(&d.probs),
+                    candidate_mass: diag.candidate_mass.values().next().copied(),
+                    ms: t.elapsed().as_millis(),
+                };
+                writeln!(file, "{}", serde_json::to_string(&row)?)?;
+                rows.push(row);
+                if (i + 1) % 50 == 0 {
+                    let acc =
+                        rows.iter().filter(|r| r.pred == r.gold).count() as f64 / rows.len() as f64;
+                    eprintln!(
+                        "{}/{}  acc so far {:.3}  {:.0} s",
+                        i + 1,
+                        items.len(),
+                        acc,
+                        t0.elapsed().as_secs_f32()
+                    );
+                }
+            }
+            file.flush()?;
+            let summary = summarize(&rows);
+            let full = serde_json::json!({
+                "model": name, "task": task, "data": data, "revision": jglue::REVISION,
+                "n": rows.len(), "readout": "label", "layout": "gemma_label", "summary": summary,
+            });
+            std::fs::write(
+                out.join("summary.json"),
+                serde_json::to_string_pretty(&full)?,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        Cmd::Bench {
+            model,
+            state_tokens,
+            questions,
+            rounds,
+            n_ctx,
+        } => {
+            let backend = LlamaEngine::load(
+                &model,
+                Options {
+                    n_ctx,
+                    n_batch: n_ctx,
+                    n_seq_max: (questions + 1).max(2) as u32,
+                    ..Default::default()
+                },
+            )?;
+            let name = model
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model")
+                .to_lowercase();
+            let mut engine = Engine::new(backend, Renderer::gemma_label(), Readout::Label, name);
+            // Build a state of roughly `state_tokens` tokens from a repeated clause.
+            let unit = "第3条 本契約に基づく報酬は月額金500,000円（消費税別）とし、甲は乙の請求書受領月の翌月末日までに支払う。";
+            let unit_tokens = engine.backend.tokenize(unit)?.len().max(1);
+            let state: String = std::iter::repeat_n(unit, state_tokens / unit_tokens + 1)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut qs = indexmap::IndexMap::new();
+            for i in 0..questions {
+                let topic = ["支払期日", "遅延損害金", "秘密保持", "解除"][i % 4];
+                qs.insert(
+                    format!("q{i}"),
+                    grande_core::Question::Choice {
+                        instructions: Some(serde_json::json!(format!(
+                            "この条項は{topic}に関する定めを含むか"
+                        ))),
+                        criteria: [
+                            ("yes", "含む"),
+                            ("no", "含まない"),
+                            ("unclear", "判断できない"),
+                        ]
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), Some(serde_json::json!(v))))
+                        .collect(),
+                    },
+                );
+            }
+            let req = Request {
+                model: "grande-latest".into(),
+                state: serde_json::json!(state),
+                questions: qs,
+            };
+            let mut best_ms = u128::MAX;
+            let mut tokens = 0usize;
+            for r in 0..rounds {
+                let t = Instant::now();
+                let (_, diag) = engine.answer(&req, Mode::Packed)?;
+                let ms = t.elapsed().as_millis();
+                let branch: usize = diag.branch_tokens.iter().sum();
+                tokens = diag.prefix_tokens + branch;
+                best_ms = best_ms.min(ms);
+                eprintln!(
+                    "round {r}: {ms} ms, {tokens} tokens ({} prefix + {branch} branches)",
+                    diag.prefix_tokens
+                );
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "tokens": tokens, "questions": questions, "best_ms": best_ms,
+                    "tok_per_s": (tokens as f64 / (best_ms as f64 / 1000.0)).round(),
+                })
+            );
+        }
+        Cmd::Serve {
+            model,
+            host,
+            port,
+            api_key,
+            temperature,
+            n_ctx,
+        } => {
+            let backend = LlamaEngine::load(
+                &model,
+                Options {
+                    n_ctx,
+                    n_batch: n_ctx,
+                    ..Default::default()
+                },
+            )?;
+            let name = model
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model")
+                .to_lowercase();
+            let mut engine = Engine::new(
+                backend,
+                Renderer::gemma_label(),
+                Readout::Label,
+                name.clone(),
+            );
+            engine.temperature = temperature;
+            let state = std::sync::Arc::new(grande_server::AppState {
+                engine: std::sync::Mutex::new(engine),
+                api_key,
+                model_id: name.clone(),
+            });
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
+                eprintln!("grande: http://{host}:{port}/v1/systemone  backend {name}  temperature {temperature}");
+                axum::serve(listener, grande_server::router(state)).await?;
+                Ok::<(), anyhow::Error>(())
+            })?;
+        }
         Cmd::Meta { model, key } => {
             let engine = LlamaEngine::load(
                 &model,
