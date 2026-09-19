@@ -1,4 +1,4 @@
-import { loadEngine, MODELS } from "./engine.js";
+import { loadEngine, MODELS, whereIs } from "./engine.js";
 import { PRESETS } from "./presets.js";
 import { cachedModelIds, cacheUsage, clearCache } from "./cache.js";
 
@@ -10,10 +10,14 @@ let transformers = null;
 let mode = "shared";
 
 let cached = new Set();
+// Models served from this site or a Hugging Face repo that turn out to be
+// in neither place (not published yet) stay listed but disabled.
+const unpublished = new Set();
 function renderModelOptions() {
   for (const o of $("model").options) {
     const m = MODELS[o.value];
-    o.textContent = `${o.value}  ·  ${m.size}  ·  ${m.note}${cached.has(m.id) ? "  ·  cached" : ""}`;
+    o.disabled = unpublished.has(o.value);
+    o.textContent = `${o.value}  ·  ${m.size}  ·  ${m.note}${cached.has(m.id) ? "  ·  cached" : ""}${o.disabled ? "  ·  not published yet" : ""}`;
   }
 }
 for (const [k] of Object.entries(MODELS)) {
@@ -23,6 +27,18 @@ for (const [k] of Object.entries(MODELS)) {
   $("model").append(o);
 }
 renderModelOptions();
+for (const [k, m] of Object.entries(MODELS)) {
+  if (!m.hub) continue;
+  whereIs(m).then((where) => {
+    if (where || cached.has(m.id)) return;
+    unpublished.add(k);
+    renderModelOptions();
+    if ($("model").value === k) {
+      $("model").value = "grande-270m-ja";
+      selectModel();
+    }
+  });
+}
 
 async function refreshCache() {
   cached = await cachedModelIds();

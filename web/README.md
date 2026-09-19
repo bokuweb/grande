@@ -80,7 +80,8 @@ The files are served from `./models/gemma-4-e2b-wgpu/` when present (local
 development: export there or symlink) and otherwise from the Hugging Face
 repo `bokuweb/gemma-4-E2B-it-grande-wgpu` — GitHub Pages caps a site at
 1 GB and release assets are not CORS-enabled — uploaded with
-`tools/upload_wgpu_hf.py`.
+`tools/upload_wgpu_hf.py`. Until the repo exists the entry is listed
+disabled ("not published yet"), so the site deploys either way.
 
 Padding (`batched` only): Gemma 3 causal-LM exports honour `attention_mask`
 / `position_ids`, so rows are left-padded and only one logits position is

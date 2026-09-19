@@ -207,6 +207,17 @@ function gatherPerLayer(table, ids) {
   return new Uint8Array(out.buffer);
 }
 
+// Where a `hub`-backed model's files are right now: "here" (./models/),
+// "hub" (the Hugging Face repo) or null (not published yet). Cached models
+// count as available.
+export async function whereIs(spec) {
+  const head = (url) => fetch(url, { method: "HEAD", cache: "no-store" }).then((r) => r.ok).catch(() => false);
+  if (await head(new URL(`./models/${spec.id}/config.json`, location.href).href)) return "here";
+  if (!spec.hub) return null;
+  if (await head(`https://huggingface.co/${spec.hub}/resolve/main/config.json`)) return "hub";
+  return null;
+}
+
 let wasmReady = null;
 
 export async function loadEngine({ transformers, model = "gemma-3-1b", device = "webgpu", onProgress } = {}) {
@@ -228,11 +239,11 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     let base = new URL(`./models/${spec.id}/`, location.href).href;
     let here = true;
     if (spec.hub) {
-      const probe = await fetch(`${base}config.json`, { method: "HEAD" }).catch(() => null);
+      const probe = await fetch(`${base}config.json`, { method: "HEAD", cache: "no-store" }).catch(() => null);
       if (!probe?.ok) {
         base = `https://huggingface.co/${spec.hub}/resolve/main/`;
         here = false;
-        const hub = await fetch(`${base}config.json`, { method: "HEAD" }).catch(() => null);
+        const hub = await fetch(`${base}config.json`, { method: "HEAD", cache: "no-store" }).catch(() => null);
         if (!hub?.ok) throw new Error(`${spec.id}: not in ./models/ and https://huggingface.co/${spec.hub} is not published (see web/README.md)`);
       }
     }
