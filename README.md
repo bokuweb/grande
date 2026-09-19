@@ -57,6 +57,9 @@ vocabulary: 1.2 GB streamed from the Hub once and cached in the browser,
       WebGPU from the same kernels. Parity with llama.cpp on the trained 270M
       and on E2B Q4_0; `grande --model <checkpoint dir>` and the
       `gemma-4-e2b-wgpu-ja` browser model (1.2 GB after vocabulary pruning).
+      The last state's K/V stays resident: a request over the same state
+      runs only its branches (E2B, 12 questions: 500-token state 3.0 → 1.7 s,
+      2,000 tokens 8.1 → 2.0 s native; browser ticket 1.0 → 0.77 s).
 - [ ] IIA test, permutation flip rate on a JGLUE sample
 
 ## First numbers (2026-09-19, M-series Mac, Metal)

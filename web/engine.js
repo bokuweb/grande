@@ -548,7 +548,10 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     if (spec.kind === "pointer" || spec.kind === "wgpu") {
       for (const b of rendered.branches) if (spec.readout === "label" && b.keys.length > labelIds.length) throw new Error(`a question has ${b.keys.length} options; this tokenizer supports ${labelIds.length} single-token labels`);
       const { rows, tokens, prefixTokens } = spec.kind !== "wgpu" ? await pointerBatched(rendered) : spec.readout === "label" ? await labelWgpu(rendered) : await pointerWgpu(rendered);
-      return { rows, tokens, forwards: 1, state_tokens: prefixTokens, mode: spec.kind === "wgpu" ? "packed" : "batched" };
+      // The wgpu engine keeps the last state's K/V resident: a request over
+      // the same state runs only its branches (prefix_source "resident").
+      const warm = spec.kind === "wgpu" ? { warm: gpu.prefix_source() === "resident" } : {};
+      return { rows, tokens, forwards: 1, state_tokens: prefixTokens, mode: spec.kind === "wgpu" ? "packed" : "batched", ...warm };
     }
     const prefix = segmentsToText(rendered.prefix, bos);
     const branchTexts = rendered.branches.map((b) => segmentsToText(b.segments, bos));

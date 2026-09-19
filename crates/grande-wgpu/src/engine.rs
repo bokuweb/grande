@@ -8,10 +8,11 @@
 //! `finish` allocates the workspace and wires the bind groups.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytemuck::{Pod, Zeroable};
-use grande_core::{BranchOutput, BranchTokens, Want};
+use grande_core::{BranchOutput, BranchTokens, PrefixSource, Want};
 use half::f16;
 use wgpu::util::DeviceExt;
 
@@ -81,17 +82,24 @@ struct QkParams {
     v_norm: u32,
     offset: f32,
     q_stride: u32,
-    _p0: u32,
+    /// Index of this pass's first token in the K/V cache and tok_meta.
+    base: u32,
     _p1: u32,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct AttnParams {
+    /// Keys: tokens 0..t of the K/V cache (resident prefix + this pass).
     t: u32,
     heads: u32,
     window: u32,
     q_stride: u32,
+    /// Queries are tokens base..t; their rows in the workspace start at 0.
+    base: u32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
 }
 
 #[repr(C)]
@@ -384,6 +392,12 @@ pub struct Engine {
     /// Per-dispatch GPU timings (timestamp queries), when the adapter has
     /// them and profiling is on. Native only; wasm never sets it.
     profile: Option<Profiler>,
+    /// The prefix whose K/V (and tok_meta) occupy cache rows 0..len after
+    /// the last pass: a request over the same prefix evaluates only its
+    /// branches, appended at row len. Every full pass leaves its prefix
+    /// resident; a continuation only overwrites rows past it.
+    resident: Mutex<Option<Vec<u32>>>,
+    last_source: Mutex<Option<PrefixSource>>,
 }
 
 struct Profiler {
@@ -981,6 +995,8 @@ impl EngineBuilder {
             _keep: keep,
             _weights: weights.into_values().collect(),
             profile,
+            resident: Mutex::new(None),
+            last_source: Mutex::new(None),
         })
     }
 }
@@ -1045,7 +1061,11 @@ impl Engine {
                 .per_layer_table
                 .as_ref()
                 .ok_or_else(|| anyhow!("this model needs per-layer embedding rows; none loaded"))?;
-            let mut ids: Vec<u32> = prefix.to_vec();
+            let mut ids: Vec<u32> = if self.is_resident(prefix) {
+                Vec::new()
+            } else {
+                prefix.to_vec()
+            };
             for b in branches {
                 ids.extend(b.tokens.iter().map(|t| t.0 as u32));
             }
@@ -1080,7 +1100,9 @@ impl Engine {
         let cfg = &self.config;
         let d = cfg.d;
         // Pack: prefix at positions 0..P in sequence 0, each branch restarting
-        // at P in its own sequence.
+        // at P in its own sequence. With the prefix resident from the last
+        // pass, only the branches run: K/V rows and tok_meta 0..P are kept and
+        // this pass's tokens take cache rows P.., workspace rows 0...
         let p = prefix.len();
         let total = p + branches.iter().map(|b| b.tokens.len()).sum::<usize>();
         if total > self.capacity {
@@ -1092,14 +1114,17 @@ impl Engine {
         if total == 0 {
             bail!("empty request");
         }
-        let mut ids: Vec<u32> = Vec::with_capacity(total);
-        let mut meta: Vec<i32> = Vec::with_capacity(total * 2);
-        // (branch, slot, packed index)
+        let base = if self.is_resident(prefix) { p } else { 0 };
+        let mut ids: Vec<u32> = Vec::with_capacity(total - base);
+        let mut meta: Vec<i32> = Vec::with_capacity((total - base) * 2);
+        // (branch, slot, workspace row)
         let mut wanted: Vec<(usize, usize, usize)> = Vec::new();
-        ids.extend_from_slice(prefix);
-        for i in 0..p {
-            meta.push(i as i32);
-            meta.push(0);
+        if base == 0 {
+            ids.extend_from_slice(prefix);
+            for i in 0..p {
+                meta.push(i as i32);
+                meta.push(0);
+            }
         }
         for (bi, b) in branches.iter().enumerate() {
             let start = ids.len();
@@ -1128,18 +1153,31 @@ impl Engine {
         if let Some(&id) = ids.iter().find(|&&id| id as usize >= cfg.vocab) {
             bail!("token id {id} outside the vocabulary of {}", cfg.vocab);
         }
-        let t = total;
+        // Tokens this pass runs (workspace rows); keys seen by attention are
+        // the cache rows 0..base + t.
+        let t = total - base;
         self.queue
             .write_buffer(&self.ids, 0, bytemuck::cast_slice(&ids));
         self.queue
-            .write_buffer(&self.meta, 0, bytemuck::cast_slice(&meta));
+            .write_buffer(&self.meta, (base * 8) as u64, bytemuck::cast_slice(&meta));
         if let Some(plg) = &self.plg {
             let rows =
                 per_layer_rows.ok_or_else(|| anyhow!("per-layer embedding rows required"))?;
-            let need = t * cfg.per_layer_dim * cfg.layers * 2;
-            if rows.len() != need {
-                bail!("per-layer rows: {} bytes, expected {need}", rows.len());
-            }
+            let row_bytes = cfg.per_layer_dim * cfg.layers * 2;
+            // Callers may gather rows for prefix + branches regardless of
+            // residency; only this pass's tokens are uploaded.
+            let rows = if rows.len() == total * row_bytes {
+                &rows[base * row_bytes..]
+            } else if rows.len() == t * row_bytes {
+                rows
+            } else {
+                bail!(
+                    "per-layer rows: {} bytes, expected {} (or {} with the prefix)",
+                    rows.len(),
+                    t * row_bytes,
+                    total * row_bytes
+                );
+            };
             self.queue.write_buffer(plg, 0, rows);
         }
 
@@ -1198,7 +1236,7 @@ impl Engine {
                     emb_scale: (pl as f32).sqrt(),
                     out_scale: 1.0 / 2f32.sqrt(),
                 });
-                run("pl_combine", combine, off, ((t * cfg.layers) as u32, 1));
+                run("pl_combine", combine, off, (cfg.layers as u32, t as u32));
             }
             #[cfg(not(target_arch = "wasm32"))]
             let n_layers = std::env::var("GRANDE_WGPU_LAYERS")
@@ -1227,15 +1265,19 @@ impl Engine {
                     v_norm: cfg.v_norm as u32,
                     offset: cfg.norm_offset,
                     q_stride: l.qkv_width as u32,
-                    _p0: 0,
+                    base: base as u32,
                     _p1: 0,
                 });
                 run("qk_prep", &l.qk, off, (t as u32, 1));
                 let off = params.push(AttnParams {
-                    t: t as u32,
+                    t: (base + t) as u32,
                     heads: cfg.heads as u32,
                     window: if l.sliding { cfg.window as u32 } else { 0 },
                     q_stride: l.qkv_width as u32,
+                    base: base as u32,
+                    _p0: 0,
+                    _p1: 0,
+                    _p2: 0,
                 });
                 let (rows, _) = attn_tile(l.hd);
                 run(
@@ -1446,7 +1488,30 @@ impl Engine {
                 .rows
                 .push(data[r * width..(r + 1) * width].to_vec());
         }
+        // Whichever way this pass ran, cache rows 0..p now hold the prefix.
+        *self.resident.lock().unwrap() = Some(prefix.to_vec());
+        *self.last_source.lock().unwrap() = Some(if base > 0 {
+            PrefixSource::Resident
+        } else {
+            PrefixSource::Decoded
+        });
         Ok(outputs)
+    }
+
+    /// Whether `prefix` is the resident one, so a request over it can skip
+    /// straight to its branches.
+    pub fn is_resident(&self, prefix: &[u32]) -> bool {
+        !prefix.is_empty() && self.resident.lock().unwrap().as_deref() == Some(prefix)
+    }
+
+    /// How the last `evaluate` obtained its prefix.
+    pub fn prefix_source(&self) -> Option<PrefixSource> {
+        *self.last_source.lock().unwrap()
+    }
+
+    /// Forget the resident prefix: the next request decodes it again.
+    pub fn evict_resident(&self) {
+        *self.resident.lock().unwrap() = None;
     }
 
     /// Storage type of the embedding table (also the logits projection).

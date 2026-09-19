@@ -3,7 +3,8 @@
 // proj is x . per_layer_model_proj^T laid out [t][layers x P]; emb is the
 // gathered per-layer token table (f16 pairs, same layout, uploaded by the
 // host); proj_scale = 1/sqrt(d), emb_scale = sqrt(P), out_scale = 1/sqrt(2).
-// One workgroup per (token, layer) slice of P elements.
+// One workgroup per (token, layer) slice of P elements, dispatched as
+// (layers, tokens) so neither axis reaches the 65,535 limit.
 
 struct Params { t: u32, p: u32, layers: u32, eps: f32, offset: f32, proj_scale: f32, emb_scale: f32, out_scale: f32 }
 
@@ -17,8 +18,8 @@ var<workgroup> red: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>) {
-    let slice = wg.x; // t * layers + layer
-    if (slice >= p.t * p.layers) { return; }
+    let slice = wg.y * p.layers + wg.x; // t * layers + layer
+    if (wg.x >= p.layers || wg.y >= p.t) { return; }
     let base = slice * p.p;
     var s = 0.0;
     for (var i = l.x; i < p.p; i += 256u) {

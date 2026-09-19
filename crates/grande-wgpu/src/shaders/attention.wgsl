@@ -6,7 +6,10 @@
 //
 // One KV head shared by `heads` query heads. Q is read from the layer's fused
 // projection buffer (row stride q_stride), K and V from a K/V buffer
-// [t][2 x HD] that may belong to an earlier layer (Gemma 4 shares K/V). A
+// [t][2 x HD] that may belong to an earlier layer (Gemma 4 shares K/V). The
+// keys are cache tokens 0..t; the queries are cache tokens base..t, held at
+// workspace rows 0.. (base > 0 when the prefix is resident from an earlier
+// pass and only the branches run). A
 // workgroup of ROWS x KB invocations handles ROWS query rows = (ROWS / heads)
 // tokens x heads with their Q held as f16 in workgroup memory, and streams
 // keys KB at a time. A tile no row can see is skipped (keys after the block,
@@ -19,7 +22,7 @@
 // engine (16 x 8: 128 invocations, 13 KB at HD 256 / 25 KB at HD 512; see
 // attn_tile for the shapes that measured worse).
 
-struct Params { t: u32, heads: u32, window: u32, q_stride: u32 }
+struct Params { t: u32, heads: u32, window: u32, q_stride: u32, base: u32, _p0: u32, _p1: u32, _p2: u32 }
 
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> q: array<vec4<f32>>;
@@ -73,9 +76,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let row = li / KB;          // 0..ROWS, both roles
     let key = li % KB;          // score role
     let chunk = key * CH;       // output role: CH dims of `row`
-    let tok = tok0 + row / heads;
+    let tok = tok0 + row / heads;   // workspace row; cache token base + tok
     let head = row % heads;
-    let ok = tok < p.t;
+    let ok = p.base + tok < p.t;
 
     // Q tile as f16 pairs: this invocation's CH dims of its row.
     {
@@ -88,7 +91,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         }
     }
     if (li < tb) {
-        let tk = tok0 + li;
+        let tk = p.base + tok0 + li;
         if (tk < p.t) {
             qpos[li] = tok_meta[2u * tk];
             qseq[li] = tok_meta[2u * tk + 1u];
