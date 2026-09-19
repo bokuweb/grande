@@ -20,20 +20,21 @@ use crate::model::{Config, Dtype, QTensor, Weights};
 const PARAM_SLOT: u64 = 256;
 
 /// Workgroup memory the attention kernel declares at a head_dim (see
-/// attention.wgsl): Q tile, K tile, scores, positions.
+/// attention.wgsl): Q tile, K/V tile, scores, positions.
 fn attn_workgroup_bytes(hd: usize) -> u32 {
     let (rows, kb) = attn_tile(hd);
-    (rows * hd / 2 * 4 + kb * hd / 2 * 4 + 128 * 4 + kb * 8 + rows * 8 + 4) as u32
+    (rows * hd / 2 * 4 + kb * hd / 2 * 4 + 2 * rows * kb * 4 + kb * 8 + rows * 8 + 4) as u32
 }
 
 /// Attention workgroup shape (query rows, keys per tile) per head_dim; the
-/// product is the 128-invocation workgroup.
+/// product is the workgroup size, `rows` must be a multiple of the head
+/// count (Config::validate keeps heads at a divisor of 16). 16 x 8 measured
+/// best on an M4 at both head dims (E2B ticket, attention 35 layers): 16 x 16
+/// 67 ms, 32 x 8 101 ms, 8 x 16 68 ms, 16 x 8 64 ms at HD 256; 8 x 16 64 ms
+/// vs 16 x 8 46 ms at HD 512. Workgroup memory is 13 KB / 25 KB.
 fn attn_tile(hd: usize) -> (usize, usize) {
-    if hd >= 512 {
-        (16, 8)
-    } else {
-        (8, 16)
-    }
+    let _ = hd;
+    (16, 8)
 }
 
 #[repr(C)]
@@ -220,10 +221,14 @@ impl Kernels {
                         &format!("const HD: u32 = {}u;", hd.max(256)),
                     )
                     .replace(
-                        "const ROWS: u32 = 8u;",
+                        "const ROWS: u32 = 16u;",
                         &format!("const ROWS: u32 = {rows}u;"),
                     )
-                    .replace("const KB: u32 = 16u;", &format!("const KB: u32 = {kb}u;")),
+                    .replace("const KB: u32 = 16u;", &format!("const KB: u32 = {kb}u;"))
+                    .replace(
+                        "@workgroup_size(128) // ROWS * KB",
+                        &format!("@workgroup_size({}) //", rows * kb),
+                    ),
             );
             let label = format!("{}/{hd}/{quant}", k.name());
             let mut entries = vec![wgpu::BindGroupLayoutEntry {
@@ -1176,8 +1181,8 @@ impl Engine {
                 _pad: 0,
             };
             // matmul.wgsl tiles 64 rows x 128 cols, matmul_gated.wgsl 64 x 64.
-            let mm_wg = |n: usize| (div_ceil(n, 128), div_ceil(t, 64));
-            let gated_wg = |n: usize| (div_ceil(n, 64), div_ceil(t, 64));
+            let mm_wg = |n: usize| (div_ceil(n, 128), div_ceil(t, 32));
+            let gated_wg = |n: usize| (div_ceil(n, 128), div_ceil(t, 32));
             let pl = cfg.per_layer_dim;
             if let Some((mm_proj, combine)) = &self.pl_pre {
                 let n = pl * cfg.layers;

@@ -212,7 +212,7 @@ fn check_matmul(g: &Gpu, m: usize, n: usize, k: usize, dtype: Dtype, tol: f32) {
         [m as u32, n as u32, k as u32],
         &[&bx, &bw, &bs, &by],
         3,
-        (n.div_ceil(128) as u32, m.div_ceil(64) as u32),
+        (n.div_ceil(128) as u32, m.div_ceil(32) as u32),
     );
     let mut worst = 0.0f32;
     for i in 0..m {
@@ -249,7 +249,7 @@ fn check_gated(g: &Gpu, m: usize, n: usize, k: usize, dtype: Dtype, tol: f32) {
         [m as u32, n as u32, k as u32],
         &[&bx, &bg, &bgs, &bu, &bus, &by],
         5,
-        (n.div_ceil(64) as u32, m.div_ceil(64) as u32),
+        (n.div_ceil(128) as u32, m.div_ceil(32) as u32),
     );
     let mut worst = 0.0f32;
     for i in 0..m {
