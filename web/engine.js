@@ -10,6 +10,7 @@
 // only the label-token logits at the last position are read. No generation.
 
 import init, * as grande from "./pkg/grande.js";
+import { idbCache } from "./cache.js";
 
 const GEMMA3 = { layout: "label", turn_start: "<start_of_turn>", turn_end: "<end_of_turn>", user: "user", model: "model" };
 const GEMMA4 = { layout: "label", turn_start: "<|turn>", turn_end: "<turn|>", user: "user", model: "model" };
@@ -57,6 +58,11 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
   await wasmReady;
   const spec = MODELS[model];
   if (!spec) throw new Error(`unknown model ${model}`);
+  // Weights persist in IndexedDB across visits (see cache.js); ask the browser
+  // not to evict them under storage pressure.
+  transformers.env.useCustomCache = true;
+  transformers.env.customCache = idbCache;
+  navigator.storage?.persist?.().catch(() => {});
   const { AutoTokenizer, AutoModelForCausalLM, AutoProcessor, Gemma4ForConditionalGeneration, Tensor } = transformers;
 
   let tok, net;

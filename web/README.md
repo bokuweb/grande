@@ -1,9 +1,13 @@
 # grande web demo
 
-Static page: `index.html` + `app.js` + `engine.js` + `presets.js` + `pkg/`
-(wasm-bindgen output of `crates/grande-web`). transformers.js is loaded from
-jsDelivr; model weights stream from the Hugging Face Hub and are cached by
-the browser. Nothing is uploaded.
+Static page: `index.html` + `app.js` + `engine.js` + `cache.js` +
+`presets.js` + `pkg/` (wasm-bindgen output of `crates/grande-web`).
+transformers.js is loaded from jsDelivr; model weights stream from the
+Hugging Face Hub once and are kept in IndexedDB (`cache.js`, plugged in as
+`env.customCache`: Chromium's Cache API rejects the large `.onnx_data`
+shards, so the default cache only kept the small files). Loaded models also
+stay resident for the page's lifetime, so switching back is instant.
+Nothing is uploaded.
 
 ```bash
 # build the wasm (once per grande-core change)
