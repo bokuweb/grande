@@ -98,6 +98,24 @@ impl<B: Backend> Engine<B> {
         mode: Mode,
     ) -> Result<(Vec<(RenderedBranch, Distribution)>, Diagnostics)> {
         req.validate()?;
+        if matches!(self.readout, Readout::Label) {
+            let max_k = req
+                .questions
+                .values()
+                .map(|q| match q {
+                    crate::api::Question::Choice { criteria, .. } => criteria.len(),
+                    crate::api::Question::Score { criteria, .. } => criteria.len(),
+                    crate::api::Question::Noul { .. } => 2,
+                })
+                .max()
+                .unwrap_or(0);
+            if max_k > crate::readout::LABELS.len() {
+                return Err(crate::Error::invalid(
+                    "questions",
+                    format!("label readout supports at most {} options", crate::readout::LABELS.len()),
+                ));
+            }
+        }
         let rendered = self.renderer.render_with(req, orders);
         let packed = self.pack(&rendered)?;
         let max_k = rendered

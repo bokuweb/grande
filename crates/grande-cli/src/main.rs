@@ -137,6 +137,25 @@ enum Cmd {
         #[arg(long, value_enum, default_value = "pointer")]
         layout: LayoutArg,
     },
+    /// Score a kev-style suite (TypeSafe-shaped records with `label` on each
+    /// question) and report accuracy per task, like kev's kev-vs-jev tables.
+    Suite {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        head: Option<PathBuf>,
+        /// Only records whose `_meta.variant` is `clean` (kev's headline numbers).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        clean_only: bool,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long, default_value_t = 4096)]
+        n_ctx: u32,
+    },
     /// Print a GGUF metadata value (e.g. tokenizer.chat_template).
     Meta {
         #[arg(long)]
@@ -570,6 +589,129 @@ fn main() -> Result<()> {
                     "branches": branches,
                 }))?
             );
+        }
+        Cmd::Suite {
+            model,
+            data,
+            out,
+            head,
+            clean_only,
+            limit,
+            n_ctx,
+        } => {
+            use grande_eval::report::{metrics, Row};
+            use std::collections::BTreeMap;
+            let mut records = grande_eval::suite::load(&data)?;
+            if clean_only {
+                records.retain(|r| r.variant == "clean");
+            }
+            if let Some(n) = limit {
+                records.truncate(n);
+            }
+            std::fs::create_dir_all(&out)?;
+            let rows_path = out.join("rows.jsonl");
+            anyhow::ensure!(
+                !rows_path.exists(),
+                "{} exists; choose a fresh --out",
+                rows_path.display()
+            );
+            let backend = LlamaEngine::load(
+                &model,
+                Options {
+                    n_ctx,
+                    n_batch: n_ctx,
+                    ..Default::default()
+                },
+            )?;
+            let (renderer, readout) = readout_for(&backend, head.as_ref())?;
+            let mut engine = Engine::new(backend, renderer, readout, "suite");
+            let mut by_task: BTreeMap<String, Vec<Row>> = BTreeMap::new();
+            let mut skipped: BTreeMap<String, usize> = BTreeMap::new();
+            let mut file = std::io::BufWriter::new(std::fs::File::create(&rows_path)?);
+            use std::io::Write;
+            let t0 = Instant::now();
+            let mut total_ms = 0u128;
+            for (i, rec) in records.iter().enumerate() {
+                let t = Instant::now();
+                let res = engine.distributions(&rec.request, &Default::default(), Mode::Packed);
+                let (dists, diag) = match res {
+                    Ok(x) => x,
+                    Err(grande_core::Error::Invalid { message, .. })
+                        if message.contains("label readout supports") =>
+                    {
+                        for task in &rec.tasks {
+                            *skipped.entry(task.clone()).or_default() += 1;
+                        }
+                        continue;
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                let ms = t.elapsed().as_millis();
+                total_ms += ms;
+                for (k, (branch, d)) in dists.iter().enumerate() {
+                    let Some(gold) = rec.gold[k] else { continue };
+                    let row = Row {
+                        id: format!("{}/{}", rec.id, branch.id),
+                        gold,
+                        logits: d.logits.clone(),
+                        pred: grande_core::math::argmax(&d.probs),
+                        candidate_mass: diag.candidate_mass.get(&branch.id).copied(),
+                        ms,
+                        permuted_preds: Vec::new(),
+                        permuted_probs: Vec::new(),
+                    };
+                    writeln!(
+                        file,
+                        "{}",
+                        serde_json::to_string(
+                            &serde_json::json!({"task": rec.tasks[k], "row": row})
+                        )?
+                    )?;
+                    by_task.entry(rec.tasks[k].clone()).or_default().push(row);
+                }
+                if (i + 1) % 50 == 0 {
+                    eprintln!(
+                        "{}/{}  {:.0} s",
+                        i + 1,
+                        records.len(),
+                        t0.elapsed().as_secs_f32()
+                    );
+                }
+            }
+            file.flush()?;
+            let mut all: Vec<Row> = Vec::new();
+            let mut per_task = serde_json::Map::new();
+            println!(
+                "{:<14} {:>5} {:>6} {:>6} {:>6}",
+                "task", "n", "acc", "ece", "nll"
+            );
+            for (task, rows) in &by_task {
+                let m = metrics(rows, 1.0);
+                println!(
+                    "{task:<14} {:>5} {:>6.3} {:>6.3} {:>6.3}",
+                    m.n, m.accuracy, m.ece, m.nll
+                );
+                per_task.insert(task.clone(), serde_json::to_value(&m)?);
+                all.extend(rows.iter().cloned());
+            }
+            let m = metrics(&all, 1.0);
+            println!(
+                "{:<14} {:>5} {:>6.3} {:>6.3} {:>6.3}",
+                "ALL", m.n, m.accuracy, m.ece, m.nll
+            );
+            for (task, n) in &skipped {
+                println!(
+                    "skipped {task}: {n} records (more options than the label readout supports)"
+                );
+            }
+            let summary = serde_json::json!({
+                "data": data, "clean_only": clean_only, "records": records.len(), "per_task": per_task,
+                "all": m, "skipped": skipped, "mean_ms_per_record": total_ms as f64 / records.len().max(1) as f64,
+            });
+            std::fs::write(
+                out.join("summary.json"),
+                serde_json::to_string_pretty(&summary)?,
+            )?;
         }
         Cmd::Meta { model, key } => {
             let engine = LlamaEngine::load(

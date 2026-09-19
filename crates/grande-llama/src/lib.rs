@@ -107,6 +107,10 @@ impl LlamaEngine {
             .with_n_threads(opts.n_threads)
             .with_n_threads_batch(opts.n_threads)
             .with_swa_full(opts.swa_full)
+            // One shared cell pool: `seq_cp` then only adds a sequence id to
+            // the prefix cells (no copy), and n_ctx is the request's total
+            // budget instead of being split per sequence.
+            .with_kv_unified(true)
             .with_embeddings(true);
         let ctx = match model.new_context(backend, cparams) {
             Ok(c) => c,

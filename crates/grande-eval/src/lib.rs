@@ -7,3 +7,4 @@
 
 pub mod jglue;
 pub mod report;
+pub mod suite;
