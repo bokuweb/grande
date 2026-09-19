@@ -114,15 +114,29 @@ the pruning corpus); the unpruned Q4_0 scores 0.530 / 0.857 on the same rows.
 | **Q4_0, pruned** | **1,273 MB** | 0.580 (n=400) | 0.855 (n=400) | 1.10 s |
 | Q3_K_M, pruned | 1,181 MB | 0.520 | 0.793 | 1.18 s |
 | Q2_K, pruned | 969 MB | 0.223 | 0.240 | – (model collapses) |
+| Q3_K_M, embeddings kept at Q8 | 1,255 MB | 0.520 | 0.790 | |
+| Q2_K, embeddings kept at Q8 | 1,043 MB | 0.213 | 0.243 | (still collapses: it is the blocks) |
+| IQ3_XXS + Japanese imatrix, emb Q8 | 1,080 MB | 0.570 | 0.793 | |
+| Q2_K + Japanese imatrix, emb Q8 | 1,043 MB | 0.543 | 0.710 | |
+| IQ2_M + Japanese imatrix, emb Q8 | 985 MB | 0.603 | 0.557 | |
 
 Reading: pruning is free (Q8_0-pruned ≡ unpruned); Q4 costs nothing
-measurable on JNLI and ~1 pt on JCQA; Q3_K_M loses 6 pts on JCQA; Q2_K
-without an importance matrix destroys the model (the PLE table is probably
-what breaks — keeping embeddings at Q8 and quantizing only the blocks is the
-next thing to try). Quantization level does not change speed (compute-bound).
-One real cost of pruning: text outside the corpus tokenizes into more pieces
-(the synthetic contract state: 549 → 612 branch tokens, +11%); a broader
-Japanese corpus for the kept set fixes that.
+measurable on JNLI and ~1 pt on JCQA. Below Q4 the transformer blocks are
+what breaks, not the embeddings: Q2_K collapses with or without Q8
+embeddings, and an importance matrix computed on Japanese text
+(`llama-imatrix`, 120 × 512 tokens of Wikipedia + JGLUE) brings Q2_K back to
+0.54 / 0.71 and gives IQ3_XXS Q3_K_M quality at 1,080 MB. Gemma 4's shared
+K/V layers have no activations for the imatrix, so `attn_k` / `attn_v` are
+pinned to Q4_0 for the IQ types. Nothing under ~1.0 GB keeps JCQA above
+0.79; the next 20% below Q4_0-pruned buys −6 pts, so **Q4_0-pruned
+(1,273 MB) is the sweet spot** and the lever below it is layer dropping, not
+bits. Quantization level does not change speed (compute-bound).
+
+Pruning corpus: with JGLUE + kev suites + examples (29k tokens kept) text
+outside the corpus tokenizes into more pieces (synthetic contract state:
+549 → 612 branch tokens, +11%). Adding 3,000 Japanese + 1,500 English
+Wikipedia articles keeps 86,897 tokens (33%), the overhead drops to +6.6%
+(585 tokens), and the Q4_0 file would be ~1.6 GB. Pick by workload.
 
 Beyond this: PLE / embeddings at Q3 with the blocks at Q4 (~1.0 GB), early
 exit / layer drop (needs training, RFC 07 §2.4), or the 270M backbone
