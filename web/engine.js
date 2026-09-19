@@ -10,13 +10,20 @@
 // only the label-token logits at each branch's last position are read. No generation.
 // Modes: "shared" (above), "batched" (one forward where every row re-reads the
 // state) and "sequential" (one forward per question) are kept for comparison.
+// The trained pointer model (a hidden-state export without a KV cache) always
+// runs batched.
 
 import init, * as grande from "./pkg/grande.js";
+import { idbCache } from "./cache.js";
 
 const GEMMA3 = { layout: "label", turn_start: "<start_of_turn>", turn_end: "<end_of_turn>", user: "user", model: "model" };
 const GEMMA4 = { layout: "label", turn_start: "<|turn>", turn_end: "<turn|>", user: "user", model: "model" };
 
 export const MODELS = {
+  // Trained pointer head (JNLI 0.71 / JCQA 0.71, 12k records) on a Gemma 3 270M
+  // backbone with embedding rows pruned to a Japanese + English corpus. Served
+  // from this site (./models/, fetched from a GitHub release at build time).
+  "grande-270m-ja": { id: "grande-270m-ja", local: true, kind: "pointer", layout: { layout: "pointer", state: "<unused0>", question: "<unused1>", opt: "<unused2>", opt_end: "<unused3>", decide: "<unused4>" }, dtype: "q8", size: "0.21 GB", note: "default, trained, fast" },
   "gemma-3-270m": { id: "onnx-community/gemma-3-270m-it-ONNX", kind: "causal", layout: GEMMA3, dtype: "q4f16", size: "0.27 GB", note: "smoke test only" },
   "gemma-3-1b": { id: "onnx-community/gemma-3-1b-it-ONNX", kind: "causal", layout: GEMMA3, dtype: "q4f16", size: "0.76 GB", note: "fast" },
   "gemma-4-e2b": { id: "onnx-community/gemma-4-E2B-it-ONNX", kind: "gemma4", layout: GEMMA4, dtype: "q4f16", size: "3.4 GB", note: "default", padding: "right" },
@@ -50,6 +57,47 @@ function logSumExp(row, ids) {
   return m + Math.log(s);
 }
 
+// Minimal safetensors reader for the pointer head (q.weight [dp,d], q.bias, k.weight, k.bias).
+async function loadHead(url) {
+  const buf = await (await fetch(url)).arrayBuffer();
+  const n = Number(new DataView(buf).getBigUint64(0, true));
+  const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 8, n)));
+  const base = 8 + n;
+  const tensor = (name) => {
+    const t = header[name];
+    if (!t) throw new Error(`head: missing ${name}`);
+    if (t.dtype !== "F32") throw new Error(`head: ${name} is ${t.dtype}, expected F32`);
+    const [a, b] = t.data_offsets;
+    return { shape: t.shape, data: new Float32Array(buf.slice(base + a, base + b)) };
+  };
+  const wq = tensor("q.weight"), bq = tensor("q.bias"), wk = tensor("k.weight"), bk = tensor("k.bias");
+  return { dp: wq.shape[0], d: wq.shape[1], wq: wq.data, bq: bq.data, wk: wk.data, bk: bk.data };
+}
+
+function project(head, w, b, h, off) {
+  const { dp, d } = head;
+  const out = new Float32Array(dp);
+  for (let r = 0; r < dp; r++) {
+    let acc = b[r];
+    const wr = r * d;
+    for (let c = 0; c < d; c++) acc += w[wr + c] * h[off + c];
+    out[r] = acc;
+  }
+  return out;
+}
+
+// Pointer readout: logits_i = (W_k h_opt_i + b_k) · (W_q h_decide + b_q) / sqrt(dp).
+function pointerLogits(head, hidden, decideOff, optOffs) {
+  const q = project(head, head.wq, head.bq, hidden, decideOff);
+  const scale = 1 / Math.sqrt(head.dp);
+  return optOffs.map((o) => {
+    const k = project(head, head.wk, head.bk, hidden, o);
+    let dot = 0;
+    for (let i = 0; i < head.dp; i++) dot += k[i] * q[i];
+    return dot * scale;
+  });
+}
+
 let wasmReady = null;
 
 export async function loadEngine({ transformers, model = "gemma-3-1b", device = "webgpu", onProgress } = {}) {
@@ -59,10 +107,28 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
   await wasmReady;
   const spec = MODELS[model];
   if (!spec) throw new Error(`unknown model ${model}`);
+  // Weights persist in IndexedDB across visits (see cache.js); ask the browser
+  // not to evict them under storage pressure.
+  transformers.env.useCustomCache = true;
+  transformers.env.customCache = idbCache;
+  navigator.storage?.persist?.().catch(() => {});
   const { AutoTokenizer, AutoModelForCausalLM, AutoProcessor, Gemma4ForConditionalGeneration, Tensor, DynamicCache } = transformers;
 
-  let tok, net;
-  if (spec.kind === "gemma4") {
+  let tok, net, head = null, idMap = null;
+  if (spec.local) {
+    // Same-origin model directory. transformers.js only probes local files when
+    // localModelPath is NOT an absolute URL (its metadata check skips http(s)
+    // paths), so keep it page-relative.
+    transformers.env.allowLocalModels = true;
+    transformers.env.localModelPath = "./models/";
+    transformers.env.allowRemoteModels = false;
+    const base = new URL(`./models/${spec.id}/`, location.href).href;
+    tok = await AutoTokenizer.from_pretrained(spec.id, { progress_callback: onProgress });
+    net = await transformers.AutoModel.from_pretrained(spec.id, { dtype: spec.dtype, device, progress_callback: onProgress });
+    transformers.env.allowRemoteModels = true;
+    head = await loadHead(`${base}head.safetensors`);
+    idMap = new Int32Array(await (await fetch(`${base}id_map.bin`)).arrayBuffer());
+  } else if (spec.kind === "gemma4") {
     const processor = await AutoProcessor.from_pretrained(spec.id, { progress_callback: onProgress });
     tok = processor.tokenizer;
     net = await Gemma4ForConditionalGeneration.from_pretrained(spec.id, { dtype: spec.dtype, device, progress_callback: onProgress });
@@ -212,12 +278,74 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     return { rows, tokens: tokens + (warm ? 0 : P), forwards: branchTexts.length + (warm ? 0 : 1), warm, state_tokens: P };
   }
 
+  // Tokenize rendered segments one by one (mirror of grande-core's pack): text
+  // segments never parse control tokens, specials resolve to one id, and the
+  // wanted positions (each </opt>, then <decide>) are the last token of their
+  // segment.
+  function packSegments(segments) {
+    const ids = [];
+    const ends = [];
+    for (const s of segments) {
+      if (s.kind === "bos") ids.push(...tok.encode(bos, { add_special_tokens: false }));
+      else if (s.kind === "special") {
+        const t = tok.encode(s.value, { add_special_tokens: false });
+        if (t.length !== 1) throw new Error(`${s.value} is not one token`);
+        ids.push(t[0]);
+      } else ids.push(...tok.encode(neutralize(s.value), { add_special_tokens: false }));
+      ends.push(ids.length - 1);
+    }
+    return { ids, ends };
+  }
+
+  // Pointer readout over one batched forward (right padding; pads sit after the
+  // real tokens so causal attention never sees them). Every row re-reads the state.
+  async function pointerBatched(rendered) {
+    const prefix = packSegments(rendered.prefix).ids;
+    const rows = rendered.branches.map((b) => {
+      const { ids, ends } = packSegments(b.segments);
+      const want = b.marks.map(([seg, mark]) => (mark === "Last" ? ids.length - 1 : ends[seg]) + prefix.length);
+      return { ids: [...prefix, ...ids], want, k: b.keys.length };
+    });
+    const B = rows.length;
+    const L = Math.max(...rows.map((r) => r.ids.length));
+    const input = new BigInt64Array(B * L);
+    const mask = new BigInt64Array(B * L);
+    let tokens = 0;
+    rows.forEach((r, b) => {
+      r.ids.forEach((id, i) => {
+        input[b * L + i] = BigInt(idMap[id]);
+        mask[b * L + i] = 1n;
+      });
+      tokens += r.ids.length;
+    });
+    const out = await net({ input_ids: new Tensor("int64", input, [B, L]), attention_mask: new Tensor("int64", mask, [B, L]) });
+    const hs = out.last_hidden_state;
+    const [, , D] = hs.dims;
+    const data = hs.data instanceof Float32Array ? hs.data : Float32Array.from(hs.data, Number);
+    const result = rows.map((r, b) => {
+      const offs = r.want.map((p) => (b * L + p) * D);
+      const decide = offs[offs.length - 1];
+      const logits = pointerLogits(head, data, decide, offs.slice(0, -1));
+      return { logits, candidate_mass: null };
+    });
+    hs.dispose?.();
+    return { rows: result, tokens, prefixTokens: prefix.length };
+  }
+
   let queue = Promise.resolve();
   const enqueue = (job) => { const p = queue.then(job, job); queue = p.catch(() => {}); return p; };
 
   async function answerNow(request, { temperature = 1.0, mode = "shared" } = {}) {
     const reqJson = JSON.stringify(request);
     const rendered = JSON.parse(grande.render(reqJson, JSON.stringify(spec.layout)));
+    if (spec.kind === "pointer") {
+      const t0 = performance.now();
+      const { rows, tokens, prefixTokens } = await pointerBatched(rendered);
+      const ms = performance.now() - t0;
+      const resp = JSON.parse(grande.answer(reqJson, JSON.stringify(rows), temperature, spec.id, tokens));
+      return { ...resp, usage: { ...resp.usage, state_tokens: prefixTokens, questions: rows.length, mode: "batched", ms, forwards: 1 },
+        diagnostics: { candidate_mass: {}, rows } };
+    }
     const prefix = segmentsToText(rendered.prefix, bos);
     const branchTexts = rendered.branches.map((b) => segmentsToText(b.segments, bos));
     const texts = branchTexts.map((t) => prefix + t);

@@ -1,9 +1,13 @@
 # grande web demo
 
-Static page: `index.html` + `app.js` + `engine.js` + `presets.js` + `pkg/`
-(wasm-bindgen output of `crates/grande-web`). transformers.js is loaded from
-jsDelivr; model weights stream from the Hugging Face Hub and are cached by
-the browser. Nothing is uploaded.
+Static page: `index.html` + `app.js` + `engine.js` + `cache.js` +
+`presets.js` + `pkg/` (wasm-bindgen output of `crates/grande-web`).
+transformers.js is loaded from jsDelivr; model weights stream from the
+Hugging Face Hub once and are kept in IndexedDB (`cache.js`, plugged in as
+`env.customCache`: Chromium's Cache API rejects the large `.onnx_data`
+shards, so the default cache only kept the small files). Loaded models also
+stay resident for the page's lifetime, so switching back is instant.
+Nothing is uploaded.
 
 ```bash
 # build the wasm (once per grande-core change)
@@ -44,6 +48,9 @@ Modes:
 - `batched`: one forward where every row is `state + question`, right- or
   left-padded. The state is re-read once per question.
 - `sequential`: one forward per `state + question`, for comparison.
+
+The trained pointer model (`grande-270m-ja`, a hidden-state export without
+a KV cache) always runs batched, so it still re-reads the state per question.
 
 Padding (`batched` only): Gemma 3 causal-LM exports honour `attention_mask`
 / `position_ids`, so rows are left-padded and only one logits position is

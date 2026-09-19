@@ -1,9 +1,10 @@
-/target
-/models/
-/runs/
 *.gguf
 .DS_Store
-/python/.venv/
 /.cache/
-__pycache__/
+/models/
+/python/.venv/
+/runs/
+/target
+/web/models/
 /web/pkg/
+__pycache__/

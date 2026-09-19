@@ -1,5 +1,6 @@
 import { loadEngine, MODELS } from "./engine.js";
 import { PRESETS } from "./presets.js";
+import { cachedModelIds, cacheUsage, clearCache } from "./cache.js";
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
@@ -8,12 +9,34 @@ let engine = null;
 let transformers = null;
 let mode = "shared";
 
-for (const [k, m] of Object.entries(MODELS)) {
+let cached = new Set();
+function renderModelOptions() {
+  for (const o of $("model").options) {
+    const m = MODELS[o.value];
+    o.textContent = `${o.value}  ·  ${m.size}  ·  ${m.note}${cached.has(m.id) ? "  ·  cached" : ""}`;
+  }
+}
+for (const [k] of Object.entries(MODELS)) {
   const o = document.createElement("option");
-  o.value = k; o.textContent = `${k}  ·  ${m.size}  ·  ${m.note}`;
-  if (k === (params.get("model") ?? "gemma-4-e2b")) o.selected = true;
+  o.value = k;
+  if (k === (params.get("model") ?? "grande-270m-ja")) o.selected = true;
   $("model").append(o);
 }
+renderModelOptions();
+
+async function refreshCache() {
+  cached = await cachedModelIds();
+  renderModelOptions();
+  const { bytes, quota } = await cacheUsage();
+  $("cache").textContent = bytes ? `${(bytes / 1e9).toFixed(2)} GB cached in IndexedDB${quota ? ` of ${(quota / 1e9).toFixed(0)} GB quota` : ""}` : "";
+  $("cache").parentElement.hidden = !bytes;
+}
+$("clear").addEventListener("click", async () => {
+  if (!confirm("Delete all cached model weights from this browser?")) return;
+  await clearCache();
+  await refreshCache();
+  selectModel();
+});
 for (const [k, p] of Object.entries(PRESETS)) {
   const o = document.createElement("option");
   o.value = k; o.textContent = p.label;
@@ -93,14 +116,19 @@ function selectModel() {
     setStatus(`${engine.spec.id} loaded (WebGPU, ${engine.spec.dtype})`, null, "ok");
     $("load").textContent = "Loaded";
     $("load").disabled = true;
+  } else if (cached.has(MODELS[model].id)) {
+    setStatus(`Not loaded. Weights are cached in this browser; loading needs no download.`);
+    $("load").textContent = "Load model";
+    $("load").disabled = loading;
   } else {
-    setStatus(`Not loaded. ${MODELS[model].size} streams from the Hugging Face Hub and is cached by the browser.`);
+    setStatus(`Not loaded. ${MODELS[model].size} streams from the Hugging Face Hub once, then stays cached in this browser.`);
     $("load").textContent = "Load model";
     $("load").disabled = loading;
   }
 }
 $("model").addEventListener("change", selectModel);
 selectModel();
+refreshCache().then(selectModel);
 
 $("load").addEventListener("click", async () => {
   const model = $("model").value;
@@ -127,6 +155,7 @@ $("load").addEventListener("click", async () => {
     engines.set(model, loaded);
     loading = false;
     $("model").disabled = false;
+    await refreshCache();
     selectModel();
   } catch (e) {
     loading = false;
@@ -189,7 +218,7 @@ function renderResults(request, resp) {
       <div class="q-head"><span class="q-id">${esc(id)}</span><span class="badge">${a.type}</span></div>
       ${q.instructions ? `<div class="q-inst">${esc(q.instructions)}</div>` : ""}
       <div class="opts">${opts}</div>
-      <div class="q-foot"><span>${summary}</span><span class="${mass < 0.9 ? "warn" : ""}" title="Probability mass on the candidate labels">mass ${mass.toFixed(3)}</span></div>
+      <div class="q-foot"><span>${summary}</span>${mass == null ? "" : `<span class="${mass < 0.9 ? "warn" : ""}" title="Probability mass on the candidate labels">mass ${mass.toFixed(3)}</span>`}</div>
     </div>`);
   }
   $("results").innerHTML = cards.join("");
