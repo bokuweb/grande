@@ -27,6 +27,12 @@ enum ModeArg {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
+enum LayoutArg {
+    Label,
+    Pointer,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
 enum TaskArg {
     Jnli,
     Jcqa,
@@ -108,6 +114,17 @@ enum Cmd {
         temperature: f32,
         #[arg(long, default_value_t = 8192)]
         n_ctx: u32,
+    },
+    /// Dump the packed layout of a request as JSON: prefix token ids, and
+    /// per branch the token ids, wanted positions and option keys. Used to
+    /// check that the Python training renderer produces the same bytes.
+    Render {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long, value_enum, default_value = "pointer")]
+        layout: LayoutArg,
     },
     /// Print a GGUF metadata value (e.g. tokenizer.chat_template).
     Meta {
@@ -383,6 +400,53 @@ fn main() -> Result<()> {
                 axum::serve(listener, grande_server::router(state)).await?;
                 Ok::<(), anyhow::Error>(())
             })?;
+        }
+        Cmd::Render {
+            model,
+            request,
+            layout,
+        } => {
+            let req: Request = serde_json::from_slice(&std::fs::read(&request)?)?;
+            req.validate()?;
+            let backend = LlamaEngine::load(
+                &model,
+                Options {
+                    n_ctx: 512,
+                    n_batch: 512,
+                    ..Default::default()
+                },
+            )?;
+            let renderer = match layout {
+                LayoutArg::Label => Renderer::gemma_label(),
+                LayoutArg::Pointer => Renderer::gemma_pointer(),
+            };
+            let engine = Engine::new(backend, renderer.clone(), Readout::Label, "render");
+            let rendered = renderer.render(&req);
+            let packed = engine.pack(&rendered)?;
+            let pieces = |ts: &[grande_core::Token]| {
+                ts.iter()
+                    .map(|t| engine.backend.piece(*t))
+                    .collect::<Vec<_>>()
+            };
+            let branches: Vec<serde_json::Value> = rendered
+                .branches
+                .iter()
+                .zip(&packed.branches)
+                .map(|(b, p)| {
+                    serde_json::json!({
+                        "id": b.id, "keys": b.keys, "tokens": p.tokens.iter().map(|t| t.0).collect::<Vec<_>>(),
+                        "pieces": pieces(&p.tokens), "want": p.want,
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "prefix": packed.prefix.iter().map(|t| t.0).collect::<Vec<_>>(),
+                    "prefix_pieces": pieces(&packed.prefix),
+                    "branches": branches,
+                }))?
+            );
         }
         Cmd::Meta { model, key } => {
             let engine = LlamaEngine::load(

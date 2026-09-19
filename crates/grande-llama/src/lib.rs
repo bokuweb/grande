@@ -8,9 +8,11 @@
 //! block-causal mask kev uses in PyTorch. Positions restart at `prefix_len`
 //! per branch, so every branch is "state, then this question".
 
+use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 use std::num::NonZeroU32;
 use std::path::Path;
+use std::sync::Mutex;
 
 use anyhow::{anyhow, Context};
 use grande_core::{Backend, BranchOutput, BranchTokens, Error, Token, Want};
@@ -59,6 +61,7 @@ pub struct LlamaEngine {
     backend: *mut LlamaBackend,
     opts: Options,
     n_seq_max: usize,
+    specials: Mutex<HashMap<String, Token>>,
 }
 
 // SAFETY: every use of the context and model goes through `&mut self` or
@@ -122,6 +125,7 @@ impl LlamaEngine {
             backend: backend_ptr,
             opts,
             n_seq_max,
+            specials: Mutex::new(HashMap::new()),
         })
     }
 
@@ -251,26 +255,26 @@ impl Backend for LlamaEngine {
     }
 
     fn special(&self, name: &str) -> grande_core::Result<Token> {
+        if let Some(t) = self.specials.lock().unwrap().get(name) {
+            return Ok(*t);
+        }
+        // Tokens the tokenizer treats as control tokens parse directly
+        // (`<|turn>`). Gemma's reserved `<unusedN>` tokens are plain vocab
+        // entries in the GGUF, so fall back to an exact vocabulary lookup.
         let toks = self
             .model()
             .str_to_token(name, AddBos::Never)
             .map_err(|e| core_err(e.into()))?;
-        if toks.len() != 1 {
-            return Err(Error::Backend(format!(
-                "{name:?} is not a single special token: {toks:?}"
-            )));
-        }
-        let mut dec = encoding_rs::UTF_8.new_decoder();
-        let piece = self
-            .model()
-            .token_to_piece(toks[0], &mut dec, true, None)
-            .unwrap_or_default();
-        if piece != name {
-            return Err(Error::Backend(format!(
-                "{name:?} tokenized to {piece:?}, not a control token"
-            )));
-        }
-        Ok(Token(toks[0].0))
+        let found = if toks.len() == 1 && self.piece(Token(toks[0].0)) == name {
+            Some(Token(toks[0].0))
+        } else {
+            let n = self.model().n_vocab();
+            (0..n).map(Token).find(|t| self.piece(*t) == name)
+        };
+        let t = found
+            .ok_or_else(|| Error::Backend(format!("{name:?} is not a token in this vocabulary")))?;
+        self.specials.lock().unwrap().insert(name.to_string(), t);
+        Ok(t)
     }
 
     fn bos(&self) -> Token {
