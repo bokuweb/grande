@@ -79,16 +79,41 @@ function setStatus(text, pct, cls = "") {
   $("bar").style.width = pct == null ? "0%" : `${Math.round(pct)}%`;
 }
 
+// Loaded engines stay resident, keyed by model, so switching back to a model
+// that was already loaded is instant (no re-fetch, no re-init).
+const engines = new Map();
+let loading = false;
+
+function selectModel() {
+  const model = $("model").value;
+  engine = engines.get(model) ?? null;
+  window.grandeEngine = engine; // for the console
+  $("run").disabled = !engine;
+  if (engine) {
+    setStatus(`${engine.spec.id} loaded (WebGPU, ${engine.spec.dtype})`, null, "ok");
+    $("load").textContent = "Loaded";
+    $("load").disabled = true;
+  } else {
+    setStatus(`Not loaded. ${MODELS[model].size} streams from the Hugging Face Hub and is cached by the browser.`);
+    $("load").textContent = "Load model";
+    $("load").disabled = loading;
+  }
+}
+$("model").addEventListener("change", selectModel);
+selectModel();
+
 $("load").addEventListener("click", async () => {
+  const model = $("model").value;
+  if (engines.has(model) || loading) return;
+  loading = true;
   $("load").disabled = true;
-  $("model").disabled = true;
+  $("model").disabled = true; // the progress line belongs to this model
   try {
     if (!navigator.gpu) throw new Error("WebGPU is not available in this browser (Chrome / Edge, Safari 26+).");
     transformers ??= await import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.0");
-    const model = $("model").value;
     const files = new Map();
     setStatus(`Fetching ${MODELS[model].id}…`, 0);
-    engine = await loadEngine({
+    const loaded = await loadEngine({
       transformers, model,
       onProgress: (info) => {
         if (info.status === "progress") {
@@ -99,14 +124,15 @@ $("load").addEventListener("click", async () => {
         } else if (info.status === "ready") setStatus("Initializing…", 100);
       },
     });
-    window.grandeEngine = engine; // for the console
-    setStatus(`${engine.spec.id} loaded (WebGPU, ${engine.spec.dtype})`, null, "ok");
-    $("run").disabled = false;
-    $("load").textContent = "Loaded";
+    engines.set(model, loaded);
+    loading = false;
+    $("model").disabled = false;
+    selectModel();
   } catch (e) {
+    loading = false;
+    $("model").disabled = false;
     setStatus(`Failed to load: ${e.message}`, null, "err");
     $("load").disabled = false;
-    $("model").disabled = false;
     console.error(e);
   }
 });
