@@ -42,6 +42,10 @@ enum Cmd {
         request: PathBuf,
         #[arg(long, value_enum, default_value = "packed")]
         mode: ModeArg,
+        /// Pointer head weights (safetensors). Switches to the packed
+        /// delimiter layout; without it the zero-shot label readout is used.
+        #[arg(long)]
+        head: Option<PathBuf>,
         #[arg(long, default_value_t = 1.0)]
         temperature: f32,
         #[arg(long, default_value_t = 8192)]
@@ -392,6 +396,7 @@ fn main() -> Result<()> {
             model,
             request,
             mode,
+            head,
             temperature,
             n_ctx,
             n_gpu_layers,
@@ -416,7 +421,20 @@ fn main() -> Result<()> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("model")
                 .to_lowercase();
-            let mut engine = Engine::new(backend, Renderer::gemma_label(), Readout::Label, name);
+            let (renderer, readout) = match head {
+                Some(p) => {
+                    let h = grande_core::readout::safetensors::load(&std::fs::read(&p)?)?;
+                    anyhow::ensure!(
+                        h.d == backend.n_embd(),
+                        "head d={} but model n_embd={}",
+                        h.d,
+                        backend.n_embd()
+                    );
+                    (Renderer::gemma_pointer(), Readout::Pointer(h))
+                }
+                None => (Renderer::gemma_label(), Readout::Label),
+            };
+            let mut engine = Engine::new(backend, renderer, readout, name);
             engine.temperature = temperature;
 
             match mode {
