@@ -250,12 +250,29 @@ impl Kernels {
                     label: Some(&label),
                     entries: &entries,
                 });
-            let module = self
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some(&label),
-                    source: wgpu::ShaderSource::Wgsl(src.into()),
-                });
+            let desc = wgpu::ShaderModuleDescriptor {
+                label: Some(&label),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            let unchecked = std::env::var("GRANDE_WGPU_CHECKED").is_err();
+            #[cfg(target_arch = "wasm32")]
+            let unchecked = false;
+            let module = if unchecked {
+                // Native default: naga clamps every array index in the
+                // generated MSL / SPIR-V (`min(i, len - 1)`), which costs ~20%
+                // on the E2B pass (M4: 1.12 -> 0.88 s). The kernels guard
+                // m / n / k themselves and the shapes come from the engine, so
+                // an out-of-range access would be an engine bug; set
+                // GRANDE_WGPU_CHECKED=1 to get the clamps back when chasing
+                // one. wasm always runs Tint's checks.
+                unsafe {
+                    self.device
+                        .create_shader_module_trusted(desc, wgpu::ShaderRuntimeChecks::unchecked())
+                }
+            } else {
+                self.device.create_shader_module(desc)
+            };
             let pl = self
                 .device
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1158,7 +1175,9 @@ impl Engine {
                 k: k as u32,
                 _pad: 0,
             };
-            let mm_wg = |n: usize| (div_ceil(n, 64), div_ceil(t, 64));
+            // matmul.wgsl tiles 64 rows x 128 cols, matmul_gated.wgsl 64 x 64.
+            let mm_wg = |n: usize| (div_ceil(n, 128), div_ceil(t, 64));
+            let gated_wg = |n: usize| (div_ceil(n, 64), div_ceil(t, 64));
             let pl = cfg.per_layer_dim;
             if let Some((mm_proj, combine)) = &self.pl_pre {
                 let n = pl * cfg.layers;
@@ -1228,7 +1247,7 @@ impl Engine {
                 let off = params.push(norm_p(0, 1.0));
                 run("norm", &l.norm_pre_ff, off, (t as u32, 1));
                 let off = params.push(mm(l.ff, d));
-                run("mm_gate_up", &l.mm_gate_up, off, mm_wg(l.ff));
+                run("mm_gate_up", &l.mm_gate_up, off, gated_wg(l.ff));
                 let off = params.push(mm(d, l.ff));
                 run("mm_down", &l.mm_down, off, mm_wg(d));
                 match &l.pl {

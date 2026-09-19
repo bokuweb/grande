@@ -1,33 +1,127 @@
 // Y[M, N] = X[M, K] * W[N, K]^T   (a linear layer; W row-major as HF stores it)
 // X, Y are f32; W is f16 packed two per u32 or a quantized block format (see
-// weight.wgsl, prepended; QUANT picks the decoder). A 64x64 output tile per
-// workgroup of 64 invocations, each owning 8 consecutive rows x 8 consecutive
-// cols. K streams through workgroup memory 16 wide as k-major vec4 tiles, so
-// the inner loop is 4 vector loads per 64 FMAs and a simdgroup's loads are
-// contiguous. K must be a multiple of 32; M and N are bounds-checked.
+// weight.wgsl, prepended; QUANT picks the decoder). A 64x128 output tile per
+// workgroup of 128 invocations, each owning 8 consecutive rows x 8 consecutive
+// cols. K streams through workgroup memory 32 wide (one quantized block per
+// column per step) as f16 pairs packed over k: xs[kp][row] and ws[kp][col]
+// hold (k, k+1) of one row / column, so a step of the inner loop is 4 vec4
+// loads and 16 unpacks for 128 FMAs, and the tiles are half the bytes of f32
+// ones. X is rounded to f16 on the way in (as llama.cpp's Metal mat-mul does).
+// Measured on an M4 and rejected: an f32 X tile (+30%: the extra workgroup
+// bandwidth costs more than the unpacks) and prefetching the next tile into
+// registers before the multiply (+20-140%: the live registers cut occupancy).
+// K must be a multiple of 32; M and N are bounds-checked.
 
 struct Params { m: u32, n: u32, k: u32, _pad: u32 }
 
 @group(0) @binding(0) var<uniform> p: Params;
-@group(0) @binding(1) var<storage, read> x: array<f32>;
-@group(0) @binding(2) var<storage, read> w: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read> w: array<vec4<u32>>;
 @group(0) @binding(3) var<storage, read> sc: array<u32>;
 @group(0) @binding(4) var<storage, read_write> y: array<f32>;
 
 const BM: u32 = 64u;
-const BN: u32 = 64u;
-const BK: u32 = 16u;
-const G: u32 = 16u; // vec4 groups per tile row (BM / 4 = BN / 4)
+const BN: u32 = 128u;
+const BK: u32 = 32u;
+const KP: u32 = BK / 2u;   // k pairs per tile
+const XG: u32 = BM / 4u;   // vec4<u32> per kp row of xs
+const WG: u32 = BN / 4u;   // vec4<u32> per kp row of ws
 
-var<workgroup> xs: array<vec4<f32>, 256>; // [BK][G]: rows 4g..4g+4 at k
-var<workgroup> ws: array<vec4<f32>, 256>; // [BK][G]: cols 4g..4g+4 at k
+var<workgroup> xs: array<vec4<u32>, KP * XG>;  // rows 4g..4g+4 at (k, k+1)
+var<workgroup> ws: array<vec4<u32>, KP * WG>;  // cols 4g..4g+4 at (k, k+1)
 
-@compute @workgroup_size(64)
+// One invocation's share of a tile between the global loads and the
+// workgroup stores. X: one k pair of two row quads. W (invocations 0..64
+// only): four consecutive columns over half the k pairs, in storage form.
+// Every workgroup store is a whole vec4: a component store to workgroup
+// memory may compile to a read-modify-write of the vector and race with the
+// other lanes' stores (it did, on Metal).
+struct Stage {
+    xr: array<vec4<u32>, 2>,
+    wq: array<vec4<u32>, 8>,  // f16: 2 per column; Q4 / Q8: 1 per column
+    d: vec4<f32>,
+}
+
+fn load_stage(li: u32, row0: u32, col0: u32, k0: u32) -> Stage {
+    var s: Stage;
+    // X: k pair li % 16 of row quads li / 16 + 8i; a simdgroup reads two
+    // quads' 128 contiguous bytes per row.
+    let kp = li % KP;
+    for (var i = 0u; i < 2u; i++) {
+        let g = li / KP + 8u * i;
+        var v = vec4<u32>(0u);
+        for (var j = 0u; j < 4u; j++) {
+            let r = row0 + 4u * g + j;
+            if (r < p.m) { v[j] = pack2x16float(x[(r * p.k + k0) / 2u + kp]); }
+        }
+        s.xr[i] = v;
+    }
+    // W: columns 4g..4g+4 (g = li / 2), k pairs 8h..8h+8 (h = li % 2).
+    s.d = vec4<f32>(0.0);
+    for (var i = 0u; i < 8u; i++) { s.wq[i] = vec4<u32>(0u); }
+    if (li < 64u) {
+        let g = li / 2u;
+        let h = li % 2u;
+        for (var j = 0u; j < 4u; j++) {
+            let n = col0 + 4u * g + j;
+            if (n >= p.n) { continue; }
+            let e = n * p.k + k0;
+            if (QUANT == 0u) {
+                let base = e / 8u + 2u * h;
+                s.wq[2u * j] = w[base];
+                s.wq[2u * j + 1u] = w[base + 1u];
+            } else {
+                let blk = e / 32u;
+                s.d[j] = block_scale(sc[blk / 2u], blk);
+                if (QUANT == 1u) {
+                    s.wq[j] = w[blk * 2u + h];
+                } else {
+                    s.wq[j] = w[blk];
+                }
+            }
+        }
+    }
+    return s;
+}
+
+// Column j of the stage at k pair jj (0..8) of its half h, as an f16 pair.
+fn stage_pair(s: Stage, h: u32, j: u32, jj: u32) -> u32 {
+    if (QUANT == 0u) {
+        return s.wq[2u * j + jj / 4u][jj % 4u];
+    }
+    if (QUANT == 1u) {
+        // elements 16h + 2jj, +1: word jj / 2 of the staged vec4
+        return dq8_pair(s.wq[j][jj / 2u], (jj % 2u) * 16u, s.d[j]);
+    }
+    // Q4: half 0 is the low nibbles, half 1 the high nibbles of word jj / 2.
+    return dq4_pair(s.wq[j][jj / 2u], (jj % 2u) * 16u + 4u * h, s.d[j]);
+}
+
+fn store_stage(li: u32, s: Stage) {
+    let kp = li % KP;
+    for (var i = 0u; i < 2u; i++) {
+        xs[kp * XG + li / KP + 8u * i] = s.xr[i];
+    }
+    if (li < 64u) {
+        let g = li / 2u;
+        let h = li % 2u;
+        for (var jj = 0u; jj < 8u; jj++) {
+            ws[(8u * h + jj) * WG + g] = vec4<u32>(
+                stage_pair(s, h, 0u, jj),
+                stage_pair(s, h, 1u, jj),
+                stage_pair(s, h, 2u, jj),
+                stage_pair(s, h, 3u, jj),
+            );
+        }
+    }
+}
+
+@compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let row0 = wg.y * BM;
     let col0 = wg.x * BN;
-    let tr = li / 8u; // rows tr*8 .. tr*8+8
-    let tc = li % 8u; // cols tc*8 .. tc*8+8
+    let tr = li / 16u; // rows tr*8 .. tr*8+8
+    let tc = li % 16u; // cols tc*8 .. tc*8+8
     var lo0 = vec4<f32>(0.0); var hi0 = vec4<f32>(0.0);
     var lo1 = vec4<f32>(0.0); var hi1 = vec4<f32>(0.0);
     var lo2 = vec4<f32>(0.0); var hi2 = vec4<f32>(0.0);
@@ -39,83 +133,42 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 
     let ktiles = p.k / BK;
     for (var kt = 0u; kt < ktiles; kt++) {
-        let k0 = kt * BK;
-        // X tile: invocation li reads k = li % 16 of rows 4g..4g+4 for
-        // g = li/16 + 4i (16 consecutive k of a row across 16 invocations).
-        {
-            let c = li % BK;
-            for (var i = 0u; i < 4u; i++) {
-                let g = li / BK + 4u * i;
-                var v = vec4<f32>(0.0);
-                for (var j = 0u; j < 4u; j++) {
-                    let gr = row0 + 4u * g + j;
-                    if (gr < p.m) { v[j] = x[gr * p.k + k0 + c]; }
-                }
-                xs[c * G + g] = v;
-            }
-        }
-        // W tile. f16: invocation li reads k pair li % 8 of cols 4g..4g+4
-        // for g = li/8 + 8i. Quantized: invocation li decodes k quad
-        // (li % 4) * 4 of cols 4g..4g+4 for g = li / 4.
-        if (QUANT == 0u) {
-            let c2 = li % 8u;
-            for (var i = 0u; i < 2u; i++) {
-                let g = li / 8u + 8u * i;
-                var a = vec4<f32>(0.0);
-                var b = vec4<f32>(0.0);
-                for (var j = 0u; j < 4u; j++) {
-                    let gn = col0 + 4u * g + j;
-                    if (gn < p.n) {
-                        let v = unpack2x16float(w[(gn * p.k + k0) / 2u + c2]);
-                        a[j] = v.x;
-                        b[j] = v.y;
-                    }
-                }
-                ws[(2u * c2) * G + g] = a;
-                ws[(2u * c2 + 1u) * G + g] = b;
-            }
-        } else {
-            let g = li / 4u;
-            let kq = (li % 4u) * 4u;
-            var t0 = vec4<f32>(0.0);
-            var t1 = vec4<f32>(0.0);
-            var t2 = vec4<f32>(0.0);
-            var t3 = vec4<f32>(0.0);
-            for (var j = 0u; j < 4u; j++) {
-                let gn = col0 + 4u * g + j;
-                if (gn < p.n) {
-                    let e = gn * p.k + k0 + kq;
-                    let blk = e / 32u;
-                    let d = block_scale(sc[blk / 2u], blk);
-                    var v: vec4<f32>;
-                    if (QUANT == 1u) {
-                        v = dq8(w[e / 4u], d);
-                    } else {
-                        let q = w[blk * 4u + ((e % 32u) % 16u) / 4u];
-                        if ((e % 32u) < 16u) { v = dq4lo(q, d); } else { v = dq4hi(q, d); }
-                    }
-                    t0[j] = v.x; t1[j] = v.y; t2[j] = v.z; t3[j] = v.w;
-                }
-            }
-            ws[kq * G + g] = t0;
-            ws[(kq + 1u) * G + g] = t1;
-            ws[(kq + 2u) * G + g] = t2;
-            ws[(kq + 3u) * G + g] = t3;
-        }
+        store_stage(li, load_stage(li, row0, col0, kt * BK));
         workgroupBarrier();
-        for (var kk = 0u; kk < BK; kk++) {
-            let xa = xs[kk * G + 2u * tr];
-            let xb = xs[kk * G + 2u * tr + 1u];
-            let wlo = ws[kk * G + 2u * tc];
-            let whi = ws[kk * G + 2u * tc + 1u];
-            lo0 += xa.x * wlo; hi0 += xa.x * whi;
-            lo1 += xa.y * wlo; hi1 += xa.y * whi;
-            lo2 += xa.z * wlo; hi2 += xa.z * whi;
-            lo3 += xa.w * wlo; hi3 += xa.w * whi;
-            lo4 += xb.x * wlo; hi4 += xb.x * whi;
-            lo5 += xb.y * wlo; hi5 += xb.y * whi;
-            lo6 += xb.z * wlo; hi6 += xb.z * whi;
-            lo7 += xb.w * wlo; hi7 += xb.w * whi;
+        for (var kp = 0u; kp < KP; kp++) {
+            let xa = xs[kp * XG + 2u * tr];
+            let xb = xs[kp * XG + 2u * tr + 1u];
+            let wa = ws[kp * WG + 2u * tc];
+            let wb = ws[kp * WG + 2u * tc + 1u];
+            let c0 = unpack2x16float(wa.x);
+            let c1 = unpack2x16float(wa.y);
+            let c2 = unpack2x16float(wa.z);
+            let c3 = unpack2x16float(wa.w);
+            let c4 = unpack2x16float(wb.x);
+            let c5 = unpack2x16float(wb.y);
+            let c6 = unpack2x16float(wb.z);
+            let c7 = unpack2x16float(wb.w);
+            // cols tc*8.. at k (lo_k / hi_k) and at k + 1 (lo_n / hi_n)
+            let wlo_k = vec4<f32>(c0.x, c1.x, c2.x, c3.x);
+            let wlo_n = vec4<f32>(c0.y, c1.y, c2.y, c3.y);
+            let whi_k = vec4<f32>(c4.x, c5.x, c6.x, c7.x);
+            let whi_n = vec4<f32>(c4.y, c5.y, c6.y, c7.y);
+            let r0 = unpack2x16float(xa.x);
+            let r1 = unpack2x16float(xa.y);
+            let r2 = unpack2x16float(xa.z);
+            let r3 = unpack2x16float(xa.w);
+            let r4 = unpack2x16float(xb.x);
+            let r5 = unpack2x16float(xb.y);
+            let r6 = unpack2x16float(xb.z);
+            let r7 = unpack2x16float(xb.w);
+            lo0 += r0.x * wlo_k + r0.y * wlo_n; hi0 += r0.x * whi_k + r0.y * whi_n;
+            lo1 += r1.x * wlo_k + r1.y * wlo_n; hi1 += r1.x * whi_k + r1.y * whi_n;
+            lo2 += r2.x * wlo_k + r2.y * wlo_n; hi2 += r2.x * whi_k + r2.y * whi_n;
+            lo3 += r3.x * wlo_k + r3.y * wlo_n; hi3 += r3.x * whi_k + r3.y * whi_n;
+            lo4 += r4.x * wlo_k + r4.y * wlo_n; hi4 += r4.x * whi_k + r4.y * whi_n;
+            lo5 += r5.x * wlo_k + r5.y * wlo_n; hi5 += r5.x * whi_k + r5.y * whi_n;
+            lo6 += r6.x * wlo_k + r6.y * wlo_n; hi6 += r6.x * whi_k + r6.y * whi_n;
+            lo7 += r7.x * wlo_k + r7.y * wlo_n; hi7 += r7.x * whi_k + r7.y * whi_n;
         }
         workgroupBarrier();
     }
