@@ -20,8 +20,10 @@ python3 -m http.server 8765 --directory web
 open "http://localhost:8765/?model=gemma-3-270m"
 ```
 
-`?model=` picks `gemma-3-270m` (0.27 GB, smoke test), `gemma-3-1b` (0.76 GB),
-`gemma-4-e2b` (3.4 GB, default; half of it is the per-layer embedding table)
+`?model=` picks `grande-270m-ja` (default) / `grande-270m-ja-wgpu` (the
+trained pointer model, 0.2 / 0.3 GB), `gemma-4-e2b-wgpu` (2.8 GB, Gemma 4 E2B
+on the wgpu engine), `gemma-3-270m` (0.27 GB, smoke test), `gemma-3-1b` (0.76 GB),
+`gemma-4-e2b` (3.4 GB; half of it is the per-layer embedding table)
 or `gemma-4-e4b` (5.2 GB). Requires WebGPU (Chrome / Edge, Safari 26+).
 
 What runs where:
@@ -65,6 +67,20 @@ from `tools/export_wgpu.py` and live in `models/grande-270m-ja-wgpu/`
 (fetched from the `wgpu-v1` release by `fetch-models.sh`). Measured with the
 GPU shared with a training job, interleaved with the ONNX model: ticket
 0.17–0.55 s vs 0.86–1.35 s, contract 0.41–0.74 s vs 2.9–4.0 s.
+
+`gemma-4-e2b-wgpu` is Gemma 4 E2B on the same engine: the llama.cpp Q4_0
+GGUF repacked by `tools/export_wgpu_gguf.py` into a `manifest.json`
+directory (one file per layer, `embed.bin`, and the 1.3 GB
+`per_layer_table.bin` of per-layer token embeddings, 2.8 GB in all). The
+loader streams the files into the engine one at a time (`WgpuLoader`);
+the per-layer table stays in JS and its rows are gathered and dequantized
+per request. Zero-shot label readout, one pass, no resident state: ticket
+1.16 s, contract 2.5 s on an idle M4 (the ONNX path: 2.5–2.8 s / 3.1–5.2 s).
+The files are served from `./models/gemma-4-e2b-wgpu/` when present (local
+development: export there or symlink) and otherwise from the Hugging Face
+repo `bokuweb/gemma-4-E2B-it-grande-wgpu` — GitHub Pages caps a site at
+1 GB and release assets are not CORS-enabled — uploaded with
+`tools/upload_wgpu_hf.py`.
 
 Padding (`batched` only): Gemma 3 causal-LM exports honour `attention_mask`
 / `position_ids`, so rows are left-padded and only one logits position is

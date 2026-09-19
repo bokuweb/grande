@@ -24,11 +24,14 @@ export const MODELS = {
   // The same trained checkpoint on grande's own wgpu engine (crates/grande-wgpu):
   // state + every question in ONE forward pass with a block-causal mask, no
   // ONNX Runtime. f16 safetensors served from this site.
-  "grande-270m-ja-wgpu": { id: "grande-270m-ja-wgpu", local: true, kind: "wgpu", readout: "pointer", layout: { layout: "pointer", state: "<unused0>", question: "<unused1>", opt: "<unused2>", opt_end: "<unused3>", decide: "<unused4>" }, size: "0.32 GB", note: "trained, wgpu engine: one pass" },
+  "grande-270m-ja-wgpu": { id: "grande-270m-ja-wgpu", local: true, kind: "wgpu", readout: "pointer", dtype: "f16", layout: { layout: "pointer", state: "<unused0>", question: "<unused1>", opt: "<unused2>", opt_end: "<unused3>", decide: "<unused4>" }, size: "0.32 GB", note: "trained, wgpu engine: one pass" },
   // Gemma 4 E2B (Q4_0, from the GGUF via tools/export_wgpu_gguf.py) on the same
   // engine: zero-shot label readout, state + every question in one pass. The
   // 1.3 GB per-layer token table stays in JS memory and is gathered per request.
-  "gemma-4-e2b-wgpu": { id: "gemma-4-e2b-wgpu", local: true, kind: "wgpu", readout: "label", manifest: true, layout: GEMMA4, size: "2.8 GB", note: "wgpu engine: one pass" },
+  // Served from ./models/ when present (local development), otherwise from
+  // the Hugging Face repo (GitHub Pages caps a site at 1 GB and release
+  // assets are not CORS-enabled).
+  "gemma-4-e2b-wgpu": { id: "gemma-4-e2b-wgpu", local: true, hub: "bokuweb/gemma-4-E2B-it-grande-wgpu", kind: "wgpu", readout: "label", manifest: true, dtype: "q4", layout: GEMMA4, size: "2.8 GB", note: "wgpu engine: one pass" },
   // Trained pointer head (JNLI 0.71 / JCQA 0.71, 12k records) on a Gemma 3 270M
   // backbone with embedding rows pruned to a Japanese + English corpus. Served
   // from this site (./models/, fetched from a GitHub release at build time).
@@ -222,12 +225,24 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
 
   let tok, net, head = null, idMap = null, gpu = null, plTable = null;
   if (spec.kind === "wgpu") {
-    transformers.env.allowLocalModels = true;
-    transformers.env.localModelPath = "./models/";
-    transformers.env.allowRemoteModels = false;
-    const base = new URL(`./models/${spec.id}/`, location.href).href;
-    tok = await AutoTokenizer.from_pretrained(spec.id, { progress_callback: onProgress });
-    transformers.env.allowRemoteModels = true;
+    let base = new URL(`./models/${spec.id}/`, location.href).href;
+    let here = true;
+    if (spec.hub) {
+      const probe = await fetch(`${base}config.json`, { method: "HEAD" }).catch(() => null);
+      if (!probe?.ok) {
+        base = `https://huggingface.co/${spec.hub}/resolve/main/`;
+        here = false;
+      }
+    }
+    if (here) {
+      transformers.env.allowLocalModels = true;
+      transformers.env.localModelPath = "./models/";
+      transformers.env.allowRemoteModels = false;
+      tok = await AutoTokenizer.from_pretrained(spec.id, { progress_callback: onProgress });
+      transformers.env.allowRemoteModels = true;
+    } else {
+      tok = await AutoTokenizer.from_pretrained(spec.hub, { progress_callback: onProgress });
+    }
     const config = await (await fetch(`${base}config.json`)).text();
     if (spec.manifest) {
       ({ gpu, plTable } = await loadManifest(base, config, onProgress));
