@@ -95,9 +95,22 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
   async function batched(texts, keysPerRow) {
     tok.padding_side = "left";
     const inputs = tok(texts, { padding: true, truncation: false, add_special_tokens: false });
-    const out = await net.forward({ ...inputs, num_logits_to_keep: new Tensor("int64", [1n], []) });
-    let tokens = 0;
+    // Positions must be derived from the mask so a left-padded row starts at 0 at
+    // its first real token. Gemma3ForCausalLM does this itself; the multimodal
+    // Gemma 4 wrapper does not, and without it every padded row is garbage.
+    const [B, L] = inputs.attention_mask.dims;
     const mask = inputs.attention_mask.data;
+    const pos = new BigInt64Array(B * L);
+    for (let b = 0; b < B; b++) {
+      let c = 0n;
+      for (let i = 0; i < L; i++) {
+        pos[b * L + i] = Number(mask[b * L + i]) ? c : 0n;
+        if (Number(mask[b * L + i])) c += 1n;
+      }
+    }
+    const position_ids = new Tensor("int64", pos, [B, L]);
+    const out = await net.forward({ ...inputs, position_ids, num_logits_to_keep: new Tensor("int64", [1n], []) });
+    let tokens = 0;
     for (let i = 0; i < mask.length; i++) if (Number(mask[i])) tokens++;
     const rows = rowsFromLogits(out.logits.data, out.logits.dims, keysPerRow);
     out.logits.dispose?.();

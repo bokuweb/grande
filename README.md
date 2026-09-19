@@ -32,8 +32,10 @@ browser. Design notes live in `life/idea/local-jev`.
       served by the Rust runtime. Smoke-tested on Gemma 3 270M (MPS).
 - [ ] trained Gemma 4 base weights (E2B base is 10 GB bf16; needs more than a
       16 GB laptop or a rented GPU)
-- [ ] isolation / IIA / boundary-forgery tests in `grande-eval`
-- [ ] wasm / WebGPU backend
+- [x] `grande mechanism`: isolation, packed vs separate, boundary forgery.
+- [x] browser demo (`web/`): `grande-core` as wasm + transformers.js on
+      WebGPU, Gemma 3 270M / 1B and Gemma 4 E2B ONNX.
+- [ ] IIA test, permutation flip rate on a JGLUE sample
 
 ## First numbers (2026-09-19, M-series Mac, Metal)
 
@@ -59,6 +61,24 @@ placed in the state gives `0.996`. Branches do not see each other.
 
 Sliding-window attention: Gemma 4's SWA layers isolate correctly with the
 default iSWA cache (`--swa-full false`), no full cache needed.
+
+### JGLUE, zero-shot (Gemma 4 E2B it Q4_0, label readout, valid split)
+
+Temperature fitted on even-indexed records, reported on odd-indexed ones.
+Prompts are jev_local's, so the numbers compare across runtimes.
+
+| task | n (test) | accuracy | ECE raw → scaled | NLL raw → scaled | T | p≥0.9 error rate raw → scaled | ms / record |
+|---|---|---|---|---|---|---|---|
+| JNLI (3-way) | 1,217 | 0.614 | 0.252 → **0.088** | 1.255 → 0.949 | 2.81 | 0.41 → 0.00 | 754 |
+| JCommonsenseQA (5-way) | 559 | 0.853 | 0.044 → 0.046 | 0.447 → 0.438 | 1.19 | 0.04 → 0.02 | 702 |
+
+The instruct model is badly overconfident on NLI (mean confidence 0.86 at
+61% accuracy; 41% of its ≥0.9 answers are wrong) and one temperature
+removes most of it. Commonsense QA is already calibrated. Timings were taken
+while other GPU jobs ran; see `grande bench` for clean numbers.
+
+Mechanism tests (`grande mechanism`): isolation sibling 0.098 / absent 0.098 /
+state 0.996, packed vs separate 3.5e-4, forged delimiters add no options.
 
 ## Training loop
 
