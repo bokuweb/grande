@@ -60,6 +60,10 @@ enum Cmd {
         /// options (Zhao et al. 2021). Pass without a value for "N/A".
         #[arg(long, num_args = 0..=1, default_missing_value = grande_core::calibration::CONTENT_FREE)]
         baseline: Option<String>,
+        /// Ask every Choice / Noul under this many option orders in the same
+        /// pass and average the logits (position-bias removal). 1 = off.
+        #[arg(long, default_value_t = 1)]
+        orders: usize,
         #[arg(long, default_value_t = 8192)]
         n_ctx: u32,
         #[arg(long, default_value_t = 999)]
@@ -102,6 +106,10 @@ enum Cmd {
         /// options (Zhao et al. 2021). Pass without a value for "N/A".
         #[arg(long, num_args = 0..=1, default_missing_value = grande_core::calibration::CONTENT_FREE)]
         baseline: Option<String>,
+        /// Ask every Choice / Noul under this many option orders in the same
+        /// pass and average the logits (position-bias removal). 1 = off.
+        #[arg(long, default_value_t = 1)]
+        orders: usize,
     },
     /// Prefill throughput: a synthetic state of about N tokens and Q
     /// questions, packed, repeated a few times.
@@ -157,6 +165,10 @@ enum Cmd {
         /// options (Zhao et al. 2021). Pass without a value for "N/A".
         #[arg(long, num_args = 0..=1, default_missing_value = grande_core::calibration::CONTENT_FREE)]
         baseline: Option<String>,
+        /// Ask every Choice / Noul under this many option orders in the same
+        /// pass and average the logits (position-bias removal). 1 = off.
+        #[arg(long, default_value_t = 1)]
+        orders: usize,
         #[arg(long, default_value_t = 8192)]
         n_ctx: u32,
         /// RAM for serialized states of recently seen documents (MB). A
@@ -197,6 +209,10 @@ enum Cmd {
         limit: Option<usize>,
         #[arg(long, default_value_t = 4096)]
         n_ctx: u32,
+        /// Ask every Choice / Noul under this many option orders in the same
+        /// pass and average the logits (position-bias removal). 1 = off.
+        #[arg(long, default_value_t = 1)]
+        orders: usize,
     },
     /// Print a GGUF metadata value (e.g. tokenizer.chat_template).
     Meta {
@@ -295,6 +311,7 @@ fn main() -> Result<()> {
             head,
             terse,
             baseline,
+            orders,
         } => {
             use grande_eval::jglue::{self, Task};
             use grande_eval::report::{summarize, Row};
@@ -358,6 +375,7 @@ fn main() -> Result<()> {
             };
             let mut engine = Engine::new(backend, renderer, readout, name.clone());
             engine.baseline = baseline;
+            engine.orders = orders;
             let mut rows = Vec::with_capacity(items.len());
             let mut file = std::io::BufWriter::new(std::fs::File::create(&rows_path)?);
             use std::io::Write;
@@ -374,12 +392,10 @@ fn main() -> Result<()> {
                     let k = d.probs.len();
                     permuted_preds.push(pred);
                     permuted_probs.push(d.probs.clone());
-                    for r in 1..permute {
-                        let mut order: Vec<usize> = (0..k).collect();
-                        order.rotate_left(r % k);
-                        if r % 2 == 1 {
-                            order.reverse();
-                        }
+                    for order in grande_core::math::option_orders(k, permute)
+                        .into_iter()
+                        .skip(1)
+                    {
                         let mut orders = indexmap::IndexMap::new();
                         orders.insert("answer".to_string(), order.clone());
                         let (pd, _) = engine.distributions(&item.request, &orders, Mode::Packed)?;
@@ -657,6 +673,7 @@ fn main() -> Result<()> {
             api_key,
             temperature,
             baseline,
+            orders,
             n_ctx,
             state_cache_mb,
             state_cache_dir,
@@ -682,6 +699,7 @@ fn main() -> Result<()> {
             let mut engine = Engine::new(backend, renderer, readout, name.clone());
             engine.temperature = temperature;
             engine.baseline = baseline;
+            engine.orders = orders;
             let state = std::sync::Arc::new(grande_server::AppState {
                 engine: std::sync::Mutex::new(engine),
                 api_key,
@@ -750,6 +768,7 @@ fn main() -> Result<()> {
             clean_only,
             limit,
             n_ctx,
+            orders,
         } => {
             use grande_eval::report::{metrics, Row};
             use std::collections::BTreeMap;
@@ -778,6 +797,7 @@ fn main() -> Result<()> {
             )?;
             let (renderer, readout) = readout_for(&backend, head.as_ref())?;
             let mut engine = Engine::new(backend, renderer, readout, "suite");
+            engine.orders = orders;
             let mut by_task: BTreeMap<String, Vec<Row>> = BTreeMap::new();
             let mut skipped: BTreeMap<String, usize> = BTreeMap::new();
             let mut file = std::io::BufWriter::new(std::fs::File::create(&rows_path)?);
@@ -914,6 +934,7 @@ fn main() -> Result<()> {
             head,
             temperature,
             baseline,
+            orders,
             n_ctx,
             n_gpu_layers,
             swa_full,
@@ -942,6 +963,7 @@ fn main() -> Result<()> {
             let mut engine = Engine::new(backend, renderer, readout, name);
             engine.temperature = temperature;
             engine.baseline = baseline;
+            engine.orders = orders;
 
             match mode {
                 ModeArg::Packed | ModeArg::Separate => {
@@ -963,6 +985,12 @@ fn main() -> Result<()> {
                     }
                     for (id, b) in &diag.baseline {
                         eprintln!("  baseline {id}: {b:?}");
+                    }
+                    for (id, s) in &diag.order_spread {
+                        eprintln!("  order_spread {id}: {s:.4} over {} orders", diag.orders);
+                    }
+                    for (id, f) in &diag.two_stage {
+                        eprintln!("  two_stage {id}: {} finalists", f.len());
                     }
                 }
                 ModeArg::Check => {

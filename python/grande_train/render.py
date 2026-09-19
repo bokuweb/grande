@@ -25,9 +25,26 @@ def content_text(v) -> str:
 
 
 def state_text(v) -> str:
-    if isinstance(v, dict):
-        return "\n".join(f"{k}: {content_text(x)}" for k, x in v.items())
+    """One `path: value` line per leaf (`ticket.messages[0].text: …`), same as
+    `grande-core::api::state_text`; strings pass through."""
+    if isinstance(v, (dict, list)):
+        lines: list[str] = []
+        _flatten_state("", v, lines)
+        return "\n".join(lines)
     return content_text(v)
+
+
+def _flatten_state(path: str, v, out: list[str]) -> None:
+    if isinstance(v, dict) and v:
+        for k, x in v.items():
+            _flatten_state(f"{path}.{k}" if path else k, x, out)
+    elif isinstance(v, list) and v:
+        for i, x in enumerate(v):
+            _flatten_state(f"{path}[{i}]", x, out)
+    elif not path:
+        out.append(content_text(v))
+    else:
+        out.append(f"{path}: {content_text(v)}")
 
 
 def neutralize(text: str) -> str:

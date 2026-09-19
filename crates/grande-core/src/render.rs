@@ -174,7 +174,9 @@ impl Renderer {
         Rendered { prefix, branches }
     }
 
-    fn branch(&self, id: &str, q: &Question, order: Option<&[usize]>) -> RenderedBranch {
+    /// One branch for question `id` with the options at `order` (original
+    /// indices, one per slot; a subset renders only those options).
+    pub fn branch(&self, id: &str, q: &Question, order: Option<&[usize]>) -> RenderedBranch {
         let (kind, instr, options) = options_of(q);
         let order: Vec<usize> = match order {
             Some(o) => o.to_vec(),
@@ -198,7 +200,13 @@ impl Renderer {
                     format!("Question: {instr}\n")
                 };
                 for (i, (key, desc)) in ordered.iter().enumerate() {
-                    let letter = crate::readout::LABELS[i];
+                    // Past the last letter the branch cannot be read out; the
+                    // engine splits such a Choice into groups before
+                    // evaluating, so this render is only ever looked at for
+                    // its keys and order.
+                    let letter = crate::readout::LABELS
+                        .get(i)
+                        .map_or_else(|| i.to_string(), char::to_string);
                     match desc {
                         Some(d) if !d.is_empty() => {
                             text.push_str(&format!("{letter}: {key} — {d}\n"))
