@@ -106,7 +106,8 @@
 
   details { margin-top: 20px; }
   summary { cursor: pointer; color: var(--muted); font-size: 13px; user-select: none; }
-  details pre { background: var(--surface); border: 1px solid var(--line); padding: 12px; border-radius: 8px; overflow: auto; font: 12px/1.5 var(--mono); margin-top: 10px; }
+  details pre { background: var(--surface); border: 1px solid var(--line); padding: 12px; border-radius: 8px; overflow: auto; font: 12px/1.5 var(--mono); margin-top: 10px; max-height: 480px; }
+  details pre:empty { display: none; }
   footer { margin-top: 40px; color: var(--muted); font-size: 12px; }
 </style>
 </head>
@@ -162,7 +163,7 @@
 
   <div class="usage" id="usage"></div>
   <div id="results" class="results"></div>
-  <details><summary>Response JSON</summary><pre id="raw"></pre></details>
+  <details open><summary>Response JSON</summary><pre id="raw"></pre></details>
 
   <footer>Zero-shot label readout on Gemma 3 / Gemma 4 ONNX via transformers.js. The request validation, prompt layout and probability math are the same Rust crate as the native runtime, compiled to wasm.</footer>
 </main>
