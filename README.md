@@ -19,11 +19,21 @@ browser. Design notes live in `life/idea/local-jev`.
       every branch gets the prefix by `llama_memory_seq_cp` (zero copy) and
       all branches are decoded in one batch. Logits or hidden states at
       requested positions only.
-- [x] `grande` CLI: `probe` (packed / separate / check), `tokens`, `pieces`, `meta`.
-- [ ] pointer-head weights loader (`head.safetensors`)
-- [ ] `grande-server` (axum, `/v1/systemone`)
-- [ ] `grande-eval` (JGLUE, isolation / permutation / IIA / boundary tests)
-- [ ] fine-tuned Gemma 4 pt weights, wasm / WebGPU backend
+- [x] `grande` CLI: `probe` (packed / separate / check, `--head`), `jglue`,
+      `serve`, `bench`, `render`, `tokens`, `pieces`, `meta`.
+- [x] pointer-head weights loader (`head.safetensors`, no deps).
+- [x] `grande-server`: axum, `POST /v1/systemone`, `/separate`, `/permute`,
+      `GET /v1/models`, `/health`, bearer auth, 422 `detail[]`, `X-Grande-*` headers.
+- [x] `grande-eval`: JGLUE JNLI / JCommonsenseQA, temperature fit on the
+      even half, accuracy / NLL / Brier / ECE / confident-error rate,
+      `--permute` flip rate.
+- [x] `python/grande_train`: LoRA + pointer head with the same layout
+      (token-for-token parity with `grande render` verified), merge → GGUF →
+      served by the Rust runtime. Smoke-tested on Gemma 3 270M (MPS).
+- [ ] trained Gemma 4 base weights (E2B base is 10 GB bf16; needs more than a
+      16 GB laptop or a rented GPU)
+- [ ] isolation / IIA / boundary-forgery tests in `grande-eval`
+- [ ] wasm / WebGPU backend
 
 ## First numbers (2026-09-19, M-series Mac, Metal)
 
@@ -49,6 +59,25 @@ placed in the state gives `0.996`. Branches do not see each other.
 
 Sliding-window attention: Gemma 4's SWA layers isolate correctly with the
 default iSWA cache (`--swa-full false`), no full cache needed.
+
+## Training loop
+
+```bash
+cd python && uv venv --python 3.13 .venv && source .venv/bin/activate
+uv pip install torch transformers peft safetensors numpy gguf sentencepiece
+python -m grande_train.train --base unsloth/gemma-3-270m \
+  --jnli ../.cache/jglue/jnli-train.jsonl --jcqa ../.cache/jglue/jcommonsenseqa-train.jsonl \
+  --n-per-source 1500 --epochs 2 --out ../runs/grande-270m
+python -m grande_train.merge --base unsloth/gemma-3-270m --run ../runs/grande-270m --out ../runs/grande-270m/merged
+PYTHONPATH=/path/to/llama.cpp python /path/to/llama.cpp/convert_hf_to_gguf.py ../runs/grande-270m/merged \
+  --outfile ../runs/grande-270m/grande-270m-f16.gguf --outtype f16
+cd .. && ./target/release/grande jglue --model runs/grande-270m/grande-270m-f16.gguf \
+  --head runs/grande-270m/head.safetensors --task jnli --out runs/eval-270m-jnli
+```
+
+The renderer is defined twice (Rust for serving, Python for training) on
+purpose; `grande render` dumps token ids and `grande_train.render.check_parity`
+compares, so drift is caught before a model is trained on the wrong bytes.
 
 ## Usage
 
