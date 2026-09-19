@@ -24,7 +24,7 @@ import torch
 from safetensors.torch import save_file
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from .data import jcqa, jnli, load_jsonl, rendered_label, shuffled_order
+from .data import distilled, jcqa, jnli, jsts, load_jsonl, rendered_label, shuffled_order
 from .model import DecisionModel
 from .render import Renderer
 
@@ -75,6 +75,9 @@ def main():
     p.add_argument("--base", default="google/gemma-4-E2B")
     p.add_argument("--jnli")
     p.add_argument("--jcqa")
+    p.add_argument("--jsts")
+    p.add_argument("--distill", help="teacher-labelled records (tools/teacher_label.py); trained with KL to the teacher distribution")
+    p.add_argument("--n-distill", type=int, default=100000)
     p.add_argument("--n-per-source", type=int, default=1000)
     p.add_argument("--epochs", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -100,11 +103,15 @@ def main():
     model = DecisionModel(backbone, text_cfg.hidden_size, lora_r=a.lora, sliding_window=getattr(text_cfg, "sliding_window", None)).to(a.device)
 
     records = []
-    for path, conv in ((a.jnli, jnli), (a.jcqa, jcqa)):
+    for path, conv in ((a.jnli, jnli), (a.jcqa, jcqa), (a.jsts, jsts)):
         if path:
             rows = load_jsonl(path, conv)
             rng.shuffle(rows)
             records += rows[: a.n_per_source]
+    if a.distill:
+        rows = load_jsonl(a.distill, distilled)
+        rng.shuffle(rows)
+        records += rows[: a.n_distill]
     rng.shuffle(records)
     print(f"{len(records)} records, {sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable params")
 
@@ -117,14 +124,16 @@ def main():
         rng.shuffle(records)
         for i in range(0, len(records), a.batch):
             batch = records[i : i + a.batch]
-            encs, labels = [], []
+            encs, labels, soft = [], [], []
             for r in batch:
                 # Shuffle option order per example so the head cannot learn positions.
                 orders = {qid: shuffled_order(rng, len(q["criteria"]) if q["type"] != "noul" else 2) for qid, q in r["questions"].items()}
                 enc = renderer.encode(r, orders)
                 encs.append(enc)
                 labels.append([rendered_label(r, qid, orders[qid]) for qid in r["questions"]])
-            loss = model.loss(encs, labels)
+                probs = r.get("probs")
+                soft.append([[probs[qid][o] for o in orders[qid]] if probs and probs.get(qid) else None for qid in r["questions"]])
+            loss = model.loss(encs, labels, soft if any(any(x is not None for x in s) for s in soft) else None)
             opt.zero_grad()
             loss.backward()
             opt.step()

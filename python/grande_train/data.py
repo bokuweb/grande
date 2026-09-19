@@ -16,6 +16,8 @@ JNLI_DESC = [
 ]
 JNLI_INSTR = "前提が正しいとき、仮説との論理的な関係を判定してください。前提から分からない情報を補わないでください。"
 JCQA_INSTR = "質問に対して、常識に基づく最も適切な答えを選択肢から1つ選んでください。"
+JSTS_INSTR = "2つの文の意味がどの程度似ているかを判定してください。"
+JSTS_LEVELS = ["0: 全く関係がない", "1: ほとんど関係がない", "2: 一部の話題が共通する", "3: おおよそ同じ内容", "4: 細部を除いて同じ", "5: 完全に同じ意味"]
 
 
 def jnli(row: dict) -> dict:
@@ -32,6 +34,19 @@ def jcqa(row: dict) -> dict:
         "questions": {"answer": {"type": "choice", "instructions": JCQA_INSTR, "criteria": {str(i): row[f"choice{i}"] for i in range(5)}}},
         "labels": {"answer": int(row["label"])},
     }
+
+
+def jsts(row: dict) -> dict:
+    return {
+        "state": {"文1": row["sentence1"], "文2": row["sentence2"]},
+        "questions": {"answer": {"type": "score", "instructions": JSTS_INSTR, "criteria": JSTS_LEVELS}},
+        "labels": {"answer": int(round(float(row["label"])))},
+    }
+
+
+def distilled(rec: dict) -> dict:
+    """A teacher-labelled synthetic record: keeps `probs` as soft targets."""
+    return {"state": rec["state"], "questions": rec["questions"], "labels": rec["labels"], "probs": rec.get("probs")}
 
 
 def load_jsonl(path: str, convert) -> list[dict]:

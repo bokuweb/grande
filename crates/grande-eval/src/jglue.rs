@@ -7,12 +7,22 @@ use std::path::Path;
 
 pub const REVISION: &str = "6f071c09316baae89c3d083a90985b4b1cb9968c";
 pub const JNLI_LABELS: [&str; 3] = ["entailment", "contradiction", "neutral"];
+pub const JSTS_INSTR: &str = "2つの文の意味がどの程度似ているかを判定してください。";
+pub const JSTS_LEVELS: [&str; 6] = [
+    "0: 全く関係がない",
+    "1: ほとんど関係がない",
+    "2: 一部の話題が共通する",
+    "3: おおよそ同じ内容",
+    "4: 細部を除いて同じ",
+    "5: 完全に同じ意味",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Task {
     Jnli,
     Jcqa,
+    Jsts,
 }
 
 impl Task {
@@ -20,6 +30,7 @@ impl Task {
         match self {
             Task::Jnli => "jnli",
             Task::Jcqa => "jcommonsenseqa",
+            Task::Jsts => "jsts",
         }
     }
 
@@ -54,7 +65,41 @@ pub fn load(task: Task, path: &Path) -> Result<Vec<Item>> {
     Ok(items)
 }
 
+fn item_jsts(row: &Value) -> Result<Item> {
+    let s = |k: &str| {
+        row[k]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("missing {k}"))
+    };
+    let gold = row["label"]
+        .as_f64()
+        .ok_or_else(|| anyhow!("label"))?
+        .round()
+        .clamp(0.0, 5.0) as usize;
+    let mut questions = IndexMap::new();
+    questions.insert(
+        "answer".to_string(),
+        grande_core::Question::Score {
+            instructions: Some(json!(JSTS_INSTR)),
+            criteria: JSTS_LEVELS.iter().map(|l| json!(l)).collect(),
+        },
+    );
+    Ok(Item {
+        id: s("sentence_pair_id")?,
+        request: Request {
+            model: "grande-latest".into(),
+            state: json!({"文1": s("sentence1")?, "文2": s("sentence2")?}),
+            questions,
+        },
+        gold,
+    })
+}
+
 fn item(task: Task, row: &Value) -> Result<Item> {
+    if task == Task::Jsts {
+        return item_jsts(row);
+    }
     let s = |k: &str| {
         row[k]
             .as_str()
@@ -85,6 +130,7 @@ fn item(task: Task, row: &Value) -> Result<Item> {
                 gold,
             )
         }
+        Task::Jsts => unreachable!(),
         Task::Jcqa => {
             let gold = row["label"].as_u64().ok_or_else(|| anyhow!("label"))? as usize;
             let criteria: IndexMap<String, Option<Value>> = (0..5)

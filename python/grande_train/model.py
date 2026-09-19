@@ -84,12 +84,19 @@ class DecisionModel(nn.Module):
             out.append([self.head(hs[b, d], hs[b, torch.tensor(oi, device=hs.device)]) for d, oi in zip(e.decide_idx, e.opt_idx)])
         return out
 
-    def loss(self, encs, labels):
-        """labels[b][k] = index of the gold option in rendered order; -1 to skip."""
+    def loss(self, encs, labels, soft=None):
+        """labels[b][k] = index of the gold option in rendered order (-1 to skip).
+        soft[b][k], when given, is a target distribution in rendered order and
+        the loss is KL(target || model) instead of cross-entropy."""
         logits = self(encs)
         losses = []
         for b in range(len(encs)):
             for k, z in enumerate(logits[b]):
+                t = soft[b][k] if soft is not None else None
+                if t is not None:
+                    tt = torch.tensor(t, device=z.device, dtype=z.dtype)
+                    losses.append(F.kl_div(F.log_softmax(z, -1), tt, reduction="sum"))
+                    continue
                 y = labels[b][k]
                 if y >= 0:
                     losses.append(F.cross_entropy(z[None], torch.tensor([y], device=z.device)))

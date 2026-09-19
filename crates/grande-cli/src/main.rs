@@ -36,6 +36,7 @@ enum LayoutArg {
 enum TaskArg {
     Jnli,
     Jcqa,
+    Jsts,
 }
 
 #[derive(Subcommand)]
@@ -267,6 +268,7 @@ fn main() -> Result<()> {
             let task = match task {
                 TaskArg::Jnli => Task::Jnli,
                 TaskArg::Jcqa => Task::Jcqa,
+                TaskArg::Jsts => Task::Jsts,
             };
             let data = match data {
                 Some(p) => p,
