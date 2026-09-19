@@ -11,9 +11,10 @@ grande targets Japanese, Gemma 4, quantized local inference, and (later) the
 browser. Design notes live in `life/idea/local-jev`.
 
 **Demo:** https://bokuweb.github.io/grande/ (WebGPU; nothing leaves the browser).
-Gemma 4 E2B zero-shot on grande's own wgpu engine with a 25k-token
-vocabulary: 1.2 GB streamed from the Hub once and cached in the browser,
-5 questions over a 90-token state in ~1.1 s on an M4.
+Gemma 4 E2B or E4B zero-shot on grande's own wgpu engine with a 25k-token
+vocabulary: 1.2 GB / 2.5 GB streamed from the Hub once and cached in the
+browser, 5 questions over a 90-token state in ~1.1 s (E2B) / ~2.5 s (E4B)
+on an M4.
 
 ## Status
 
@@ -55,6 +56,10 @@ vocabulary: 1.2 GB streamed from the Hub once and cached in the browser,
 - [x] `grande-wgpu`: our own Gemma 3 / Gemma 4 forward pass in WGSL — state
       + every branch in one block-causal pass, native (Metal / Vulkan) and
       WebGPU from the same kernels. Parity with llama.cpp on the trained 270M
+      and on E2B / E4B Q4_0; `grande --model <checkpoint dir>` and the
+      `gemma-4-e2b-wgpu-ja` / `gemma-4-e4b-wgpu-ja` browser models (1.2 GB /
+      2.5 GB after vocabulary pruning).
+- [ ] IIA test, permutation flip rate on a JGLUE sample
       and on E2B Q4_0; `grande --model <checkpoint dir>` and the
       `gemma-4-e2b-wgpu-ja` browser model (1.2 GB after vocabulary pruning).
 - [x] `--orders N`: every Choice / Noul asked under N option orders in the
@@ -247,25 +252,29 @@ python tools/export_wgpu.py --run runs/grande-270m-12k --out web/models/grande-2
 ./target/release/grande probe --model web/models/grande-270m-ja-wgpu \
   --head runs/grande-270m-12k/head.safetensors --request examples/ticket-ja.json
 
-# Gemma 4 E2B: repack the llama.cpp GGUF (Q4_0 / Q8_0 codes kept as they are)
+# Gemma 4 E2B / E4B: repack the llama.cpp GGUF (Q4_0 / Q8_0 codes kept as they are)
 python tools/export_wgpu_gguf.py models/gemma-4-E2B-it-Q4_0.gguf --out models/gemma-4-e2b-wgpu-q4
 ./target/release/grande probe --model models/gemma-4-e2b-wgpu-q4 --request examples/ticket-ja.json
+python tools/export_wgpu_gguf.py models/gemma-4-E4B-it-Q4_0.gguf --out models/gemma-4-e4b-wgpu-q4
 ```
 
 Two model families run on the same kernels. Gemma 3 (the trained 270M, f16
-from the HF checkpoint) and Gemma 4 E2B: sliding layers at head_dim 256 and
-global layers at 512 with partial RoPE, the last 20 layers attending over
-layer 13 / 14's K/V, RMS-normalized V, double-wide MLPs, the per-layer
-token embeddings (the 1.3 GB table is gathered on the host per request, not
-uploaded), per-layer output scalars and softcapped logits. `Config`
-describes every layer and `Config::tensors()` is the catalogue both loaders
-fill. One KV head throughout.
+from the HF checkpoint) and Gemma 4 E2B / E4B: sliding layers at head_dim
+256 and global layers at 512 with partial RoPE, the last 20 (E2B) / 18
+(E4B) layers attending over the last own-K/V layer of their type,
+RMS-normalized V, double-wide MLPs, the per-layer token embeddings (the
+1.3 GB table is gathered on the host per request, not uploaded), per-layer
+output scalars and softcapped logits. `Config` describes every layer and
+`Config::tensors()` is the catalogue both loaders fill. Grouped-query
+attention: one K/V head on the 270M and E2B, two on E4B (8 query heads,
+4 per group); the attention workgroup handles the rows of one K/V head.
 
-Both match llama.cpp: the 270M to ~5e-4 in probability on the ticket and
+All match llama.cpp: the 270M to ~5e-4 in probability on the ticket and
 isolation examples, E2B on the same Q4_0 weights to ≤ 5e-4 (ticket,
-isolation, contract). `crates/grande-wgpu/tests/reference.rs` checks the
-shaders against a plain-Rust forward on random models of both shapes with
-f16, Q8 and Q4 weights.
+isolation, contract), E4B to ≤ 7e-5 (ticket, isolation).
+`crates/grande-wgpu/tests/reference.rs` checks the shaders against a
+plain-Rust forward on random models of all three shapes with f16, Q8 and
+Q4 weights.
 
 E2B on this engine, M4, one pass and no resident state: the 5-question
 ticket (313 tokens) in 1.16 s and the 8-question contract (639 tokens) in

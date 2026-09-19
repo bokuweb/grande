@@ -19,16 +19,17 @@ import { idbCache } from "./cache.js";
 
 const GEMMA4 = { layout: "label", turn_start: "<|turn>", turn_end: "<turn|>", user: "user", model: "model" };
 
-// The page offers one model: Gemma 4 E2B on grande's own wgpu engine
-// (crates/grande-wgpu), Q4_0 codes from the vocabulary-pruned GGUF
-// (tools/prune_vocab.py: 25k tokens from JGLUE train, kev's suites and the
-// examples), repacked by tools/export_wgpu_gguf.py. Zero-shot label readout,
-// state + every question in ONE block-causal forward pass, no ONNX Runtime;
-// 1.2 GB (the per-layer token table 1.3 GB → 128 MB). Same logits as the
-// full vocabulary wherever the text tokenizes the same; text outside the
-// pruning corpus tokenizes into ~5% more pieces. Served from ./models/ when
-// present (local development), otherwise from the Hugging Face repo (GitHub
-// Pages caps a site at 1 GB and release assets are not CORS-enabled).
+// The page offers Gemma 4 E2B and E4B on grande's own wgpu engine
+// (crates/grande-wgpu), Q4_0 codes from the vocabulary-pruned GGUFs
+// (tools/prune_vocab.py: the same 25k tokens from JGLUE train, kev's suites
+// and the examples for both sizes), repacked by tools/export_wgpu_gguf.py.
+// Zero-shot label readout, state + every question in ONE block-causal
+// forward pass, no ONNX Runtime; E2B 1.2 GB (the per-layer token table
+// 1.3 GB → 128 MB), E4B 2.5 GB. Same logits as the full vocabulary wherever
+// the text tokenizes the same; text outside the pruning corpus tokenizes
+// into ~5% more pieces. Served from ./models/ when present (local
+// development), otherwise from the Hugging Face repo (GitHub Pages caps a
+// site at 1 GB and release assets are not CORS-enabled).
 //
 // The loader below still knows the other kinds this page has run — Gemma 3
 // / Gemma 4 ONNX exports through transformers.js (`kind: "causal"` /
@@ -36,7 +37,8 @@ const GEMMA4 = { layout: "label", turn_start: "<|turn>", turn_end: "<turn|>", us
 // 270M pointer model (`"pointer"`, `"wgpu"` + `readout: "pointer"`) — so an
 // entry can be added back; see git history for their specs.
 export const MODELS = {
-  "gemma-4-e2b-wgpu-ja": { id: "gemma-4-e2b-wgpu-ja", local: true, hub: "bokuweb/gemma-4-E2B-it-grande-wgpu-ja", kind: "wgpu", readout: "label", manifest: true, dtype: "q4", layout: GEMMA4, size: "1.2 GB", note: "wgpu engine: one pass, 25k-token vocabulary" },
+  "gemma-4-e2b-wgpu-ja": { id: "gemma-4-e2b-wgpu-ja", local: true, hub: "bokuweb/gemma-4-E2B-it-grande-wgpu-ja", kind: "wgpu", readout: "label", manifest: true, dtype: "q4", layout: GEMMA4, size: "1.2 GB", note: "E2B, wgpu engine: one pass, 25k-token vocabulary" },
+  "gemma-4-e4b-wgpu-ja": { id: "gemma-4-e4b-wgpu-ja", local: true, hub: "bokuweb/gemma-4-E4B-it-grande-wgpu-ja", kind: "wgpu", readout: "label", manifest: true, dtype: "q4", layout: GEMMA4, size: "2.5 GB", note: "E4B, wgpu engine: one pass, 25k-token vocabulary" },
 };
 
 const ZWNJ = "‌";

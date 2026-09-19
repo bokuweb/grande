@@ -4,12 +4,14 @@
 // sliding-window layers) within the window. That is the isolation rule the
 // llama.cpp backend gets from its per-sequence KV cache.
 //
-// One KV head shared by `heads` query heads. Q is read from the layer's fused
+// `kv_heads` KV heads, each shared by `heads / kv_heads` consecutive query
+// heads (one for E2B, two for E4B). Q is read from the layer's fused
 // projection buffer (row stride q_stride), K and V from a K/V buffer
-// [t][2 x HD] that may belong to an earlier layer (Gemma 4 shares K/V). A
-// workgroup of ROWS x KB invocations handles ROWS query rows = (ROWS / heads)
-// tokens x heads with their Q held as f16 in workgroup memory, and streams
-// keys KB at a time. A tile no row can see is skipped (keys after the block,
+// [t][kv_heads x HD | kv_heads x HD] (all K heads, then all V heads) that
+// may belong to an earlier layer (Gemma 4 shares K/V). A workgroup of
+// ROWS x KB invocations handles ROWS query rows of one KV head, wg.y:
+// (ROWS / hpg) tokens x the hpg query heads of that group, with their Q held
+// as f16 in workgroup memory, and streams that head's keys KB at a time. A tile no row can see is skipped (keys after the block,
 // other branches). Otherwise the K tile is staged as f16, each invocation
 // computes one full (row, key) score, then the same tile buffer is refilled
 // with V and each invocation owns HD/KB output dims of one row for the
@@ -19,7 +21,7 @@
 // engine (16 x 8: 128 invocations, 13 KB at HD 256 / 25 KB at HD 512; see
 // attn_tile for the shapes that measured worse).
 
-struct Params { t: u32, heads: u32, window: u32, q_stride: u32 }
+struct Params { t: u32, heads: u32, window: u32, q_stride: u32, kv_heads: u32, _p0: u32, _p1: u32, _p2: u32 }
 
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> q: array<vec4<f32>>;
@@ -51,14 +53,17 @@ fn visible(qp: i32, qs_: i32, kp: i32, ks_: i32) -> bool {
     return (ks_ == 0 || ks_ == qs_) && kp <= qp && (p.window == 0u || u32(qp - kp) < p.window);
 }
 
-// Stage KB rows of K (half == 0) or V (half == 1) of tile j0 as f16 pairs.
-fn stage_kv(li: u32, j0: u32, half: u32) {
+// Stage KB rows of K (half == 0) or V (half == 1) of KV head g, tile j0, as
+// f16 pairs. A kv row is 2 x kv_heads head rows: the K heads, then the V heads.
+fn stage_kv(li: u32, j0: u32, half: u32, g: u32) {
+    let stride4 = 2u * p.kv_heads * HQ;
+    let off4 = (half * p.kv_heads + g) * HQ;
     for (var e = li; e < KB * HQ; e += N) {
         let kk = e / HQ;
         let d4 = e % HQ;
         let j = j0 + kk;
         var v = vec4<f32>(0.0);
-        if (j < p.t) { v = kv[j * 2u * HQ + half * HQ + d4]; }
+        if (j < p.t) { v = kv[j * stride4 + off4 + d4]; }
         kvs[kk * HP + 2u * d4] = pack2x16float(v.xy);
         kvs[kk * HP + 2u * d4 + 1u] = pack2x16float(v.zw);
     }
@@ -67,14 +72,16 @@ fn stage_kv(li: u32, j0: u32, half: u32) {
 @compute @workgroup_size(128) // ROWS * KB, substituted by the engine
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let heads = p.heads;
-    let tb = ROWS / heads;
+    let hpg = heads / p.kv_heads; // query heads per KV head
+    let g = wg.y;                 // this workgroup's KV head
+    let tb = ROWS / hpg;
     let tok0 = wg.x * tb;
 
     let row = li / KB;          // 0..ROWS, both roles
     let key = li % KB;          // score role
     let chunk = key * CH;       // output role: CH dims of `row`
-    let tok = tok0 + row / heads;
-    let head = row % heads;
+    let tok = tok0 + row / hpg;
+    let head = g * hpg + row % hpg;
     let ok = tok < p.t;
 
     // Q tile as f16 pairs: this invocation's CH dims of its row.
@@ -132,7 +139,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         if (!workgroupUniformLoad(&tile_any)) {
             continue;
         }
-        stage_kv(li, j0, 0u);
+        stage_kv(li, j0, 0u, g);
         workgroupBarrier();
 
         // One full score per invocation.
@@ -152,11 +159,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
                 a3 += dot(unpack2x16float(qs[qb + i + 3u]), unpack2x16float(kvs[kb + i + 3u]));
             }
             let acc = (a0 + a1) + (a2 + a3);
-            let vis = visible(qpos[row / heads], qseq[row / heads], kpos[key], kseq[key]);
+            let vis = visible(qpos[row / hpg], qseq[row / hpg], kpos[key], kseq[key]);
             s[li] = select(NEG, acc, vis);
         }
         workgroupBarrier();
-        stage_kv(li, j0, 1u);
+        stage_kv(li, j0, 1u, g);
 
         // Online softmax: every invocation of a row tracks the same running
         // max m and sum l (same tiles, same order), so the rescale is

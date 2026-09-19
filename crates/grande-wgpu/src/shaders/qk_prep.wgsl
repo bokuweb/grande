@@ -1,16 +1,18 @@
-// Per token, on the fused projection row [q(heads x HD) | k(HD) | v(HD)] (k, v
-// only on layers with their own K/V): RMSNorm each q head (q_norm), RoPE the
-// first `rope_dims` dims at the token's position with this layer's theta,
-// scale q by `scale`, in place. On K/V layers, k is normed (k_norm) and roped,
-// v is RMS-normalized without a weight when `v_norm` is set, and both are
-// written to the layer's K/V buffer [t][2 x HD] for the attention kernel (and
-// for the later layers that share this layer's K/V). One workgroup per token,
+// Per token, on the fused projection row
+// [q(heads x HD) | k(kv_heads x HD) | v(kv_heads x HD)] (k, v only on layers
+// with their own K/V): RMSNorm each q head (q_norm), RoPE the first
+// `rope_dims` dims at the token's position with this layer's theta, scale q
+// by `scale`, in place. On K/V layers, each k head is normed (k_norm) and
+// roped, each v head is RMS-normalized without a weight when `v_norm` is set,
+// and both are written to the layer's K/V buffer
+// [t][kv_heads x HD | kv_heads x HD] for the attention kernel (and for the
+// later layers that share this layer's K/V). One workgroup per token,
 // one invocation per HD/256 elements. HD is substituted by the engine.
 
 struct Params {
     t: u32, heads: u32, theta: f32, scale: f32,
     eps: f32, rope_dims: u32, has_kv: u32, v_norm: u32,
-    offset: f32, q_stride: u32, _p0: u32, _p1: u32,
+    offset: f32, q_stride: u32, kv_heads: u32, _p1: u32,
 }
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -67,8 +69,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) l: v
     let row = t * p.q_stride;
     let pos = f32(tok_meta[2u * t]);
 
-    // q heads, then k (both normed with a weight and roped).
-    let n_heads = p.heads + p.has_kv;
+    // q heads, then the k heads (both normed with a weight and roped).
+    let kv_row = t * 2u * p.kv_heads * HD;
+    let n_heads = p.heads + p.has_kv * p.kv_heads;
     for (var h = 0u; h < n_heads; h++) {
         let base = row + h * HD;
         let inv = inverseSqrt(sumsq(base, li) / f32(HD) + p.eps);
@@ -86,20 +89,22 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) l: v
             if (h < p.heads) {
                 qkv[base + d] = y * p.scale;
             } else {
-                kv[t * 2u * HD + d] = y;
+                kv[kv_row + (h - p.heads) * HD + d] = y;
             }
         }
         workgroupBarrier();
     }
     if (p.has_kv == 1u) {
-        let base = row + (p.heads + 1u) * HD;
-        var inv = 1.0;
-        if (p.v_norm == 1u) {
-            inv = inverseSqrt(sumsq(base, li) / f32(HD) + p.eps);
-        }
-        for (var e = 0u; e < PER; e++) {
-            let d = li + 256u * e;
-            kv[t * 2u * HD + HD + d] = qkv[base + d] * inv;
+        for (var g = 0u; g < p.kv_heads; g++) {
+            let base = row + (p.heads + p.kv_heads + g) * HD;
+            var inv = 1.0;
+            if (p.v_norm == 1u) {
+                inv = inverseSqrt(sumsq(base, li) / f32(HD) + p.eps);
+            }
+            for (var e = 0u; e < PER; e++) {
+                let d = li + 256u * e;
+                kv[kv_row + (p.kv_heads + g) * HD + d] = qkv[base + d] * inv;
+            }
         }
     }
 }

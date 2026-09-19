@@ -110,6 +110,8 @@ state again, branches only (the prefix stays resident in the KV cache).
 | grande browser, wgpu engine, **f16-tile matmul** (pruned model; same session: previous kernels 1.18–1.42 s / 2.56–2.90 s) | gemma-4-e2b-wgpu-ja Q4_0 (1.2 GB) | 5 Q ticket / 8 Q contract | 313 / 639 | **1.02 s / 2.3 s** | |
 | grande native, wgpu engine, f16-tile matmul (previous kernels 1.53 s) | gemma-4-e2b-wgpu-ja Q4_0 | 5 Q ticket | 313 | **0.88 s** (1.12 s with `GRANDE_WGPU_CHECKED=1`, naga's bounds clamps on) | |
 | grande native, wgpu engine, + attention rewrite and 32-row matmul tiles | gemma-4-e2b-wgpu-ja Q4_0 | 5 Q ticket | 313 | **0.82 s** (GPU 782 ms: gate_up 393, down 202, qkv 55, o 51, attention 46, rest 35) | |
+| grande browser, wgpu engine, **E4B** (2 K/V heads; machine shared with a llama.cpp build, so an upper bound) | gemma-4-e4b-wgpu-ja Q4_0 (2.5 GB) | 5 Q ticket / 8 Q contract | 313 / 674 | 2.5 s / 7–10 s | |
+| grande native, wgpu engine, E4B (llama.cpp 2.2 s on the same GGUF, same conditions) | gemma-4-e4b-wgpu-ja Q4_0 | 5 Q ticket | 313 | 1.8 s | |
 | **reflex browser** (WebGPU) | Qwen3.5-0.8B q4f16 | 5 Q ticket (same JSON) | 1,114 / 324 warm | 6.7 s | 3.5 s |
 | reflex Python (published) | Qwen3.5-4B bf16, GB10 | 4 Q | | | ~100 ms |
 | kev (published) | 0.5B, M5 | 6 Q | | ~160 ms | |
@@ -203,6 +205,13 @@ table alone 1.3 GB → 128 MB — with the same answers to four decimals on the
 ticket; the transformers.js export pruned by `tools/prune_onnx_vocab.py`
 is 3,381 → 1,465 MB, logits bit-identical to the full export on identically
 tokenized text (`web/README.md`).
+
+E4B through the same pipeline (`gemma-4-E4B-it-Q4_0.gguf` 4,591 MB): the
+pruning corpus keeps the identical 25,392 token ids (same tokenizer), the
+per-layer table drops 1,585 → 154 MB and the embedding 713 → 69 MB, so the
+pruned GGUF is 2,500 MB and the wgpu export 2,498 MB; llama.cpp answers on
+the ticket are equal to the unpruned file to the last digit, and the wgpu
+engine matches llama.cpp to ≤ 7e-5 (ticket, isolation).
 
 What is left in the 1,247 MB: FFN 876 MB (69%), attention q/o 149 MB,
 per-layer embeddings 147 MB, token embeddings 48 MB, `per_layer_model_proj`

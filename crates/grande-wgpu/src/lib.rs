@@ -10,10 +10,12 @@
 //! There is no KV cache to manage and no batching constraint to work around:
 //! the mask is the isolation.
 //!
-//! One KV head throughout. Gemma 3 (the trained 270M) loads f16 weights from
-//! an HF safetensors checkpoint; Gemma 4 (E2B) loads Q8_0 / Q4_0 weights from
-//! a directory exported by tools/export_wgpu_gguf.py (shared K/V, head_dim
-//! 512 global layers, per-layer embeddings, see model.rs).
+//! Grouped-query attention: `kv_heads` K/V heads (one on the 270M and E2B,
+//! two on E4B), each shared by `heads / kv_heads` query heads. Gemma 3 (the
+//! trained 270M) loads f16 weights from an HF safetensors checkpoint; Gemma 4
+//! (E2B, E4B) loads Q8_0 / Q4_0 weights from a directory exported by
+//! tools/export_wgpu_gguf.py (shared K/V, head_dim 512 global layers,
+//! per-layer embeddings, see model.rs).
 //!
 //! Debugging (native only): `GRANDE_WGPU_PROFILE=1` prints GPU time per
 //! kernel after each request (timestamp queries), `GRANDE_WGPU_LAYERS=n` runs

@@ -20,11 +20,12 @@ python3 -m http.server 8765 --directory web
 open "http://localhost:8765/"
 ```
 
-The page offers one model, `gemma-4-e2b-wgpu-ja`: Gemma 4 E2B on grande's
-own wgpu engine with a 25k-token vocabulary, 1.2 GB, streamed from the
-Hugging Face repo `bokuweb/gemma-4-E2B-it-grande-wgpu-ja` (or from
-`./models/gemma-4-e2b-wgpu-ja/` when that directory exists). Requires
-WebGPU (Chrome / Edge, Safari 26+). `engine.js` still carries the loaders
+The page offers two models: `gemma-4-e2b-wgpu-ja` (the default) and
+`gemma-4-e4b-wgpu-ja`, Gemma 4 E2B / E4B on grande's own wgpu engine with
+the same 25k-token vocabulary, 1.2 GB / 2.5 GB, streamed from the Hugging
+Face repos `bokuweb/gemma-4-E2B-it-grande-wgpu-ja` /
+`bokuweb/gemma-4-E4B-it-grande-wgpu-ja` (or from `./models/<id>/` when
+that directory exists). Requires WebGPU (Chrome / Edge, Safari 26+). `engine.js` still carries the loaders
 for everything else this page has run — the Gemma 3 / Gemma 4 ONNX exports
 through transformers.js, the full-vocabulary `gemma-4-e2b-wgpu` (2.8 GB),
 the trained 270M pointer model — so an entry can be put back in `MODELS`
@@ -97,6 +98,15 @@ all, and the same answers to four decimals on the ticket, natively and in
 the browser (from the Hub: 1.14 s warm on an idle M4). Text inside the
 pruning corpus tokenizes exactly as with the full vocabulary; outside it
 ~5% more pieces (contract preset 639 → 674 tokens).
+
+`gemma-4-e4b-wgpu-ja` is Gemma 4 E4B through the same pipeline
+(`gemma-4-E4B-it-Q4_0.gguf` → `prune_vocab.py` with the same corpus, which
+keeps the identical 25,392 token ids since both sizes share the tokenizer →
+`export_wgpu_gguf.py`): 4.6 GB → 2.5 GB, answers equal to the unpruned GGUF
+on llama.cpp to the last digit on the ticket, wgpu vs llama.cpp ≤ 7e-5.
+E4B has two K/V heads (grouped-query attention, 4 query heads each), which
+the attention kernel dispatches as one workgroup column per K/V head.
+Ticket ~2.5 s warm on an M4 in the browser (E2B ~1.0 s).
 
 The ONNX counterpart exists too: `tools/prune_onnx_vocab.py` applied to the
 onnx-community export with the same token set drops the embedding,

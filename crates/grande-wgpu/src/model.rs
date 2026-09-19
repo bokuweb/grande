@@ -211,11 +211,21 @@ impl Config {
 
     /// What the kernels can run.
     pub fn validate(&self) -> Result<()> {
-        if self.kv_heads != 1 {
-            bail!("only one KV head is supported (got {})", self.kv_heads);
+        if self.kv_heads == 0 || !self.heads.is_multiple_of(self.kv_heads) {
+            bail!(
+                "num_key_value_heads {} must divide num_attention_heads {}",
+                self.kv_heads,
+                self.heads
+            );
         }
-        if !matches!(self.heads, 1 | 2 | 4 | 8 | 16) {
-            bail!("num_attention_heads must divide 16 (got {})", self.heads);
+        // The attention workgroup covers whole tokens of one KV head's query
+        // heads, ROWS = 16 rows at a time (attention.wgsl).
+        if !matches!(self.heads / self.kv_heads, 1 | 2 | 4 | 8 | 16) {
+            bail!(
+                "query heads per KV head must divide 16 (got {} / {})",
+                self.heads,
+                self.kv_heads
+            );
         }
         for (i, &hd) in self.head_dim.iter().enumerate() {
             if hd != 256 && hd != 512 {
@@ -247,12 +257,12 @@ impl Config {
         self.kv_source[layer] == layer
     }
 
-    /// Width of layer `l`'s fused projection: q heads, plus k and v when the
-    /// layer has its own K/V.
+    /// Width of layer `l`'s fused projection: q heads, plus the k and v heads
+    /// when the layer has its own K/V.
     pub fn qkv_width(&self, l: usize) -> usize {
         let hd = self.head_dim[l];
         if self.has_kv(l) {
-            (self.heads + 2) * hd
+            (self.heads + 2 * self.kv_heads) * hd
         } else {
             self.heads * hd
         }

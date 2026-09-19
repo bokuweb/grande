@@ -93,6 +93,16 @@ fn gemma4_config() -> Config {
     }
 }
 
+/// Gemma 4 E4B shape: 8 query heads over 2 KV heads (4 per group), otherwise
+/// the E2B layout above.
+fn gemma4_gqa_config() -> Config {
+    Config {
+        heads: 8,
+        kv_heads: 2,
+        ..gemma4_config()
+    }
+}
+
 /// Random weights for a config. Linears use `linear`, norms are f16 around 1
 /// (Gemma 4) or 0 (Gemma 3), the embedding uses `embed`.
 fn weights(cfg: &Config, seed: u64, linear: Dtype, embed: Dtype) -> Weights {
@@ -216,9 +226,11 @@ fn reference(w: &Weights, ids: &[u32], meta: &[(i32, i32)]) -> Vec<Vec<f32>> {
             cfg.theta_global
         };
         let has_kv = cfg.has_kv(li);
+        let kvh = cfg.kv_heads;
+        let hpg = heads / kvh;
         let mut q = vec![vec![0f32; heads * hd]; t];
-        let mut k = vec![vec![0f32; hd]; t];
-        let mut v = vec![vec![0f32; hd]; t];
+        let mut k = vec![vec![0f32; kvh * hd]; t];
+        let mut v = vec![vec![0f32; kvh * hd]; t];
         for i in 0..t {
             let h = rmsnorm(&x[i], Some(g(&n("attn_norm"))), cfg.eps, cfg.norm_offset);
             let qkv = linear(&h, g(&n("qkv")));
@@ -235,20 +247,25 @@ fn reference(w: &Weights, ids: &[u32], meta: &[(i32, i32)]) -> Vec<Vec<f32>> {
                 }
             }
             if has_kv {
-                let mut kk = rmsnorm(
-                    &qkv[heads * hd..(heads + 1) * hd],
-                    Some(g(&n("k_norm"))),
-                    cfg.eps,
-                    cfg.norm_offset,
-                );
-                rope(&mut kk, meta[i].0, theta, cfg.rope_dims[li]);
-                k[i] = kk;
-                let vv = &qkv[(heads + 1) * hd..];
-                v[i] = if cfg.v_norm {
-                    rmsnorm(vv, None, cfg.eps, 0.0)
-                } else {
-                    vv.to_vec()
-                };
+                for gh in 0..kvh {
+                    let kb = (heads + gh) * hd;
+                    let mut kk = rmsnorm(
+                        &qkv[kb..kb + hd],
+                        Some(g(&n("k_norm"))),
+                        cfg.eps,
+                        cfg.norm_offset,
+                    );
+                    rope(&mut kk, meta[i].0, theta, cfg.rope_dims[li]);
+                    k[i][gh * hd..(gh + 1) * hd].copy_from_slice(&kk);
+                    let vb = (heads + kvh + gh) * hd;
+                    let vv = &qkv[vb..vb + hd];
+                    let vv = if cfg.v_norm {
+                        rmsnorm(vv, None, cfg.eps, 0.0)
+                    } else {
+                        vv.to_vec()
+                    };
+                    v[i][gh * hd..(gh + 1) * hd].copy_from_slice(&vv);
+                }
             }
         }
         if has_kv {
@@ -260,6 +277,7 @@ fn reference(w: &Weights, ids: &[u32], meta: &[(i32, i32)]) -> Vec<Vec<f32>> {
             let mut attn = vec![0f32; heads * hd];
             for hh in 0..heads {
                 let qh = &q[i][hh * hd..(hh + 1) * hd];
+                let gh = hh / hpg;
                 let mut scores = Vec::new();
                 for j in 0..t {
                     let (kp, ks) = meta[j];
@@ -267,15 +285,17 @@ fn reference(w: &Weights, ids: &[u32], meta: &[(i32, i32)]) -> Vec<Vec<f32>> {
                         && kp <= qp
                         && (!sliding || (qp - kp) < cfg.window as i32);
                     if visible {
-                        scores.push((j, qh.iter().zip(&k[j]).map(|(a, b)| a * b).sum::<f32>()));
+                        let kj = &k[j][gh * hd..(gh + 1) * hd];
+                        scores.push((j, qh.iter().zip(kj).map(|(a, b)| a * b).sum::<f32>()));
                     }
                 }
                 let m = scores.iter().map(|s| s.1).fold(f32::MIN, f32::max);
                 let l_sum: f32 = scores.iter().map(|s| (s.1 - m).exp()).sum();
                 for (j, sc) in &scores {
                     let p = (sc - m).exp() / l_sum;
+                    let vj = &v[*j][gh * hd..(gh + 1) * hd];
                     for dd in 0..hd {
-                        attn[hh * hd + dd] += p * v[*j][dd];
+                        attn[hh * hd + dd] += p * vj[dd];
                     }
                 }
             }
@@ -408,10 +428,20 @@ fn gemma4_f16_matches_cpu_reference() {
 }
 
 #[test]
+fn gemma4_gqa_q4_matches_cpu_reference() {
+    // E4B: two KV heads, four query heads each, on both head_dims.
+    check_hidden(
+        &weights(&gemma4_gqa_config(), 11, Dtype::Q4, Dtype::Q8),
+        2e-2,
+    );
+}
+
+#[test]
 fn branches_do_not_see_each_other() {
     for w in [
         weights(&gemma3_config(), 11, Dtype::F16, Dtype::F16),
         weights(&gemma4_config(), 11, Dtype::Q8, Dtype::Q8),
+        weights(&gemma4_gqa_config(), 11, Dtype::Q4, Dtype::Q8),
     ] {
         let Some(eng) = engine(&w) else { return };
         let prefix: Vec<u32> = vec![2, 4, 6, 8];
