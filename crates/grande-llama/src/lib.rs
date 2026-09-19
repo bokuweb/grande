@@ -314,21 +314,33 @@ impl LlamaEngine {
         }
         let t = Instant::now();
         match self.ctx.state_seq_load_file(&path, 0, prefix.len()) {
-            Ok((toks, _)) if toks.len() == prefix.len() && toks.iter().zip(prefix).all(|(a, b)| a.0 == b.0) => {
+            Ok((toks, _))
+                if toks.len() == prefix.len()
+                    && toks.iter().zip(prefix).all(|(a, b)| a.0 == b.0) =>
+            {
                 // Promote to RAM so the next switch back does not touch the disk.
                 if let Ok(state) = self.ctx.state_seq_get(0, LlamaStateSeqFlags::empty()) {
                     self.states.put(prefix.to_vec(), state);
                 }
-                tracing::debug!("state cache: disk restore in {} ms", t.elapsed().as_millis());
+                tracing::debug!(
+                    "state cache: disk restore in {} ms",
+                    t.elapsed().as_millis()
+                );
                 Some(PrefixSource::Disk)
             }
             Ok(_) => {
-                tracing::warn!("state cache: {} holds a different prefix; ignoring", path.display());
+                tracing::warn!(
+                    "state cache: {} holds a different prefix; ignoring",
+                    path.display()
+                );
                 self.ctx.clear_kv_cache();
                 None
             }
             Err(e) => {
-                tracing::warn!("state cache: {} unreadable ({e:?}); ignoring", path.display());
+                tracing::warn!(
+                    "state cache: {} unreadable ({e:?}); ignoring",
+                    path.display()
+                );
                 self.ctx.clear_kv_cache();
                 None
             }

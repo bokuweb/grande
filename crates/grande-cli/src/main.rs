@@ -237,7 +237,12 @@ fn answer_delta(a: &grande_core::Response, b: &grande_core::Response) -> f64 {
     a.answers
         .iter()
         .filter_map(|(id, x)| b.answers.get(id).map(|y| (probs(x), probs(y))))
-        .flat_map(|(x, y)| x.into_iter().zip(y).map(|(p, q)| (p - q).abs()).collect::<Vec<_>>())
+        .flat_map(|(x, y)| {
+            x.into_iter()
+                .zip(y)
+                .map(|(p, q)| (p - q).abs())
+                .collect::<Vec<_>>()
+        })
         .fold(0.0, f64::max)
 }
 
@@ -411,7 +416,11 @@ fn main() -> Result<()> {
                     },
                     // With a directory the RAM cache is off, so the restore
                     // measured below is the on-disk one.
-                    state_cache_bytes: if state_cache_dir.is_some() { 0 } else { 512 << 20 },
+                    state_cache_bytes: if state_cache_dir.is_some() {
+                        0
+                    } else {
+                        512 << 20
+                    },
                     state_cache_dir,
                     ..Default::default()
                 },
@@ -496,10 +505,7 @@ fn main() -> Result<()> {
             let restored_ms = t.elapsed().as_millis();
             let source = diag.prefix_source.map(|s| s.as_str()).unwrap_or("?");
             // A restored state must answer exactly like the decoded one.
-            let restored_delta = last
-                .as_ref()
-                .map(|l| answer_delta(l, &resp))
-                .unwrap_or(0.0);
+            let restored_delta = last.as_ref().map(|l| answer_delta(l, &resp)).unwrap_or(0.0);
             eprintln!("restored ({source}): {restored_ms} ms, max |Δp| vs decoded {restored_delta:.2e} (round-to-round {round_delta:.2e})");
             println!(
                 "{}",
