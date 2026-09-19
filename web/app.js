@@ -220,7 +220,8 @@ function bar(name, p, best) {
 
 function renderResults(request, resp) {
   const u = resp.usage;
-  const state = u.state_resident === undefined ? `state ${u.state_tokens}` : u.state_resident ? `state ${u.state_tokens} resident` : `state ${u.state_tokens} cold`;
+  const how = u.state_source === "ram" ? "restored" : u.state_resident ? "resident" : "cold";
+  const state = u.state_resident === undefined ? `state ${u.state_tokens}` : `state ${u.state_tokens} ${how}`;
   const chips = [`${u.ms.toFixed(0)} ms`, u.mode, `${u.forwards} forward${u.forwards === 1 ? "" : "s"}`, `${u.input_tokens} tokens (${state})`, `${u.questions} question${u.questions === 1 ? "" : "s"}`];
   if (u.calibrated) chips.push(u.baseline_forwards ? `calibrated (baseline ${u.baseline_forwards} forward${u.baseline_forwards === 1 ? "" : "s"})` : "calibrated (baseline cached)");
   $("usage").innerHTML = chips.map((c) => `<span class="chip">${esc(c)}</span>`).join("");

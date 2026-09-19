@@ -59,7 +59,10 @@ vocabulary: 1.2 GB streamed from the Hub once and cached in the browser,
       `gemma-4-e2b-wgpu-ja` browser model (1.2 GB after vocabulary pruning).
       The last state's K/V stays resident: a request over the same state
       runs only its branches (E2B, 12 questions: 500-token state 3.0 → 1.7 s,
-      2,000 tokens 8.1 → 2.0 s native; browser ticket 1.0 → 0.77 s).
+      2,000 tokens 8.1 → 2.0 s native; browser ticket 1.0 → 0.77 s), and
+      every state seen is kept serialized (f16, sliding layers window-only:
+      19 MB per 2,000 tokens; RAM LRU, `--state-cache-dir` files natively,
+      RAM in the browser) so coming back to one is a ~50 ms restore.
 - [ ] IIA test, permutation flip rate on a JGLUE sample
 
 ## First numbers (2026-09-19, M-series Mac, Metal)

@@ -106,6 +106,8 @@ state again, branches only (the prefix stays resident in the KV cache).
 | grande native, wgpu engine, **resident state** | gemma-4-e2b-wgpu-ja Q4_0 | 12 Q, 500-tok state | 1,123 | 3.02 s | **1.66 s** |
 | grande native, wgpu engine, resident state | gemma-4-e2b-wgpu-ja Q4_0 | 12 Q, 2,000-tok state | 2,663 | 8.1 s | **2.03 s** |
 | grande browser, wgpu engine, resident state | gemma-4-e2b-wgpu-ja Q4_0 | 5 Q ticket / 8 Q contract | 313 / 674 | 1.0 s / 2.3 s | **0.77 s / 1.5 s** |
+| grande native, wgpu engine, **state cache** (2,000-tok state seen before, another state in between) | gemma-4-e2b-wgpu-ja Q4_0 | 12 Q, 2,000-tok state | 2,663 | 8.2 s | RAM **2.05 s**, file 2.08 s (save 23 ms, 19 MB) |
+| grande browser, wgpu engine, state cache | gemma-4-e2b-wgpu-ja Q4_0 | 8 Q contract, after a ticket request | 674 | | restored 1.50–1.75 s (resident 1.5–1.73) |
 | **reflex browser** (WebGPU) | Qwen3.5-0.8B q4f16 | 5 Q ticket (same JSON) | 1,114 / 324 warm | 6.7 s | 3.5 s |
 | reflex Python (published) | Qwen3.5-4B bf16, GB10 | 4 Q | | | ~100 ms |
 | kev (published) | 0.5B, M5 | 6 Q | | ~160 ms | |
@@ -244,3 +246,4 @@ Speed (E2B, M4):
 | wgpu matmul: 32-row tiles (twice the workgroups on the small-N layers) | down 222 → 202 ms, o 56 → 51, pl_mm_gate 13 → 9; gated kernel unchanged at 64x64 / 32x128 / 256-invocation 4x4x2 (±3%) | done |
 | wgpu matmul: row tiles as the fast dispatch axis (weight-tile reuse); `enable f16` tiles with f16 FMAs and per-step f16 partials | +7%; +5% (the M4 has no double-rate f16, and unpack2x16float was already free) | measured, rejected |
 | wgpu engine: resident state (the prefix's K/V and positions stay in the cache; the same prefix again runs only the branches, appended past it) | native 12 Q: 500-tok state 3.0 → 1.7 s, 2,000-tok 8.1 → 2.0 s, identical rows (bitwise, `tests/reference.rs`); browser ticket 1.0 → 0.77 s, contract 2.3 → 1.5 s | done |
+| wgpu engine: state cache (every decoded prefix's K/V read back as f16 — exact, the attention tile rounds to f16 anyway — with sliding layers window-only; RAM LRU + `--state-cache-dir` files natively, RAM in the browser) | 2,000-tok E2B state = 19 MB, saved in 23 ms, restored in ~50 ms (RAM) / ~80 ms (file); same rows as decoded | done |

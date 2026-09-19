@@ -2,7 +2,7 @@
 //! `evaluate` over the wgpu engine.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Context};
@@ -59,6 +59,8 @@ impl WgpuBackend {
             pollster::block_on(Engine::new(&weights, capacity, max_rows))?
         };
         pollster::block_on(engine.warmup())?;
+        // The state cache is off until `set_state_cache`; warmup's two-token
+        // prefix is therefore never saved.
         Ok(WgpuBackend {
             engine,
             tokenizer,
@@ -68,6 +70,27 @@ impl WgpuBackend {
 
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// Keep the states of prefixes seen before: a RAM LRU of `bytes` and a
+    /// file per state in `dir`. The checkpoint directory's name and the
+    /// byte size of its tensor files identify the model in the files.
+    pub fn set_state_cache(&mut self, dir_path: &Path, bytes: usize, dir: Option<PathBuf>) {
+        let size: u64 = std::fs::read_dir(dir_path)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
+                    .filter_map(|e| e.metadata().ok())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .unwrap_or(0);
+        let name = dir_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("wgpu");
+        self.engine
+            .set_state_cache(bytes, dir, &format!("{name}:{size}"));
     }
 }
 

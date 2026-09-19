@@ -458,6 +458,47 @@ fn resident_prefix_matches_full_pass() {
     }
 }
 
+/// A prefix that was decoded before comes back from the state cache (RAM,
+/// or a file round-tripped through `SavedState`) with the same rows.
+#[test]
+fn state_cache_restores_exactly() {
+    for w in [
+        weights(&gemma3_config(), 17, Dtype::F16, Dtype::F16),
+        weights(&gemma4_config(), 17, Dtype::Q4, Dtype::Q8),
+    ] {
+        let Some(mut eng) = engine(&w) else { return };
+        eng.set_state_cache(64 << 20, None, "test");
+        // Longer than the sliding window (5 / 6), so the window-only rows of
+        // sliding layers are exercised.
+        let a: Vec<u32> = vec![2, 5, 9, 14, 20, 31, 7, 8, 3, 22, 4, 6];
+        let b: Vec<u32> = vec![2, 3, 4];
+        let branches = vec![BranchTokens {
+            tokens: [11, 12, 13, 14, 15].map(Token).to_vec(),
+            want: vec![0, 2, 4],
+        }];
+        let full_a = pollster::block_on(eng.evaluate(&a, &branches, Want::Hidden)).unwrap();
+        assert_eq!(eng.prefix_source(), Some(PrefixSource::Decoded));
+        let saved = pollster::block_on(eng.save_state(&a)).unwrap();
+        pollster::block_on(eng.evaluate(&b, &branches, Want::Hidden)).unwrap();
+        assert_eq!(eng.prefix_source(), Some(PrefixSource::Decoded));
+        // a is not resident (b is) but in the RAM cache.
+        let ram_a = pollster::block_on(eng.evaluate(&a, &branches, Want::Hidden)).unwrap();
+        assert_eq!(eng.prefix_source(), Some(PrefixSource::Ram));
+        assert_eq!(full_a[0].rows, ram_a[0].rows);
+        // File round trip, restored by hand into a cache that has moved on.
+        let bytes = saved.to_bytes("test");
+        let back = grande_wgpu::SavedState::from_bytes(&bytes, "test").unwrap();
+        assert!(grande_wgpu::SavedState::from_bytes(&bytes, "other").is_err());
+        pollster::block_on(eng.evaluate(&b, &branches, Want::Hidden)).unwrap();
+        eng.evict_resident();
+        eng.restore_state(&back).unwrap();
+        assert!(eng.is_resident(&a));
+        let file_a = pollster::block_on(eng.evaluate(&a, &branches, Want::Hidden)).unwrap();
+        assert_eq!(eng.prefix_source(), Some(PrefixSource::Resident));
+        assert_eq!(full_a[0].rows, file_a[0].rows);
+    }
+}
+
 #[test]
 fn branches_do_not_see_each_other() {
     for w in [

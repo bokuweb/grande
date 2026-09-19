@@ -175,6 +175,13 @@ impl WgpuEngine {
         self.inner.evict_resident();
     }
 
+    /// Keep the K/V of every state seen (f16, sliding layers window-only)
+    /// in a RAM LRU of `bytes`, so coming back to a state is a restore
+    /// (`prefix_source` "ram") instead of a decode. 0 turns it off.
+    pub fn set_state_cache_bytes(&mut self, bytes: u32) {
+        self.inner.set_state_cache(bytes as usize, None, "wgpu");
+    }
+
     /// Run a two-token request so the first real one does not pay for the
     /// workspace's first touch.
     pub async fn warmup(&self) -> Result<(), JsError> {

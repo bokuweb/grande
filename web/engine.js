@@ -269,6 +269,9 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
         gpu = await grande.WgpuEngine.load(config, weights, 4096, 256);
       }
       await gpu.warmup();
+      // States seen before come back from a RAM copy of their K/V (19 MB per
+      // 2,000 tokens of E2B) instead of being decoded again.
+      gpu.set_state_cache_bytes(256 << 20);
     } else if (spec.local) {
       // Same-origin model directory. transformers.js only probes local files when
       // localModelPath is NOT an absolute URL (its metadata check skips http(s)
@@ -550,7 +553,8 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
       const { rows, tokens, prefixTokens } = spec.kind !== "wgpu" ? await pointerBatched(rendered) : spec.readout === "label" ? await labelWgpu(rendered) : await pointerWgpu(rendered);
       // The wgpu engine keeps the last state's K/V resident: a request over
       // the same state runs only its branches (prefix_source "resident").
-      const warm = spec.kind === "wgpu" ? { warm: gpu.prefix_source() === "resident" } : {};
+      const src = spec.kind === "wgpu" ? gpu.prefix_source() : undefined;
+      const warm = src === undefined ? {} : { warm: src !== "decoded", state_source: src };
       return { rows, tokens, forwards: 1, state_tokens: prefixTokens, mode: spec.kind === "wgpu" ? "packed" : "batched", ...warm };
     }
     const prefix = segmentsToText(rendered.prefix, bos);
@@ -601,7 +605,7 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     const resp = JSON.parse(grande.answer(reqJson, JSON.stringify(rows), temperature, spec.id, tokens, base ? JSON.stringify(base.rows) : undefined));
     const stateTokens = r.state_tokens ?? tok.encode(segmentsToText(rendered.prefix, bos), { add_special_tokens: false }).length;
     return { ...resp, usage: { ...resp.usage, state_tokens: stateTokens, questions: rows.length, mode: r.mode, ms, forwards: r.forwards + (base?.forwards ?? 0),
-        ...(r.warm === undefined ? {} : { state_resident: r.warm }), ...(base ? { calibrated: "contextual", baseline_forwards: base.forwards } : {}) },
+        ...(r.warm === undefined ? {} : { state_resident: r.warm }), ...(r.state_source ? { state_source: r.state_source } : {}), ...(base ? { calibrated: "contextual", baseline_forwards: base.forwards } : {}) },
       diagnostics: { candidate_mass: Object.fromEntries(rendered.branches.map((b, i) => [b.id, rows[i].candidate_mass])), rows, ...(base ? { baseline: base.rows } : {}) } };
   }
 
