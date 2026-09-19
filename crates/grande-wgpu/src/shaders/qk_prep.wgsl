@@ -4,13 +4,15 @@
 // scale q by `scale`, in place. On K/V layers, k is normed (k_norm) and roped,
 // v is RMS-normalized without a weight when `v_norm` is set, and both are
 // written to the layer's K/V buffer [t][2 x HD] for the attention kernel (and
-// for the later layers that share this layer's K/V). One workgroup per token,
-// one invocation per HD/256 elements. HD is substituted by the engine.
+// for the later layers that share this layer's K/V). Workspace token t is
+// cache token base + t: with a resident prefix only the branches are in the
+// workspace. One workgroup per token, one invocation per HD/256 elements. HD
+// is substituted by the engine.
 
 struct Params {
     t: u32, heads: u32, theta: f32, scale: f32,
     eps: f32, rope_dims: u32, has_kv: u32, v_norm: u32,
-    offset: f32, q_stride: u32, _p0: u32, _p1: u32,
+    offset: f32, q_stride: u32, base: u32, _p1: u32,
 }
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -65,7 +67,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) l: v
     if (t >= p.t) { return; }
     let li = l.x;
     let row = t * p.q_stride;
-    let pos = f32(tok_meta[2u * t]);
+    // Workspace row t is cache row base + t (the prefix may be resident).
+    let tc = p.base + t;
+    let pos = f32(tok_meta[2u * tc]);
 
     // q heads, then k (both normed with a weight and roped).
     let n_heads = p.heads + p.has_kv;
@@ -86,7 +90,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) l: v
             if (h < p.heads) {
                 qkv[base + d] = y * p.scale;
             } else {
-                kv[t * 2u * HD + d] = y;
+                kv[tc * 2u * HD + d] = y;
             }
         }
         workgroupBarrier();
@@ -99,7 +103,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) l: v
         }
         for (var e = 0u; e < PER; e++) {
             let d = li + 256u * e;
-            kv[t * 2u * HD + HD + d] = qkv[base + d] * inv;
+            kv[tc * 2u * HD + HD + d] = qkv[base + d] * inv;
         }
     }
 }

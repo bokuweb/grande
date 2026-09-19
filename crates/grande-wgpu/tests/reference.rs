@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use grande_core::{BranchTokens, Token, Want};
+use grande_core::{BranchTokens, PrefixSource, Token, Want};
 use grande_wgpu::model::{Arch, Config, Dtype, QTensor, Weights};
 use grande_wgpu::Engine;
 
@@ -405,6 +405,57 @@ fn gemma4_q4_matches_cpu_reference() {
 #[test]
 fn gemma4_f16_matches_cpu_reference() {
     check_hidden(&weights(&gemma4_config(), 5, Dtype::F16, Dtype::F16), 2e-2);
+}
+
+/// A request over the prefix of the previous one runs only its branches on
+/// top of the resident K/V and must produce the same rows as a full pass.
+#[test]
+fn resident_prefix_matches_full_pass() {
+    for w in [
+        weights(&gemma3_config(), 13, Dtype::F16, Dtype::F16),
+        weights(&gemma4_config(), 13, Dtype::Q4, Dtype::Q8),
+    ] {
+        let Some(eng) = engine(&w) else { return };
+        let prefix: Vec<u32> = vec![2, 5, 9, 14, 20, 31, 7];
+        let branches = vec![
+            BranchTokens {
+                tokens: [11, 12, 13, 14, 15].map(Token).to_vec(),
+                want: vec![1, 4],
+            },
+            BranchTokens {
+                tokens: [30, 31, 32].map(Token).to_vec(),
+                want: vec![0, 2],
+            },
+        ];
+        let other = vec![BranchTokens {
+            tokens: [33, 34, 35, 36, 37, 38].map(Token).to_vec(),
+            want: vec![5],
+        }];
+        let full = pollster::block_on(eng.evaluate(&prefix, &branches, Want::Hidden)).unwrap();
+        assert_eq!(eng.prefix_source(), Some(PrefixSource::Decoded));
+        // Same prefix, different branches: resident, appended past the prefix.
+        let cont = pollster::block_on(eng.evaluate(&prefix, &other, Want::Hidden)).unwrap();
+        assert_eq!(eng.prefix_source(), Some(PrefixSource::Resident));
+        eng.evict_resident();
+        let cold = pollster::block_on(eng.evaluate(&prefix, &other, Want::Hidden)).unwrap();
+        assert_eq!(eng.prefix_source(), Some(PrefixSource::Decoded));
+        assert_eq!(cont[0].rows, cold[0].rows);
+        // Back to the first branches, resident again.
+        let again = pollster::block_on(eng.evaluate(&prefix, &branches, Want::Hidden)).unwrap();
+        assert_eq!(eng.prefix_source(), Some(PrefixSource::Resident));
+        for (a, b) in full.iter().zip(&again) {
+            assert_eq!(a.rows, b.rows);
+        }
+        // A different prefix decodes and becomes resident in turn.
+        let prefix2: Vec<u32> = vec![2, 3, 4];
+        let p2 = pollster::block_on(eng.evaluate(&prefix2, &branches, Want::Logits)).unwrap();
+        assert_eq!(eng.prefix_source(), Some(PrefixSource::Decoded));
+        let p2r = pollster::block_on(eng.evaluate(&prefix2, &branches, Want::Logits)).unwrap();
+        assert_eq!(eng.prefix_source(), Some(PrefixSource::Resident));
+        for (a, b) in p2.iter().zip(&p2r) {
+            assert_eq!(a.rows, b.rows);
+        }
+    }
 }
 
 #[test]

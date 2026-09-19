@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Context};
-use grande_core::{Backend, BranchOutput, BranchTokens, Error, Token, Want};
+use grande_core::{Backend, BranchOutput, BranchTokens, Error, PrefixSource, Token, Want};
 use tokenizers::Tokenizer;
 
 use crate::model::{Config, Manifest};
@@ -143,5 +143,13 @@ impl Backend for WgpuBackend {
     ) -> grande_core::Result<Vec<BranchOutput>> {
         let prefix: Vec<u32> = prefix.iter().map(|t| t.0 as u32).collect();
         pollster::block_on(self.engine.evaluate(&prefix, branches, want)).map_err(core_err)
+    }
+
+    fn prefix_source(&self) -> Option<PrefixSource> {
+        self.engine.prefix_source()
+    }
+
+    fn evict_resident(&mut self) {
+        self.engine.evict_resident();
     }
 }

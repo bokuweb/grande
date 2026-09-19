@@ -164,6 +164,17 @@ impl WgpuEngine {
         )
     }
 
+    /// How the last `evaluate` obtained its prefix: `"resident"` (same
+    /// prefix as the previous request, only the branches ran) or `"decoded"`.
+    pub fn prefix_source(&self) -> Option<String> {
+        self.inner.prefix_source().map(|s| s.as_str().to_string())
+    }
+
+    /// Forget the resident prefix (the next request decodes it again).
+    pub fn evict_resident(&self) {
+        self.inner.evict_resident();
+    }
+
     /// Run a two-token request so the first real one does not pay for the
     /// workspace's first touch.
     pub async fn warmup(&self) -> Result<(), JsError> {
