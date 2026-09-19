@@ -347,10 +347,13 @@ impl LlamaEngine {
         }
     }
 
-    fn decode_prefix(&mut self, prefix: &[Token]) -> anyhow::Result<()> {
+    /// Make `prefix` the resident state without decoding it: keep it if it
+    /// already is, else restore it from the state cache. Returns false when
+    /// it has to be decoded (the cache is then clear).
+    fn prepare_prefix(&mut self, prefix: &[Token]) -> bool {
         if self.resident_prefix.as_deref() == Some(prefix) {
             self.last_source = Some(PrefixSource::Resident);
-            return Ok(());
+            return true;
         }
         // The outgoing prefix is already in the state cache (remembered when
         // it was decoded), so its cells can simply go.
@@ -359,22 +362,9 @@ impl LlamaEngine {
         if let Some(src) = self.restore(prefix) {
             self.resident_prefix = Some(prefix.to_vec());
             self.last_source = Some(src);
-            return Ok(());
+            return true;
         }
-        let n_batch = self.opts.n_batch as usize;
-        let mut pos = 0i32;
-        for chunk in prefix.chunks(n_batch) {
-            let mut batch = LlamaBatch::new(chunk.len(), 1);
-            for t in chunk {
-                batch.add(LlamaToken(t.0), pos, &[0], false)?;
-                pos += 1;
-            }
-            self.ctx.decode(&mut batch).context("decoding prefix")?;
-        }
-        self.resident_prefix = Some(prefix.to_vec());
-        self.last_source = Some(PrefixSource::Decoded);
-        self.remember(prefix)?;
-        Ok(())
+        false
     }
 
     /// Whether the last request's state is still resident (diagnostics).
@@ -389,14 +379,23 @@ impl LlamaEngine {
         self.ctx.clear_kv_cache();
     }
 
-    /// Decode all branches, chunking at `n_batch`, collecting requested rows.
+    /// Decode the branches, and the prefix first when it is not resident, in
+    /// as few `llama_decode` calls as `n_batch` allows (one, normally).
+    ///
+    /// A prefix decoded here is added with every sequence id at once, so its
+    /// cells belong to sequence 0 and to every branch from the start and no
+    /// `seq_cp` is needed; a resident prefix is shared by `seq_cp` instead.
+    /// Either way a branch token attends to the prefix cells and to its own
+    /// sequence only.
     fn decode_branches(
         &mut self,
-        prefix_len: usize,
+        prefix: &[Token],
+        decode_prefix: bool,
         branches: &[BranchTokens],
         want: Want,
     ) -> anyhow::Result<Vec<BranchOutput>> {
         let n_batch = self.opts.n_batch as usize;
+        let prefix_len = prefix.len();
         let mut outputs: Vec<BranchOutput> = branches
             .iter()
             .map(|b| BranchOutput {
@@ -408,11 +407,22 @@ impl LlamaEngine {
         // whose output was requested in the batch being filled.
         let mut batch = LlamaBatch::new(n_batch, self.n_seq_max as i32);
         let mut pending: Vec<(usize, usize, usize)> = Vec::new();
+        if decode_prefix {
+            let seqs: Vec<i32> = (0..=branches.len() as i32).collect();
+            for (pos, t) in prefix.iter().enumerate() {
+                if batch.n_tokens() as usize >= n_batch {
+                    self.flush(&mut batch, &mut pending, &mut outputs, want)?;
+                }
+                batch.add(LlamaToken(t.0), pos as i32, &seqs, false)?;
+            }
+        }
         for (bi, b) in branches.iter().enumerate() {
             let seq = (bi + 1) as i32;
-            self.ctx
-                .kv_cache_seq_cp(0, seq, None, None)
-                .map_err(|e| anyhow!("seq_cp: {e:?}"))?;
+            if !decode_prefix {
+                self.ctx
+                    .kv_cache_seq_cp(0, seq, None, None)
+                    .map_err(|e| anyhow!("seq_cp: {e:?}"))?;
+            }
             let mut want_iter = b.want.iter().enumerate().peekable();
             for (j, t) in b.tokens.iter().enumerate() {
                 if batch.n_tokens() as usize >= n_batch {
@@ -537,14 +547,19 @@ impl Backend for LlamaEngine {
                 self.ctx.n_ctx()
             )));
         }
-        self.decode_prefix(prefix).map_err(core_err)?;
+        let have_prefix = self.prepare_prefix(prefix);
         let out = self
-            .decode_branches(prefix.len(), branches, want)
+            .decode_branches(prefix, !have_prefix, branches, want)
             .map_err(core_err);
         // Drop the branch sequences; the prefix cells (sequence 0) stay
         // resident for the next request over the same state.
         for seq in 1..=branches.len() as i32 {
             self.ctx.kv_cache_seq_rm(seq, None, None).ok();
+        }
+        if !have_prefix && out.is_ok() {
+            self.resident_prefix = Some(prefix.to_vec());
+            self.last_source = Some(PrefixSource::Decoded);
+            self.remember(prefix).map_err(core_err)?;
         }
         out
     }
