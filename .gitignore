@@ -6,3 +6,4 @@
 /python/.venv/
 /.cache/
 __pycache__/
+/web/pkg/

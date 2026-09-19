@@ -1,0 +1,53 @@
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-bindgen (version pinned in Cargo.lock) and binaryen
+        run: |
+          VERSION=$(grep -A1 'name = "wasm-bindgen"' Cargo.lock | grep version | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "wasm-bindgen $VERSION"
+          curl -sSL "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${VERSION}/wasm-bindgen-${VERSION}-x86_64-unknown-linux-musl.tar.gz" | tar xz
+          sudo mv "wasm-bindgen-${VERSION}-x86_64-unknown-linux-musl/wasm-bindgen" /usr/local/bin/
+          sudo apt-get install -y -qq binaryen
+      - name: Build wasm
+        run: |
+          cargo build --release -p grande-web --target wasm32-unknown-unknown
+          wasm-bindgen --target web --out-dir web/pkg --out-name grande target/wasm32-unknown-unknown/release/grande_web.wasm
+          wasm-opt -Oz -o web/pkg/grande_bg.wasm web/pkg/grande_bg.wasm
+          rm -f web/pkg/.gitignore
+          ls -la web/pkg
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

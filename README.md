@@ -10,6 +10,8 @@ one isolated branch per question, a readout at each branch's answer position.
 grande targets Japanese, Gemma 4, quantized local inference, and (later) the
 browser. Design notes live in `life/idea/local-jev`.
 
+**Demo:** https://bokuweb.github.io/grande/ (WebGPU; pick a model, load, run — nothing leaves the browser)
+
 ## Status
 
 - [x] `grande-core`: TypeSafe-shaped request/response, renderer (label and
