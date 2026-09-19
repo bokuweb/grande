@@ -95,6 +95,12 @@ pub enum Renderer {
         turn_end: String,
         user: String,
         model: String,
+        /// Drop the "Question:" / "Answer with one letter." scaffolding: the
+        /// branch is the instruction, the lettered options and the model
+        /// turn. Fewer tokens per question; the model turn already asks for
+        /// the answer.
+        #[serde(default)]
+        terse: bool,
     },
     /// Packed layout with reserved delimiters and a trained pointer head.
     Pointer(Delimiters),
@@ -110,6 +116,7 @@ impl Renderer {
             turn_end: "<turn|>".into(),
             user: "user".into(),
             model: "model".into(),
+            terse: false,
         }
     }
 
@@ -120,7 +127,16 @@ impl Renderer {
             turn_end: "<end_of_turn>".into(),
             user: "user".into(),
             model: "model".into(),
+            terse: false,
         }
+    }
+
+    /// The same layout with the terse branch template.
+    pub fn terse(mut self, on: bool) -> Self {
+        if let Renderer::Label { terse, .. } = &mut self {
+            *terse = on;
+        }
+        self
     }
 
     pub fn gemma_pointer() -> Self {
@@ -173,9 +189,14 @@ impl Renderer {
                 turn_start,
                 turn_end,
                 model,
+                terse,
                 ..
             } => {
-                let mut text = format!("Question: {instr}\n");
+                let mut text = if *terse {
+                    format!("{instr}\n")
+                } else {
+                    format!("Question: {instr}\n")
+                };
                 for (i, (key, desc)) in ordered.iter().enumerate() {
                     let letter = crate::readout::LABELS[i];
                     match desc {
@@ -185,7 +206,11 @@ impl Renderer {
                         _ => text.push_str(&format!("{letter}: {key}\n")),
                     }
                 }
-                text.push_str("Answer with one letter.");
+                if *terse {
+                    text.pop();
+                } else {
+                    text.push_str("Answer with one letter.");
+                }
                 segments.push(Segment::Text(text));
                 segments.push(Segment::Special(turn_end.clone()));
                 segments.push(Segment::Text("\n".into()));

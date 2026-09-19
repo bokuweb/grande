@@ -4,7 +4,7 @@ use indexmap::IndexMap;
 use serde::Serialize;
 
 use crate::api::{Answer, Question, Request, Response, Usage};
-use crate::backend::{Backend, BranchTokens, Token, Want};
+use crate::backend::{Backend, BranchTokens, PrefixSource, Token, Want};
 use crate::math::{argmax, confidence, expected_index};
 use crate::readout::{Distribution, Readout};
 use crate::render::{Kind, Mark, Rendered, RenderedBranch, Renderer, Segment};
@@ -19,6 +19,8 @@ pub struct Diagnostics {
     pub candidate_mass: IndexMap<String, f64>,
     /// Number of `evaluate` calls (1 when packed).
     pub passes: usize,
+    /// Where the backend got the state from (resident / ram / disk / decoded).
+    pub prefix_source: Option<PrefixSource>,
 }
 
 /// How branches are evaluated.
@@ -156,6 +158,7 @@ impl<B: Backend> Engine<B> {
                 outs
             }
         };
+        diag.prefix_source = self.backend.prefix_source();
         let mut result = Vec::with_capacity(outputs.len());
         for (branch, out) in rendered.branches.into_iter().zip(outputs) {
             let dist = self

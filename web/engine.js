@@ -3,11 +3,15 @@
 // runtime (validation, layout, labels, softmax / temperature / confidence, response).
 //
 //   const engine = await loadEngine({ transformers, model: "gemma-3-1b", onProgress });
-//   const resp = await engine.answer(request, { temperature: 1, mode: "batched" });
+//   const resp = await engine.answer(request, { temperature: 1, mode: "shared" });
 //
-// Zero-shot label readout: every question is rendered as "state + question + lettered
-// options", ONE forward pass per request (batched, every row re-reads the state), and
-// only the label-token logits at the last position are read. No generation.
+// Zero-shot label readout: the state is decoded once into a resident KV cache, every
+// question continues from it as an isolated branch ("state, then this question"), and
+// only the label-token logits at each branch's last position are read. No generation.
+// Modes: "shared" (above), "batched" (one forward where every row re-reads the
+// state) and "sequential" (one forward per question) are kept for comparison.
+// The trained pointer model (a hidden-state export without a KV cache) always
+// runs batched.
 
 import init, * as grande from "./pkg/grande.js";
 import { idbCache } from "./cache.js";
@@ -108,7 +112,7 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
   transformers.env.useCustomCache = true;
   transformers.env.customCache = idbCache;
   navigator.storage?.persist?.().catch(() => {});
-  const { AutoTokenizer, AutoModelForCausalLM, AutoProcessor, Gemma4ForConditionalGeneration, Tensor } = transformers;
+  const { AutoTokenizer, AutoModelForCausalLM, AutoProcessor, Gemma4ForConditionalGeneration, Tensor, DynamicCache } = transformers;
 
   let tok, net, head = null, idMap = null;
   if (spec.local) {
@@ -163,6 +167,12 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
   //    causal attention never sees them even if the graph ignores the mask (the
   //    Gemma 4 multimodal export). Costs B × L × V logits, so it is capped.
   const RIGHT_PAD_MAX_LOGITS = 64 * 1024 * 1024; // elements; ~128 MB in fp16
+
+  // Every output (logits and the present.* cache, which lives on the GPU) is
+  // released once read; only the resident state cache outlives a request.
+  async function disposeOutputs(out) {
+    for (const t of Object.values(out)) if (t?.dispose) await t.dispose();
+  }
   async function batched(texts, keysPerRow) {
     if (spec.padding === "right") return batchedRight(texts, keysPerRow);
     tok.padding_side = "left";
@@ -182,7 +192,7 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     let tokens = 0;
     for (let i = 0; i < mask.length; i++) if (Number(mask[i])) tokens++;
     const rows = rowsFromLogits(out.logits.data, out.logits.dims, keysPerRow);
-    out.logits.dispose?.();
+    await disposeOutputs(out);
     return { rows, tokens };
   }
 
@@ -203,7 +213,7 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     }
     const out = await net.forward({ ...inputs, num_logits_to_keep: new Tensor("int64", [BigInt(L)], []) });
     const rows = keysPerRow.map((k, b) => readRow(out.logits.data, out.logits.dims, b, lens[b] - 1, k));
-    out.logits.dispose?.();
+    await disposeOutputs(out);
     return { rows, tokens };
   }
 
@@ -215,9 +225,57 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
       const out = await net.forward({ ...inputs, num_logits_to_keep: new Tensor("int64", [1n], []) });
       tokens += inputs.input_ids.dims[1];
       rows.push(rowsFromLogits(out.logits.data, out.logits.dims, [keysPerRow[b]])[0]);
-      out.logits.dispose?.();
+      await disposeOutputs(out);
     }
     return { rows, tokens };
+  }
+
+  // Shared state: the browser counterpart of grande-llama's resident prefix.
+  // The state is decoded once into a KV cache and stays resident; every branch
+  // then continues from that cache, so the state is never re-read and a second
+  // request over the same state skips it entirely. A branch attends to the
+  // state and to its own tokens only, exactly the native block-causal layout.
+  //
+  // Branches run one forward each. ORT's GroupQueryAttention requires
+  // "batch_size must be 1 when sequence_length > 1 and past context is given",
+  // and a refused run leaves the session unusable, so the tiled-cache single
+  // forward is not attempted. Each branch forward is short (its own tokens
+  // only), so the cost is the per-dispatch overhead, not compute.
+  let resident = null; // { text, n, kv: DynamicCache }
+
+  function cacheFromOutput(out) {
+    const entries = {};
+    for (const name in out) {
+      if (!name.startsWith("present")) continue;
+      entries[name.replace("present", "past_key_values")] = out[name];
+    }
+    return new DynamicCache(entries);
+  }
+
+  async function ensureResident(prefixText) {
+    if (resident?.text === prefixText) return { ...resident, warm: true };
+    if (resident) { await resident.kv.dispose(); resident = null; }
+    const inputs = tok(prefixText, { add_special_tokens: false });
+    const out = await net.forward({ ...inputs, num_logits_to_keep: new Tensor("int64", [1n], []) });
+    out.logits.dispose?.();
+    resident = { text: prefixText, n: inputs.input_ids.dims[1], kv: cacheFromOutput(out) };
+    return { ...resident, warm: false };
+  }
+
+  async function shared(prefixText, branchTexts, keysPerRow) {
+    const { kv, n: P, warm } = await ensureResident(prefixText);
+    const rows = [];
+    let tokens = 0;
+    for (let b = 0; b < branchTexts.length; b++) {
+      const inputs = tok(branchTexts[b], { add_special_tokens: false });
+      const Q = inputs.input_ids.dims[1];
+      const attention_mask = new Tensor("int64", new BigInt64Array(P + Q).fill(1n), [1, P + Q]);
+      const out = await net.forward({ input_ids: inputs.input_ids, attention_mask, past_key_values: kv, num_logits_to_keep: new Tensor("int64", [1n], []) });
+      tokens += Q;
+      rows.push(rowsFromLogits(out.logits.data, out.logits.dims, [keysPerRow[b]])[0]);
+      await disposeOutputs(out);
+    }
+    return { rows, tokens: tokens + (warm ? 0 : P), forwards: branchTexts.length + (warm ? 0 : 1), warm, state_tokens: P };
   }
 
   // Tokenize rendered segments one by one (mirror of grande-core's pack): text
@@ -277,7 +335,7 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
   let queue = Promise.resolve();
   const enqueue = (job) => { const p = queue.then(job, job); queue = p.catch(() => {}); return p; };
 
-  async function answerNow(request, { temperature = 1.0, mode = "batched" } = {}) {
+  async function answerNow(request, { temperature = 1.0, mode = "shared" } = {}) {
     const reqJson = JSON.stringify(request);
     const rendered = JSON.parse(grande.render(reqJson, JSON.stringify(spec.layout)));
     if (spec.kind === "pointer") {
@@ -289,15 +347,20 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
         diagnostics: { candidate_mass: {}, rows } };
     }
     const prefix = segmentsToText(rendered.prefix, bos);
-    const texts = rendered.branches.map((b) => prefix + segmentsToText(b.segments, bos));
+    const branchTexts = rendered.branches.map((b) => segmentsToText(b.segments, bos));
+    const texts = branchTexts.map((t) => prefix + t);
     const keys = rendered.branches.map((b) => b.keys.length);
     for (const k of keys) if (k > labelIds.length) throw new Error(`a question has ${k} options; this tokenizer supports ${labelIds.length} single-token labels`);
     const t0 = performance.now();
-    const { rows, tokens } = mode === "sequential" ? await sequential(texts, keys) : await batched(texts, keys);
+    let r;
+    if (mode === "sequential") r = { ...(await sequential(texts, keys)), forwards: texts.length };
+    else if (mode === "batched") r = { ...(await batched(texts, keys)), forwards: 1 };
+    else r = await shared(prefix, branchTexts, keys);
     const ms = performance.now() - t0;
+    const { rows, tokens } = r;
     const resp = JSON.parse(grande.answer(reqJson, JSON.stringify(rows), temperature, spec.id, tokens));
-    const stateTokens = tok.encode(prefix, { add_special_tokens: false }).length;
-    return { ...resp, usage: { ...resp.usage, state_tokens: stateTokens, questions: rows.length, mode, ms, forwards: mode === "sequential" ? rows.length : 1 },
+    const stateTokens = r.state_tokens ?? tok.encode(prefix, { add_special_tokens: false }).length;
+    return { ...resp, usage: { ...resp.usage, state_tokens: stateTokens, questions: rows.length, mode, ms, forwards: r.forwards, ...(r.warm === undefined ? {} : { state_resident: r.warm }) },
       diagnostics: { candidate_mass: Object.fromEntries(rendered.branches.map((b, i) => [b.id, rows[i].candidate_mass])), rows } };
   }
 

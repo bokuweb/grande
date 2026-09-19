@@ -15,7 +15,7 @@ pub mod readout;
 pub mod render;
 
 pub use api::{Answer, Question, Request, Response, Usage};
-pub use backend::{Backend, BranchOutput, BranchTokens, Token, Want};
+pub use backend::{Backend, BranchOutput, BranchTokens, PrefixSource, Token, Want};
 pub use engine::{Diagnostics, Engine, Mode};
 pub use readout::Readout;
 pub use render::{Rendered, RenderedBranch, Renderer, Segment};

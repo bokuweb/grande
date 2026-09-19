@@ -35,6 +35,31 @@ pub struct BranchOutput {
     pub rows: Vec<Vec<f32>>,
 }
 
+/// Where the prefix (state) came from in the last `evaluate` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrefixSource {
+    /// Still in the cache from the previous request over the same state.
+    Resident,
+    /// Restored from the in-memory state cache.
+    Ram,
+    /// Restored from the on-disk state cache.
+    Disk,
+    /// Evaluated from scratch.
+    Decoded,
+}
+
+impl PrefixSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PrefixSource::Resident => "resident",
+            PrefixSource::Ram => "ram",
+            PrefixSource::Disk => "disk",
+            PrefixSource::Decoded => "decoded",
+        }
+    }
+}
+
 pub trait Backend {
     /// Tokenize caller text. Never adds BOS and never emits control tokens for
     /// text that merely looks like one.
@@ -55,4 +80,9 @@ pub trait Backend {
         branches: &[BranchTokens],
         want: Want,
     ) -> Result<Vec<BranchOutput>>;
+    /// How the last `evaluate` obtained its prefix, if the backend keeps
+    /// states around at all.
+    fn prefix_source(&self) -> Option<PrefixSource> {
+        None
+    }
 }

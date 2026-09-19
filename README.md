@@ -46,6 +46,11 @@ Gemma 4 E2B zero-shot is selectable.
 - [x] `grande suite` (kev-style frozen suites), `tools/http_eval.py`
       (any `/v1/systemone` server), `tools/prune_vocab.py`.
 - [x] unified KV cache; resident prefix across requests over the same state.
+- [x] state cache: the KV of every state seen is kept serialized (RAM LRU,
+      `--state-cache-dir` for disk), so coming back to a document is a 2–10 ms
+      restore instead of a prefill, across requests and restarts.
+- [x] browser: state decoded once and resident, questions continue from its
+      KV cache (`shared` mode); no state re-reading.
 - [ ] IIA test, permutation flip rate on a JGLUE sample
 
 ## First numbers (2026-09-19, M-series Mac, Metal)
@@ -120,13 +125,16 @@ See [docs/comparison.md](docs/comparison.md). Short version, same M4:
   0.685 / 0.630 at 26–34 ms.
 - kev's English suite (identical questions): kev 0.797, Jev 0.808, grande
   E2B zero-shot 0.677 (banking77 excluded).
-- Browser, same 5-question Japanese ticket: grande E2B 4.2 s and all 5 right;
-  reflex 0.8B 6.7 s cold / 3.5 s warm and 3 of 5 wrong.
+- Browser, same 5-question Japanese ticket: grande E2B 2.8 s cold / 2.5 s
+  with the state resident (was 4.2 s re-reading the state per question) and
+  all 5 right; reflex 0.8B 6.7 s cold / 3.5 s warm and 3 of 5 wrong.
 - Vocabulary pruning cuts E2B Q4_0 from 2,841 MB to 1,273 MB with no JGLUE
   accuracy change (`tools/prune_vocab.py`); Q3_K_M on top reaches 1,181 MB
   at −6 pts JCQA, Q2_K collapses.
 - Idle M4, 12 questions over a 500-token state: E2B Q4_0 1.94 s cold /
-  1.01 s with the state resident; 270M 168 / 86 ms.
+  1.01 s with the state resident; 270M 168 / 86 ms. A 2,000-token state
+  that was seen before comes back from the state cache in 2–4 ms (RAM) or
+  4–11 ms (file), so its request costs the same as a resident one.
 
 ## Usage
 
@@ -143,6 +151,19 @@ cargo build --release            # Metal on macOS; --features cuda / vulkan else
 `--mode packed` prints the TypeSafe-shaped response; `--mode check` runs
 packed and per-question passes and reports the largest probability
 difference.
+
+```bash
+./target/release/grande serve --model models/gemma-4-E2B-it-Q4_0.gguf \
+  --state-cache-mb 512 --state-cache-dir .cache/states
+```
+
+The server keeps the current state resident and every other state it has
+seen serialized: an LRU in RAM (`--state-cache-mb`, 512 MB ≈ 55k tokens of
+E2B state) and, with `--state-cache-dir`, a file per state keyed by model
+and token ids, so a document answered before a restart still restores in
+milliseconds. The `X-Grande-State` response header says which path a
+request took: `resident`, `ram`, `disk` or `decoded`. `grande bench`
+reports the restore (`restored_ms`, `restored_from`) next to cold and warm.
 
 ## Layout
 

@@ -88,9 +88,11 @@ state again, branches only (the prefix stays resident in the KV cache).
 | grande native | Gemma 3 270M + head | JGLUE, 1 Q | ~100 | 47–77 ms | |
 | kev-0.5b (PyTorch MPS fp32) | Qwen2.5-0.5B | 5 Q ticket | 261 | 211–313 ms | |
 | kev-0.5b | JGLUE, 1 Q | | | 136–234 ms | |
-| grande browser (WebGPU) | Gemma 3 270M q4f16 | 5 Q ticket | 673 | 2.0 s | |
-| grande browser | Gemma 4 E2B q4f16 | 5 Q ticket | 673 | 4.2 s | |
-| grande browser | Gemma 4 E2B q4f16 | 8 Q contract | 2,263 | 11.4 s | |
+| grande browser (WebGPU, `shared`) | Gemma 3 270M q4f16 | 8 Q contract | 639 | 1.7 s | 0.9 s |
+| grande browser (`shared`) | Gemma 4 E2B q4f16 | 5 Q ticket | 313 | 2.8 s | 2.5 s |
+| grande browser (`shared`) | Gemma 4 E2B q4f16 | 8 Q contract | 639 | 5.2 s | 3.1 s |
+| grande browser (`batched`, state re-read per row) | Gemma 4 E2B q4f16 | 5 Q ticket | 673 | 4.6 s | |
+| grande browser (`batched`) | Gemma 4 E2B q4f16 | 8 Q contract | 2,263 | 12.1 s | |
 | **grande browser, trained** | grande-270m-ja q8 (211 MB) | 5 Q ticket | 571 | 449 ms | **267 ms** |
 | grande browser, trained | grande-270m-ja q8 | 8 Q contract | 2,102 | | 923 ms |
 | **reflex browser** (WebGPU) | Qwen3.5-0.8B q4f16 | 5 Q ticket (same JSON) | 1,114 / 324 warm | 6.7 s | 3.5 s |
@@ -102,6 +104,25 @@ Raw llama.cpp `llama-bench pp1024`, idle M4: E2B Q4_0 **569 tok/s**, 270M
 f16 **6,181 tok/s**. grande's packed pass: 553 and 6,380 tok/s. The runtime
 adds nothing; the wall is prefill compute of the backbone on a base M4 GPU.
 Flash attention on/off and n_ubatch 128–2048 change nothing (compute-bound).
+
+State cache (native): a state that is not resident but was seen before is
+restored from its serialized KV instead of prefilled. E2B Q4_0, 2,071-token
+state, 12 questions, same session (numbers from a busier session than the
+table above, so read them against each other): cold 6.5 s, resident 1.49 s,
+restored from RAM 1.54 s (restore itself 2–4 ms for 19 MB), restored from a
+file in a fresh process 2.46 s total (restore 4–11 ms). Restored answers
+match the decoded ones to max |Δp| 1.5e-4 for states longer than the
+sliding window (the SWA cache holds only the window after a restore, so the
+attention kernel reduces over fewer cells) and exactly for shorter ones.
+
+Browser: the `shared` mode is the same layout as native — state decoded
+once into a resident KV cache, one continuation per question — and cuts the
+tokens per request from B × (state + question) to state + Σ question. The
+branches cannot be batched into one forward because ORT's
+GroupQueryAttention requires `batch_size == 1` for a multi-token
+continuation from a cache, so each question is its own forward (~90 ms
+fixed + ~7 ms/token on E2B); that per-dispatch cost, not the layout, is
+now the browser's floor.
 reflex's browser answers on the Japanese ticket were wrong on 3 of 5
 questions (queue=account 62%, refund 71%); grande E2B got all 5.
 
@@ -166,9 +187,11 @@ Speed (E2B, M4):
 |---|---|---|
 | unified KV cache (no per-stream copy) | correctness + budget; needed for long states | done |
 | resident prefix across requests over the same state | 500-tok state: 1.94 → 1.01 s; 2,000-tok: 4.69 → 1.11 s | done |
+| state cache (RAM LRU + files): any previously seen state restores in ms | 2,000-tok state, second visit or after restart: cold → resident cost | done |
+| browser: state resident, questions continue from its KV | ticket 4.2 → 2.5 s, contract 11.4 → 3.1 s (E2B, warm) | done |
 | flash attention on/off, n_ubatch 128–2048 | no change (compute-bound) | measured |
 | quantization level | no change (compute-bound) | measured |
-| shorter label template | ~−15% branch tokens | not done |
+| shorter label template (`--terse`: no "Question:" / "Answer with one letter.") | −15% branch tokens, but JCQA collapses: 0.857 → 0.480, candidate mass 0.90 → 0.001; JNLI 0.530 → 0.517 with mass 0.99 → 0.83 (first 300 valid rows, E2B Q4_0) | measured, rejected |
 | smaller backbone | 270M is 11× faster than E2B (86 vs 1,010 ms warm) | done |
 | early exit (train with `--keep-layers`) | 270M 18 → 12 layers: 86 → 59 ms warm, −2 to −8 pts | done on 270M; E2B needs a GPU to train |
 | bigger GPU | prefill is compute-bound; a 4090-class GPU is ~30× an M4 | |

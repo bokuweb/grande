@@ -152,7 +152,8 @@
         <label class="field">Preset <select id="preset"></select></label>
         <label class="field">Temperature <input type="range" id="temp" min="0.5" max="4" step="0.1" value="1"> <span id="tempv" class="chip">1.0</span></label>
         <div class="seg" id="mode" role="radiogroup" aria-label="Execution mode">
-          <button type="button" data-mode="batched" class="on" title="One forward pass for every question">Batched</button>
+          <button type="button" data-mode="shared" class="on" title="State decoded once and kept resident; every question continues from it">Shared</button>
+          <button type="button" data-mode="batched" title="One forward pass where every row re-reads the state">Batched</button>
           <button type="button" data-mode="sequential" title="One forward pass per question">Sequential</button>
         </div>
         <button id="run" class="primary" disabled>Run<kbd>⌘↵</kbd></button>
