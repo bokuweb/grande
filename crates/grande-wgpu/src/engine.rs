@@ -1181,8 +1181,8 @@ impl Engine {
                 _pad: 0,
             };
             // matmul.wgsl tiles 64 rows x 128 cols, matmul_gated.wgsl 64 x 64.
-            let mm_wg = |n: usize| (div_ceil(n, 128), div_ceil(t, 64));
-            let gated_wg = |n: usize| (div_ceil(n, 64), div_ceil(t, 64));
+            let mm_wg = |n: usize| (div_ceil(n, 128), div_ceil(t, 32));
+            let gated_wg = |n: usize| (div_ceil(n, 128), div_ceil(t, 32));
             let pl = cfg.per_layer_dim;
             if let Some((mm_proj, combine)) = &self.pl_pre {
                 let n = pl * cfg.layers;
