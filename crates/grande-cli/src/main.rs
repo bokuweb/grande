@@ -101,6 +101,11 @@ enum Cmd {
         rounds: usize,
         #[arg(long, default_value_t = 16384)]
         n_ctx: u32,
+        #[arg(long, default_value_t = 512)]
+        n_ubatch: u32,
+        /// Flash attention: auto (default), on, off.
+        #[arg(long, default_value = "auto")]
+        flash: String,
     },
     /// Mechanism tests (kev's): isolation, packed vs separate, boundary
     /// forgery. Prints one line per test with a pass/fail verdict.
@@ -190,7 +195,15 @@ fn readout_for(backend: &LlamaEngine, head: Option<&PathBuf>) -> Result<(Rendere
             );
             Ok((Renderer::gemma_pointer(), Readout::Pointer(h)))
         }
-        None => Ok((Renderer::gemma_label(), Readout::Label)),
+        None => {
+            // Gemma 4 uses <|turn>; Gemma 3 checkpoints use <start_of_turn>.
+            let renderer = if backend.special("<|turn>").is_ok() {
+                Renderer::gemma_label()
+            } else {
+                Renderer::gemma3_label()
+            };
+            Ok((renderer, Readout::Label))
+        }
     }
 }
 
@@ -250,6 +263,7 @@ fn main() -> Result<()> {
                 Options {
                     n_ctx,
                     n_batch: n_ctx,
+                    embeddings: head.is_some(),
                     ..Default::default()
                 },
             )?;
@@ -341,13 +355,21 @@ fn main() -> Result<()> {
             questions,
             rounds,
             n_ctx,
+            n_ubatch,
+            flash,
         } => {
             let backend = LlamaEngine::load(
                 &model,
                 Options {
                     n_ctx,
                     n_batch: n_ctx,
+                    n_ubatch,
                     n_seq_max: (questions + 1).max(2) as u32,
+                    flash: match flash.as_str() {
+                        "on" => Some(true),
+                        "off" => Some(false),
+                        _ => None,
+                    },
                     ..Default::default()
                 },
             )?;
@@ -356,7 +378,8 @@ fn main() -> Result<()> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("model")
                 .to_lowercase();
-            let mut engine = Engine::new(backend, Renderer::gemma_label(), Readout::Label, name);
+            let (renderer, readout) = readout_for(&backend, None)?;
+            let mut engine = Engine::new(backend, renderer, readout, name);
             // Build a state of roughly `state_tokens` tokens from a repeated clause.
             let unit = "第3条 本契約に基づく報酬は月額金500,000円（消費税別）とし、甲は乙の請求書受領月の翌月末日までに支払う。";
             let unit_tokens = engine.backend.tokenize(unit)?.len().max(1);
@@ -417,6 +440,7 @@ fn main() -> Result<()> {
                 Options {
                     n_ctx: 4096,
                     n_batch: 4096,
+                    embeddings: head.is_some(),
                     ..Default::default()
                 },
             )?;
@@ -620,6 +644,7 @@ fn main() -> Result<()> {
                 Options {
                     n_ctx,
                     n_batch: n_ctx,
+                    embeddings: head.is_some(),
                     ..Default::default()
                 },
             )?;
@@ -773,6 +798,7 @@ fn main() -> Result<()> {
                     n_batch: n_ctx,
                     n_gpu_layers,
                     swa_full,
+                    embeddings: head.is_some(),
                     ..Default::default()
                 },
             )?;

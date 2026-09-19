@@ -113,6 +113,16 @@ impl Renderer {
         }
     }
 
+    /// Gemma 3 chat layout (`<start_of_turn>` / `<end_of_turn>`).
+    pub fn gemma3_label() -> Self {
+        Renderer::Label {
+            turn_start: "<start_of_turn>".into(),
+            turn_end: "<end_of_turn>".into(),
+            user: "user".into(),
+            model: "model".into(),
+        }
+    }
+
     pub fn gemma_pointer() -> Self {
         Renderer::Pointer(Delimiters::default())
     }

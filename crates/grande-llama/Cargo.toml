@@ -9,6 +9,7 @@ description = "llama.cpp backend for grande: shared state prefix, isolated quest
 [dependencies]
 grande-core = { path = "../grande-core" }
 llama-cpp-2.workspace = true
+llama-cpp-sys-2 = { version = "0.1.156", default-features = false }
 anyhow.workspace = true
 tracing.workspace = true
 encoding_rs = "0.8"

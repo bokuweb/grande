@@ -35,6 +35,12 @@ pub struct Options {
     /// isolation on Gemma 4 E2B (packed vs separate identical either way);
     /// left as an escape hatch for other SWA models.
     pub swa_full: bool,
+    /// Flash attention: None = llama.cpp auto, Some(true/false) = force.
+    pub flash: Option<bool>,
+    /// Expose hidden states (pointer readout). Off for the label readout:
+    /// llama.cpp then computes logits only at requested positions, whereas
+    /// embeddings mode marks every token as an output.
+    pub embeddings: bool,
 }
 
 impl Default for Options {
@@ -47,6 +53,8 @@ impl Default for Options {
             n_gpu_layers: 999,
             n_threads: 8,
             swa_full: false,
+            flash: None,
+            embeddings: false,
         }
     }
 }
@@ -62,6 +70,9 @@ pub struct LlamaEngine {
     opts: Options,
     n_seq_max: usize,
     specials: Mutex<HashMap<String, Token>>,
+    /// Prefix currently resident in sequence 0, if any. A request over the
+    /// same state skips the prefix pass entirely.
+    resident_prefix: Option<Vec<Token>>,
 }
 
 // SAFETY: every use of the context and model goes through `&mut self` or
@@ -111,7 +122,12 @@ impl LlamaEngine {
             // the prefix cells (no copy), and n_ctx is the request's total
             // budget instead of being split per sequence.
             .with_kv_unified(true)
-            .with_embeddings(true);
+            .with_flash_attention_policy(match opts.flash {
+                None => llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_AUTO,
+                Some(true) => llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED,
+                Some(false) => llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_DISABLED,
+            })
+            .with_embeddings(opts.embeddings);
         let ctx = match model.new_context(backend, cparams) {
             Ok(c) => c,
             Err(e) => {
@@ -130,6 +146,7 @@ impl LlamaEngine {
             opts,
             n_seq_max,
             specials: Mutex::new(HashMap::new()),
+            resident_prefix: None,
         })
     }
 
@@ -151,6 +168,10 @@ impl LlamaEngine {
     }
 
     fn decode_prefix(&mut self, prefix: &[Token]) -> anyhow::Result<()> {
+        if self.resident_prefix.as_deref() == Some(prefix) {
+            return Ok(());
+        }
+        self.resident_prefix = None;
         self.ctx.clear_kv_cache();
         let n_batch = self.opts.n_batch as usize;
         let mut pos = 0i32;
@@ -162,7 +183,13 @@ impl LlamaEngine {
             }
             self.ctx.decode(&mut batch).context("decoding prefix")?;
         }
+        self.resident_prefix = Some(prefix.to_vec());
         Ok(())
+    }
+
+    /// Whether the last request's state is still resident (diagnostics).
+    pub fn prefix_resident(&self, prefix: &[Token]) -> bool {
+        self.resident_prefix.as_deref() == Some(prefix)
     }
 
     /// Decode all branches, chunking at `n_batch`, collecting requested rows.
@@ -314,8 +341,15 @@ impl Backend for LlamaEngine {
             )));
         }
         self.decode_prefix(prefix).map_err(core_err)?;
-        self.decode_branches(prefix.len(), branches, want)
-            .map_err(core_err)
+        let out = self
+            .decode_branches(prefix.len(), branches, want)
+            .map_err(core_err);
+        // Drop the branch sequences; the prefix cells (sequence 0) stay
+        // resident for the next request over the same state.
+        for seq in 1..=branches.len() as i32 {
+            self.ctx.kv_cache_seq_rm(seq, None, None).ok();
+        }
+        out
     }
 }
 

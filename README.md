@@ -37,6 +37,9 @@ browser. Design notes live in `life/idea/local-jev`.
 - [x] `grande mechanism`: isolation, packed vs separate, boundary forgery.
 - [x] browser demo (`web/`): `grande-core` as wasm + transformers.js on
       WebGPU, Gemma 3 270M / 1B and Gemma 4 E2B ONNX.
+- [x] `grande suite` (kev-style frozen suites), `tools/http_eval.py`
+      (any `/v1/systemone` server), `tools/prune_vocab.py`.
+- [x] unified KV cache; resident prefix across requests over the same state.
 - [ ] IIA test, permutation flip rate on a JGLUE sample
 
 ## First numbers (2026-09-19, M-series Mac, Metal)
@@ -100,6 +103,20 @@ cd .. && ./target/release/grande jglue --model runs/grande-270m/grande-270m-f16.
 The renderer is defined twice (Rust for serving, Python for training) on
 purpose; `grande render` dumps token ids and `grande_train.render.check_parity`
 compares, so drift is caught before a model is trained on the wrong bytes.
+
+## Comparison with kev, reflex, Jev
+
+See [docs/comparison.md](docs/comparison.md). Short version, same M4:
+
+- Japanese (JGLUE): grande E2B zero-shot JNLI 0.614 / JCQA 0.853; kev-0.5b
+  0.450 / 0.577; a 270M grande head trained on 3k records 0.540 / 0.670 at
+  47–77 ms per record.
+- kev's English suite (identical questions): kev 0.797, Jev 0.808, grande
+  E2B zero-shot 0.677 (banking77 excluded).
+- Browser, same 5-question Japanese ticket: grande E2B 4.2 s and all 5 right;
+  reflex 0.8B 6.7 s cold / 3.5 s warm and 3 of 5 wrong.
+- Vocabulary pruning cuts E2B Q4_0 from 2,841 MB to 1,273 MB with no JGLUE
+  accuracy change (`tools/prune_vocab.py`).
 
 ## Usage
 

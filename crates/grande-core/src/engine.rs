@@ -112,7 +112,10 @@ impl<B: Backend> Engine<B> {
             if max_k > crate::readout::LABELS.len() {
                 return Err(crate::Error::invalid(
                     "questions",
-                    format!("label readout supports at most {} options", crate::readout::LABELS.len()),
+                    format!(
+                        "label readout supports at most {} options",
+                        crate::readout::LABELS.len()
+                    ),
                 ));
             }
         }
