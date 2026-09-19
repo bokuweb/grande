@@ -15,17 +15,22 @@ on identical questions), and **latency** on one machine.
 |---|---|---|---|---|---|---|
 | **grande** Gemma 4 E2B it Q4_0, zero-shot label readout | – | **0.614** (n=1,217) | 0.252 → 0.088 (T=2.81) | **0.853** (n=559) | 0.044 → 0.046 | 700–750 |
 | grande Gemma 4 E2B, **vocab-pruned** (1.27 GB) | – | 0.580 (first 400; unpruned 0.575 on the same rows) | 0.279 | 0.855 (unpruned 0.855) | 0.046 | 570–840 |
-| grande Gemma 3 270M + LoRA + pointer head | 1,500 JNLI + 1,500 JCQA train, 2 ep | 0.540 (n=200) | 0.112 → 0.091 | 0.670 (n=200) | 0.074 | **47–77** |
+| grande Gemma 3 270M + LoRA + pointer head | 1,500 JNLI + 1,500 JCQA train, 2 ep | 0.540 (n=200) | 0.112 → 0.091 | 0.670 (n=200) | 0.074 | 47–77 |
+| grande 270M + head, **12k records** (6,000 + 6,000, 1 ep) | 12k | **0.710** (n=200) | 0.160 → 0.086 | 0.710 (n=200) | 0.050 | 73–77 |
+| grande 270M **12 of 18 layers** + head, 6k records, vocab-pruned (**256 MB**) | 6k | 0.685 (n=200) | 0.063 | 0.630 (n=200) | 0.064 | **26–34** |
 | **kev-0.5b** (Qwen2.5-0.5B, English-trained), via its `/v1/systemone` | 6 English datasets | 0.450 (n=300) | 0.168 | 0.577 (n=300) | 0.059 | 136–234 |
 | reflex | – | not run: Python engine needs CUDA; browser 0.8B below | | | | |
 | jev_local (LFM2.5-1.2B) / Jev | – | not run here | | | | |
 
-Reading: zero-shot Gemma 4 E2B is the most accurate on Japanese by a wide
-margin but badly overconfident on NLI until one temperature is applied. kev is
-an English model and it shows (JNLI 0.45 is near the 3-way chance of a
-label-skewed set). A 270M model with 3,000 training records already beats
-kev on Japanese at a quarter of its latency; that is the size/speed lever, not
-the accuracy ceiling.
+Reading: zero-shot Gemma 4 E2B is the most accurate on commonsense QA and
+badly overconfident on NLI until one temperature is applied. kev is an
+English model and it shows (JNLI 0.45 is near the 3-way chance of a
+label-skewed set). **A 270M head trained on 12k records beats the 2B
+zero-shot on JNLI (0.710 vs 0.614) at a tenth of the latency**, and a
+12-layer / 256 MB version keeps 0.685 at 26–34 ms per record — kev's own
+finding (data and a trained readout beat zero-shot size in-distribution)
+reproduced in Japanese. JCQA still favours the bigger backbone (0.853 vs
+0.71): commonsense is knowledge, NLI is a skill.
 
 ## 2. Accuracy, kev's frozen English suite (identical questions)
 
@@ -138,9 +143,20 @@ outside the corpus tokenizes into more pieces (synthetic contract state:
 Wikipedia articles keeps 86,897 tokens (33%), the overhead drops to +6.6%
 (585 tokens), and the Q4_0 file would be ~1.6 GB. Pick by workload.
 
-Beyond this: PLE / embeddings at Q3 with the blocks at Q4 (~1.0 GB), early
-exit / layer drop (needs training, RFC 07 §2.4), or the 270M backbone
-(0.55 GB f16, JNLI 0.54 / JCQA 0.67 with 3k records; data is the lever).
+The 270M backbone, same levers (`--keep-layers` trains the head on layer N
+and exports an N-layer GGUF; vocab pruning with the Wikipedia-broadened
+corpus keeps 91k tokens):
+
+| variant | size | JNLI | JCQA | 12 Q / 500-tok cold / warm | ms / record |
+|---|---|---|---|---|---|
+| 18 layers, 3k records | 551 MB | 0.540 | 0.670 | 168 / 86 ms | 47–77 |
+| 18 layers, 12k records | 551 MB | 0.710 | 0.710 | 177 / 92 ms | 73–77 |
+| 18 layers, 12k, vocab-pruned | 323 MB | ≈ same | ≈ same | 173 / 84 ms | |
+| **12 layers, 6k, vocab-pruned** | **256 MB** | 0.685 | 0.630 | **99 / 59 ms** | **26–34** |
+
+Dropping a third of the layers costs 2–8 pts and buys 1.5–1.7× on speed;
+the embedding table is 60% of the small model, so pruning matters more here
+than on E2B in relative terms.
 
 Speed (E2B, M4):
 
@@ -152,5 +168,5 @@ Speed (E2B, M4):
 | quantization level | no change (compute-bound) | measured |
 | shorter label template | ~−15% branch tokens | not done |
 | smaller backbone | 270M is 11× faster than E2B (86 vs 1,010 ms warm) | done |
-| early exit at layer 24/35 | ~−30% | needs training |
+| early exit (train with `--keep-layers`) | 270M 18 → 12 layers: 86 → 59 ms warm, −2 to −8 pts | done on 270M; E2B needs a GPU to train |
 | bigger GPU | prefill is compute-bound; a 4090-class GPU is ~30× an M4 | |

@@ -32,6 +32,8 @@ browser. Design notes live in `life/idea/local-jev`.
 - [x] `python/grande_train`: LoRA + pointer head with the same layout
       (token-for-token parity with `grande render` verified), merge → GGUF →
       served by the Rust runtime. Smoke-tested on Gemma 3 270M (MPS).
+- [x] trained 270M heads (3k / 12k records, 18 and 12 layers), vocab-pruned
+      to 323 / 256 MB.
 - [ ] trained Gemma 4 base weights (E2B base is 10 GB bf16; needs more than a
       16 GB laptop or a rented GPU)
 - [x] `grande mechanism`: isolation, packed vs separate, boundary forgery.
@@ -109,8 +111,9 @@ compares, so drift is caught before a model is trained on the wrong bytes.
 See [docs/comparison.md](docs/comparison.md). Short version, same M4:
 
 - Japanese (JGLUE): grande E2B zero-shot JNLI 0.614 / JCQA 0.853; kev-0.5b
-  0.450 / 0.577; a 270M grande head trained on 3k records 0.540 / 0.670 at
-  47–77 ms per record.
+  0.450 / 0.577; a 270M grande head trained on 12k records **0.710 / 0.710**
+  at 73–77 ms per record, and a 12-layer vocab-pruned 256 MB version
+  0.685 / 0.630 at 26–34 ms.
 - kev's English suite (identical questions): kev 0.797, Jev 0.808, grande
   E2B zero-shot 0.677 (banking77 excluded).
 - Browser, same 5-question Japanese ticket: grande E2B 4.2 s and all 5 right;
