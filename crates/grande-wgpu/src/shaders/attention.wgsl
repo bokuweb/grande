@@ -7,12 +7,13 @@
 // One KV head shared by `heads` query heads. Q is read from the layer's fused
 // projection buffer (row stride q_stride), K and V from a K/V buffer
 // [t][2 x HD] that may belong to an earlier layer (Gemma 4 shares K/V). A
-// workgroup of 128 handles 16 query rows = (16 / heads) tokens x heads with
-// their Q held as f16 in workgroup memory, and streams keys 8 at a time. A
-// tile no row can see is skipped (keys after the block, other branches).
-// Otherwise each invocation computes one full (row, key) score, then owns
-// HD/8 output dims of one row for the online softmax and P.V. Workgroup
-// memory ~12.5 KB at HD 256, ~24.5 KB at 512 (HD is substituted by the engine).
+// workgroup of 128 handles ROWS query rows = (ROWS / heads) tokens x heads
+// with their Q held as f16 in workgroup memory, and streams keys KB at a time
+// (ROWS x KB = 128). A tile no row can see is skipped (keys after the block,
+// other branches). Otherwise each invocation computes one full (row, key)
+// score, then owns HD/KB output dims of one row for the online softmax and
+// P.V. HD, ROWS and KB are substituted by the engine: 8 x 16 at HD 256
+// (~12.5 KB of workgroup memory), 16 x 8 at HD 512 (~24.5 KB).
 
 struct Params { t: u32, heads: u32, window: u32, q_stride: u32 }
 
@@ -23,20 +24,20 @@ struct Params { t: u32, heads: u32, window: u32, q_stride: u32 }
 @group(0) @binding(4) var<storage, read_write> out: array<f32>;
 
 const HD: u32 = 256u;
+const ROWS: u32 = 8u;      // query rows per workgroup = tokens * heads
+const KB: u32 = 16u;       // keys per tile; also invocations per row
 const HP: u32 = HD / 2u;   // f16 pairs per head row
-const ROWS: u32 = 16u;     // query rows per workgroup = tokens * heads
-const KB: u32 = 8u;        // keys per tile
-const CH: u32 = HD / 8u;   // output dims per invocation
+const CH: u32 = HD / KB;   // output dims per invocation
 const NV: u32 = CH / 4u;   // vec4 accumulators per invocation
 const NEG: f32 = -1.0e30;
 
 var<workgroup> qs: array<u32, ROWS * HP>;  // [ROWS][HP] f16 pairs
 var<workgroup> ks: array<u32, KB * HP>;    // [KB][HP] f16 pairs
 var<workgroup> s: array<f32, 128>;         // [ROWS][KB] masked scores
-var<workgroup> kpos: array<i32, 8>;
-var<workgroup> kseq: array<i32, 8>;
-var<workgroup> qpos: array<i32, 16>;
-var<workgroup> qseq: array<i32, 16>;
+var<workgroup> kpos: array<i32, KB>;
+var<workgroup> kseq: array<i32, KB>;
+var<workgroup> qpos: array<i32, ROWS>;
+var<workgroup> qseq: array<i32, ROWS>;
 var<workgroup> tile_any: bool;
 
 fn visible(qp: i32, qs_: i32, kp: i32, ks_: i32) -> bool {
@@ -49,9 +50,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let tb = ROWS / heads;
     let tok0 = wg.x * tb;
 
-    let row = li / KB;          // 0..16, both roles
+    let row = li / KB;          // 0..ROWS, both roles
     let key = li % KB;          // score role
-    let chunk = (li % 8u) * CH; // output role: CH dims of `row`
+    let chunk = key * CH;       // output role: CH dims of `row`
     let tok = tok0 + row / heads;
     let head = row % heads;
     let ok = tok < p.t;

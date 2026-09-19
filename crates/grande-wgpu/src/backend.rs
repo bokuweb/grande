@@ -58,6 +58,7 @@ impl WgpuBackend {
             let weights = Weights::load(&config_json, &read("model.safetensors")?)?;
             pollster::block_on(Engine::new(&weights, capacity, max_rows))?
         };
+        pollster::block_on(engine.warmup())?;
         Ok(WgpuBackend {
             engine,
             tokenizer,

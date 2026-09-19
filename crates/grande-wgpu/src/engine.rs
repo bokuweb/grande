@@ -22,7 +22,18 @@ const PARAM_SLOT: u64 = 256;
 /// Workgroup memory the attention kernel declares at a head_dim (see
 /// attention.wgsl): Q tile, K tile, scores, positions.
 fn attn_workgroup_bytes(hd: usize) -> u32 {
-    (16 * hd / 2 * 4 + 8 * hd / 2 * 4 + 128 * 4 + 8 * 8 + 16 * 8 + 4) as u32
+    let (rows, kb) = attn_tile(hd);
+    (rows * hd / 2 * 4 + kb * hd / 2 * 4 + 128 * 4 + kb * 8 + rows * 8 + 4) as u32
+}
+
+/// Attention workgroup shape (query rows, keys per tile) per head_dim; the
+/// product is the 128-invocation workgroup.
+fn attn_tile(hd: usize) -> (usize, usize) {
+    if hd >= 512 {
+        (16, 8)
+    } else {
+        (8, 16)
+    }
 }
 
 #[repr(C)]
@@ -122,6 +133,7 @@ enum K {
     Norm,
     Matmul,
     MatmulGated,
+    Logits,
     Qk,
     Attention,
     PlCombine,
@@ -135,6 +147,7 @@ impl K {
             K::Norm => "rmsnorm",
             K::Matmul => "matmul",
             K::MatmulGated => "matmul_gated",
+            K::Logits => "logits",
             K::Qk => "qk_prep",
             K::Attention => "attention",
             K::PlCombine => "pl_combine",
@@ -148,6 +161,7 @@ impl K {
             K::Norm => include_str!("shaders/rmsnorm.wgsl"),
             K::Matmul => include_str!("shaders/matmul.wgsl"),
             K::MatmulGated => include_str!("shaders/matmul_gated.wgsl"),
+            K::Logits => include_str!("shaders/logits.wgsl"),
             K::Qk => include_str!("shaders/qk_prep.wgsl"),
             K::Attention => include_str!("shaders/attention.wgsl"),
             K::PlCombine => include_str!("shaders/pl_combine.wgsl"),
@@ -164,6 +178,7 @@ impl K {
             K::Norm => vec![ro, ro, rw],
             K::Matmul => vec![ro, ro, ro, rw],
             K::MatmulGated => vec![ro, ro, ro, ro, ro, rw],
+            K::Logits => vec![ro, ro, ro, rw],
             K::Qk => vec![rw, ro, ro, ro, rw],
             K::Attention => vec![ro, ro, ro, rw],
             K::PlCombine => vec![ro, ro, ro, rw],
@@ -172,7 +187,7 @@ impl K {
     }
 
     fn reads_weights(self) -> bool {
-        matches!(self, K::Embed | K::Matmul | K::MatmulGated)
+        matches!(self, K::Embed | K::Matmul | K::MatmulGated | K::Logits)
     }
 
     fn uses_head_dim(self) -> bool {
@@ -194,10 +209,22 @@ impl Kernels {
                 src.push_str(include_str!("shaders/weight.wgsl"));
                 src.push('\n');
             }
-            src.push_str(&k.source().replace(
-                "const HD: u32 = 256u;",
-                &format!("const HD: u32 = {}u;", hd.max(256)),
-            ));
+            // Attention tile shape per head_dim: 8 rows x 16 keys fits HD 256
+            // in ~12.5 KB of workgroup memory; HD 512 needs 16 x 8 to stay
+            // under 32 KB.
+            let (rows, kb) = attn_tile(hd);
+            src.push_str(
+                &k.source()
+                    .replace(
+                        "const HD: u32 = 256u;",
+                        &format!("const HD: u32 = {}u;", hd.max(256)),
+                    )
+                    .replace(
+                        "const ROWS: u32 = 8u;",
+                        &format!("const ROWS: u32 = {rows}u;"),
+                    )
+                    .replace("const KB: u32 = 16u;", &format!("const KB: u32 = {kb}u;")),
+            );
             let label = format!("{}/{hd}/{quant}", k.name());
             let mut entries = vec![wgpu::BindGroupLayoutEntry {
                 binding: 0,
@@ -718,7 +745,7 @@ impl EngineBuilder {
             &[&x, &w("final_norm")?.data, &h],
         );
         let mm_logits = step(
-            K::Matmul,
+            K::Logits,
             0,
             embed_t.dtype.code(),
             "logits",
@@ -952,6 +979,21 @@ impl Engine {
         b.finish(capacity, max_rows)
     }
 
+    /// Run a two-token request once so the first real request does not pay
+    /// for the workspace's first touch (wgpu zero-initializes buffers on
+    /// first use; on Metal that is ~150 ms for a Gemma 4 workspace).
+    pub async fn warmup(&self) -> Result<()> {
+        let branches = [BranchTokens {
+            tokens: vec![grande_core::Token(0)],
+            want: vec![0],
+        }];
+        let rows = (self.config.per_layer_dim > 0)
+            .then(|| vec![0u8; 2 * self.config.per_layer_dim * self.config.layers * 2]);
+        self.evaluate_rows(&[self.config.bos], &branches, Want::Logits, rows.as_deref())
+            .await?;
+        Ok(())
+    }
+
     /// Gather the per-layer token table rows for `ids` (f16 little-endian,
     /// as `evaluate_rows` expects).
     pub fn gather_per_layer(table: &QTensor, ids: &[u32]) -> Vec<u8> {
@@ -985,7 +1027,18 @@ impl Engine {
             for b in branches {
                 ids.extend(b.tokens.iter().map(|t| t.0 as u32));
             }
-            Some(Self::gather_per_layer(table, &ids))
+            #[cfg(not(target_arch = "wasm32"))]
+            let t0 = std::time::Instant::now();
+            let rows = Self::gather_per_layer(table, &ids);
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.profile.is_some() {
+                eprintln!(
+                    "host gather: {:.1} ms for {} tokens",
+                    t0.elapsed().as_secs_f64() * 1e3,
+                    ids.len()
+                );
+            }
+            Some(rows)
         } else {
             None
         };
@@ -1160,7 +1213,13 @@ impl Engine {
                     window: if l.sliding { cfg.window as u32 } else { 0 },
                     q_stride: l.qkv_width as u32,
                 });
-                run("attention", &l.attn, off, (div_ceil(t, 16 / cfg.heads), 1));
+                let (rows, _) = attn_tile(l.hd);
+                run(
+                    "attention",
+                    &l.attn,
+                    off,
+                    (div_ceil(t * cfg.heads, rows), 1),
+                );
                 let attn_w = cfg.heads * l.hd;
                 let off = params.push(mm(d, attn_w));
                 run("mm_o", &l.mm_o, off, mm_wg(d));
@@ -1220,7 +1279,7 @@ impl Engine {
                 }
             }
             Some(prof) => {
-                if plan.len() as u32 * 2 > prof.capacity {
+                if (plan.len() as u32 + 1) * 2 > prof.capacity {
                     bail!("too many dispatches to profile");
                 }
                 for (i, dsp) in plan.iter().enumerate() {
@@ -1236,9 +1295,6 @@ impl Engine {
                     pass.set_bind_group(0, &dsp.step.bind, &[dsp.offset]);
                     pass.dispatch_workgroups(dsp.wg.0, dsp.wg.1, 1);
                 }
-                let n = plan.len() as u32 * 2;
-                enc.resolve_query_set(&prof.queries, 0..n, &prof.resolve, 0);
-                enc.copy_buffer_to_buffer(&prof.resolve, 0, &prof.readback, 0, n as u64 * 8);
             }
         }
         // Gather the wanted rows of the final hidden state.
@@ -1256,10 +1312,20 @@ impl Engine {
             Want::Hidden => d,
             Want::Logits => cfg.vocab,
         };
+        let mut n_timed = plan.len() as u32;
         if want == Want::Logits {
+            // Profiled as one more timestamped pass after the plan.
+            let timestamp_writes =
+                self.profile
+                    .as_ref()
+                    .map(|prof| wgpu::ComputePassTimestampWrites {
+                        query_set: &prof.queries,
+                        beginning_of_pass_write_index: Some(2 * n_timed),
+                        end_of_pass_write_index: Some(2 * n_timed + 1),
+                    });
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("logits"),
-                timestamp_writes: None,
+                timestamp_writes,
             });
             let off = params.push(MatmulParams {
                 m: wanted.len() as u32,
@@ -1269,7 +1335,14 @@ impl Engine {
             });
             pass.set_pipeline(pipeline_of(&self.mm_logits));
             pass.set_bind_group(0, &self.mm_logits.bind, &[off]);
-            pass.dispatch_workgroups(div_ceil(cfg.vocab, 64), div_ceil(wanted.len(), 64), 1);
+            pass.dispatch_workgroups(div_ceil(cfg.vocab, 256), 1, 1);
+            drop(pass);
+            n_timed += 1;
+        }
+        if let Some(prof) = &self.profile {
+            let n = 2 * n_timed;
+            enc.resolve_query_set(&prof.queries, 0..n, &prof.resolve, 0);
+            enc.copy_buffer_to_buffer(&prof.resolve, 0, &prof.readback, 0, n as u64 * 8);
         }
         let out_bytes = (wanted.len() * width * 4) as u64;
         let src = if want == Want::Logits {
@@ -1283,8 +1356,23 @@ impl Engine {
             bail!("parameter slots exhausted");
         }
         self.queue.write_buffer(&self.params, 0, &params.bytes);
-        self.queue.submit(Some(enc.finish()));
+        #[cfg(not(target_arch = "wasm32"))]
+        let t_enc = std::time::Instant::now();
+        let cb = enc.finish();
+        #[cfg(not(target_arch = "wasm32"))]
+        let t_fin = t_enc.elapsed();
+        self.queue.submit(Some(cb));
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.profile.is_some() {
+            eprintln!(
+                "encode finish {:.1} ms, submit {:.1} ms",
+                t_fin.as_secs_f64() * 1e3,
+                t_enc.elapsed().as_secs_f64() * 1e3
+            );
+        }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let t_submit = std::time::Instant::now();
         let slice = self.staging.slice(..out_bytes);
         let (tx, rx) = futures_channel::oneshot::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
@@ -1293,13 +1381,25 @@ impl Engine {
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| anyhow!("device poll: {e:?}"))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.profile.is_some() {
+            eprintln!(
+                "poll done {:.1} ms after submit",
+                t_submit.elapsed().as_secs_f64() * 1e3
+            );
+        }
         rx.await
             .context("map callback dropped")?
             .map_err(|e| anyhow!("map_async: {e:?}"))?;
         let mut data: Vec<f32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
         self.staging.unmap();
         if let Some(prof) = &self.profile {
-            self.report_profile(prof, &plan).await?;
+            #[cfg(not(target_arch = "wasm32"))]
+            eprintln!(
+                "submit to mapped: {:.1} ms",
+                t_submit.elapsed().as_secs_f64() * 1e3
+            );
+            self.report_profile(prof, &plan, n_timed as usize).await?;
         }
         if want == Want::Logits && cfg.softcap > 0.0 {
             let cap = cfg.softcap;
@@ -1331,8 +1431,13 @@ impl Engine {
     }
 
     /// Print GPU time per kernel for the dispatches just run (stderr).
-    async fn report_profile(&self, prof: &Profiler, plan: &[Dispatch<'_>]) -> Result<()> {
-        let n = plan.len() as u64 * 2;
+    async fn report_profile(
+        &self,
+        prof: &Profiler,
+        plan: &[Dispatch<'_>],
+        timed: usize,
+    ) -> Result<()> {
+        let n = timed as u64 * 2;
         let slice = prof.readback.slice(..n * 8);
         let (tx, rx) = futures_channel::oneshot::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
@@ -1348,19 +1453,23 @@ impl Engine {
         prof.readback.unmap();
         let mut by_name: Vec<(&str, f64, usize)> = Vec::new();
         let mut total = 0.0;
-        for (i, dsp) in plan.iter().enumerate() {
+        let names = plan
+            .iter()
+            .map(|d| d.name)
+            .chain(std::iter::repeat("logits"));
+        for (i, name) in names.take(timed).enumerate() {
             let ms = (ts[2 * i + 1].saturating_sub(ts[2 * i])) as f64 * prof.period_ns as f64 / 1e6;
             total += ms;
-            match by_name.iter_mut().find(|(n, _, _)| *n == dsp.name) {
+            match by_name.iter_mut().find(|(n, _, _)| *n == name) {
                 Some(e) => {
                     e.1 += ms;
                     e.2 += 1;
                 }
-                None => by_name.push((dsp.name, ms, 1)),
+                None => by_name.push((name, ms, 1)),
             }
         }
         by_name.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        eprintln!("gpu profile: {total:.2} ms over {} dispatches", plan.len());
+        eprintln!("gpu profile: {total:.2} ms over {timed} dispatches");
         for (name, ms, count) in by_name {
             eprintln!(
                 "  {name:<14} {ms:8.2} ms  ({count} x {:.3} ms)",
