@@ -117,16 +117,22 @@ def main():
     ap.add_argument("--corpus", nargs="+", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--extra", nargs="*", default=[], help="extra strings to keep tokens for")
+    ap.add_argument("--hf-tokenizer", default="unsloth/gemma-4-E2B", help="HF tokenizer matching the GGUF's vocabulary")
     a = ap.parse_args()
 
     r = GGUFReader(a.model)
     F = {f.name: f for f in r.fields.values()}
     tokens = field_str_array(F["tokenizer.ggml.tokens"])
-    scores = np.array([r.fields["tokenizer.ggml.scores"].parts[i][0] for i in F["tokenizer.ggml.scores"].data], dtype=np.float32)
+    scores = (
+        np.array([F["tokenizer.ggml.scores"].parts[i][0] for i in F["tokenizer.ggml.scores"].data], dtype=np.float32)
+        if "tokenizer.ggml.scores" in F
+        else None
+    )
     types = np.array([F["tokenizer.ggml.token_type"].parts[i][0] for i in F["tokenizer.ggml.token_type"].data], dtype=np.int32)
-    merges = field_str_array(F["tokenizer.ggml.merges"])
+    # BPE (gemma4) carries merges; SentencePiece unigram (gemma3, "llama") does not.
+    merges = field_str_array(F["tokenizer.ggml.merges"]) if "tokenizer.ggml.merges" in F else []
     V = len(tokens)
-    print(f"vocab {V}, merges {len(merges)}")
+    print(f"vocab {V}, merges {len(merges) or 'none (unigram)'}")
 
     # --- which tokens does the corpus use ---------------------------------
     # Use the HF tokenizer when available (exact), else the fallback BPE.
@@ -135,7 +141,7 @@ def main():
     try:
         from transformers import AutoTokenizer
 
-        hf = AutoTokenizer.from_pretrained("unsloth/gemma-4-E2B")
+        hf = AutoTokenizer.from_pretrained(a.hf_tokenizer)
         assert len(hf) >= V
         n = 0
         for text in list(corpus_texts(a.corpus)) + a.extra:
@@ -222,9 +228,11 @@ def main():
              GGUFValueType.FLOAT32: w.add_float32, GGUFValueType.BOOL: w.add_bool, GGUFValueType.UINT64: w.add_uint64,
              GGUFValueType.INT64: w.add_int64, GGUFValueType.FLOAT64: w.add_float64}[vt](name, val)
     w.add_array("tokenizer.ggml.tokens", [tokens[i] for i in keep])
-    w.add_array("tokenizer.ggml.scores", [float(scores[i]) for i in keep])
+    if scores is not None:
+        w.add_array("tokenizer.ggml.scores", [float(scores[i]) for i in keep])
     w.add_array("tokenizer.ggml.token_type", [int(types[i]) for i in keep])
-    w.add_array("tokenizer.ggml.merges", new_merges)
+    if merges:
+        w.add_array("tokenizer.ggml.merges", new_merges)
 
     keep_np = np.array(keep)
     for t in r.tensors:
