@@ -16,8 +16,9 @@ const GEMMA4 = { layout: "label", turn_start: "<|turn>", turn_end: "<turn|>", us
 
 export const MODELS = {
   "gemma-3-270m": { id: "onnx-community/gemma-3-270m-it-ONNX", kind: "causal", layout: GEMMA3, dtype: "q4f16", size: "0.27 GB", note: "smoke test only" },
-  "gemma-3-1b": { id: "onnx-community/gemma-3-1b-it-ONNX", kind: "causal", layout: GEMMA3, dtype: "q4f16", size: "0.76 GB", note: "default" },
-  "gemma-4-e2b": { id: "onnx-community/gemma-4-E2B-it-ONNX", kind: "gemma4", layout: GEMMA4, dtype: "q4f16", size: "3.4 GB", note: "PLE embeddings are half of it", padding: "right" },
+  "gemma-3-1b": { id: "onnx-community/gemma-3-1b-it-ONNX", kind: "causal", layout: GEMMA3, dtype: "q4f16", size: "0.76 GB", note: "fast" },
+  "gemma-4-e2b": { id: "onnx-community/gemma-4-E2B-it-ONNX", kind: "gemma4", layout: GEMMA4, dtype: "q4f16", size: "3.4 GB", note: "default", padding: "right" },
+  "gemma-4-e4b": { id: "onnx-community/gemma-4-E4B-it-ONNX", kind: "gemma4", layout: GEMMA4, dtype: "q4f16", size: "5.2 GB", note: "larger", padding: "right" },
 };
 
 const ZWNJ = "‌";

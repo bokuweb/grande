@@ -11,7 +11,7 @@ let mode = "batched";
 for (const [k, m] of Object.entries(MODELS)) {
   const o = document.createElement("option");
   o.value = k; o.textContent = `${k}  ·  ${m.size}  ·  ${m.note}`;
-  if (k === (params.get("model") ?? "gemma-3-1b")) o.selected = true;
+  if (k === (params.get("model") ?? "gemma-4-e2b")) o.selected = true;
   $("model").append(o);
 }
 for (const [k, p] of Object.entries(PRESETS)) {

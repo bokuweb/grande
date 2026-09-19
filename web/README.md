@@ -16,9 +16,9 @@ python3 -m http.server 8765 --directory web
 open "http://localhost:8765/?model=gemma-3-270m"
 ```
 
-`?model=` picks `gemma-3-270m` (0.27 GB, smoke test), `gemma-3-1b` (0.76 GB,
-default) or `gemma-4-e2b` (3.1 GB; half of it is the per-layer embedding
-table). Requires WebGPU (Chrome / Edge, Safari 26+).
+`?model=` picks `gemma-3-270m` (0.27 GB, smoke test), `gemma-3-1b` (0.76 GB),
+`gemma-4-e2b` (3.4 GB, default; half of it is the per-layer embedding table)
+or `gemma-4-e4b` (5.2 GB). Requires WebGPU (Chrome / Edge, Safari 26+).
 
 What runs where:
 
