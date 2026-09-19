@@ -12,7 +12,7 @@ let mode = "shared";
 let cached = new Set();
 // Models served from this site or a Hugging Face repo that turn out to be
 // in neither place (not published yet) stay listed but disabled.
-const DEFAULT_MODEL = "gemma-4-e2b";
+const DEFAULT_MODEL = "gemma-4-e2b-wgpu-ja";
 const unpublished = new Set();
 function renderModelOptions() {
   for (const o of $("model").options) {
@@ -29,7 +29,7 @@ for (const [k] of Object.entries(MODELS)) {
 }
 renderModelOptions();
 for (const [k, m] of Object.entries(MODELS)) {
-  if (!m.hub) continue;
+  if (!m.hub || params.get("base")) continue; // ?base= points at a local copy
   whereIs(m).then((where) => {
     if (where || cached.has(m.id)) return;
     unpublished.add(k);
@@ -167,7 +167,7 @@ $("load").addEventListener("click", async () => {
     const files = new Map();
     setStatus(`Fetching ${MODELS[model].id}…`, 0);
     const loaded = await loadEngine({
-      transformers, model,
+      transformers, model, modelBase: params.get("base") ?? undefined,
       onProgress: (info) => {
         if (info.status === "progress") {
           files.set(info.file, [info.loaded ?? 0, info.total ?? 0]);

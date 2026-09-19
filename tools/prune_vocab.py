@@ -56,7 +56,38 @@ def field_scalar(f):
     return f.parts[f.data[0]][0]
 
 
+# The label layout's own scaffolding (grande-core render.rs), so its pieces
+# survive whatever the corpus happens to contain.
+SCAFFOLD = ["State:\n", "\n\nQuestion: ", "\nA: ", "\nB: ", " — ", "\nAnswer with one letter.", "\nmodel\n", "user\n",
+            "\nA: true\nB: false\n", "\nA: 0\nB: 1\nC: 2\nD: 3\nE: 4\n"]
+
+
+def rendered_texts(doc):
+    """What the runtime actually tokenizes for a request: an object state is
+    rendered as `key: value` lines with nested values as compact JSON, so the
+    JSON punctuation glued to the text (`":"振込`, `","`) must be seen too."""
+    if not isinstance(doc, dict) or "state" not in doc:
+        return
+    st = doc["state"]
+    if isinstance(st, dict):
+        yield "\n".join(f"{k}: {v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, separators=(',', ':'))}" for k, v in st.items())
+    elif not isinstance(st, str):
+        yield json.dumps(st, ensure_ascii=False, separators=(",", ":"))
+    qs = doc.get("questions")
+    for q in qs.values() if isinstance(qs, dict) else (qs or []):
+        if not isinstance(q, dict):
+            continue
+        instr = q.get("instructions") or ""
+        opts = q.get("criteria") or q.get("legend") or {}
+        items = list(opts.items()) if isinstance(opts, dict) else [(str(o), None) for o in opts] if isinstance(opts, list) else []
+        lines = [f"Question: {instr}"]
+        for i, (k, d) in enumerate(items[:52]):
+            lines.append(f"{chr(65 + i)}: {k} — {d}" if isinstance(d, str) and d else f"{chr(65 + i)}: {k}")
+        yield "\n".join(lines) + "\nAnswer with one letter."
+
+
 def corpus_texts(paths):
+    yield from SCAFFOLD
     for pat in paths:
         for p in glob.glob(pat):
             with open(p, encoding="utf-8") as fh:
@@ -64,13 +95,16 @@ def corpus_texts(paths):
             try:
                 doc = json.loads(data)
                 yield from walk(doc)
+                yield from rendered_texts(doc)
                 continue
             except json.JSONDecodeError:
                 pass
             for line in data.splitlines():
                 if line.strip():
                     try:
-                        yield from walk(json.loads(line))
+                        row = json.loads(line)
+                        yield from walk(row)
+                        yield from rendered_texts(row)
                     except json.JSONDecodeError:
                         yield line
 
@@ -97,7 +131,9 @@ class Tokenizer:
         self.rank = {m: i for i, m in enumerate(merges)}
         self.tok2id = {t: i for i, t in enumerate(tokens)}
 
-    def bpe(self, word):
+    def bpe(self, word, trace=None):
+        """Rank-order BPE from characters; `trace` collects every piece that
+        exists at some point on the way (the merge path)."""
         parts = list(word)
         while len(parts) > 1:
             best, bi = None, -1
@@ -108,6 +144,8 @@ class Tokenizer:
             if best is None:
                 break
             parts[bi : bi + 2] = [parts[bi] + parts[bi + 1]]
+            if trace is not None:
+                trace.add(parts[bi])
         return parts
 
 
@@ -117,7 +155,7 @@ def main():
     ap.add_argument("--corpus", nargs="+", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--extra", nargs="*", default=[], help="extra strings to keep tokens for")
-    ap.add_argument("--hf-tokenizer", default="unsloth/gemma-4-E2B", help="HF tokenizer matching the GGUF's vocabulary")
+    ap.add_argument("--hf-tokenizer", default="unsloth/gemma-4-E2B", help="tokenizer.json path or Hub id matching the GGUF's vocabulary")
     a = ap.parse_args()
 
     r = GGUFReader(a.model)
@@ -139,17 +177,16 @@ def main():
     keep = set(i for i in range(V) if types[i] != 1)  # everything not NORMAL: control, byte, user-defined, unused
     used = set()
     try:
-        from transformers import AutoTokenizer
+        # `tokenizers` directly (a tokenizer.json path or a Hub id): transformers'
+        # AutoTokenizer chokes on the Gemma 4 tokenizer_config in some versions.
+        from tokenizers import Tokenizer as HfTokenizer
 
-        hf = AutoTokenizer.from_pretrained(a.hf_tokenizer)
-        assert len(hf) >= V
-        n = 0
-        for text in list(corpus_texts(a.corpus)) + a.extra:
-            for i in hf.encode(text, add_special_tokens=False):
-                if i < V:
-                    used.add(i)
-            n += 1
-        print(f"HF tokenizer: {n} texts, {len(used)} distinct tokens")
+        hf = HfTokenizer.from_file(a.hf_tokenizer) if a.hf_tokenizer.endswith(".json") else HfTokenizer.from_pretrained(a.hf_tokenizer)
+        assert hf.get_vocab_size() >= V
+        texts = list(corpus_texts(a.corpus)) + a.extra
+        for enc in hf.encode_batch(texts, add_special_tokens=False):
+            used.update(i for i in enc.ids if i < V)
+        print(f"HF tokenizer: {len(texts)} texts, {len(used)} distinct tokens")
     except Exception as e:  # noqa: BLE001
         print(f"HF tokenizer unavailable ({e}); using fallback BPE")
         bpe = Tokenizer(tokens, merges)
@@ -168,22 +205,24 @@ def main():
             keep.add(i)
 
     # --- merge closure ---------------------------------------------------------
+    # BPE reaches a token through one specific path of lower-ranked merges (the
+    # merges inside a final piece fire in rank order whatever surrounds it), so
+    # replay that path for every kept token and keep each intermediate piece.
+    # Keeping only *some* producing pair is not enough: the runtime would take
+    # the real path, hit a dropped intermediate, and stop short ("An"+"sw"+"er").
     tok2id = {t: i for i, t in enumerate(tokens)}
-    produced = {}  # result token -> (a, b)
-    for m in merges:
-        a_, b_ = m.split(" ", 1)
-        produced.setdefault(a_ + b_, (a_, b_))
-    stack = list(keep)
-    while stack:
-        i = stack.pop()
-        pair = produced.get(tokens[i])
-        if not pair:
-            continue
-        for part in pair:
-            j = tok2id.get(part)
-            if j is not None and j not in keep:
-                keep.add(j)
-                stack.append(j)
+    bpe = Tokenizer(tokens, merges)
+    path = set()
+    for i in list(keep):
+        if types[i] == 1:
+            path.update(tokens[i])  # the single-character start symbols
+            out = bpe.bpe(tokens[i], path)
+            if out != [tokens[i]]:
+                path.update(out)  # no path (the token is not merge-reachable); keep what it splits into
+    for piece in path:
+        j = tok2id.get(piece)
+        if j is not None:
+            keep.add(j)
     keep = sorted(keep)
     new_id = {old: new for new, old in enumerate(keep)}
     kept_set = set(keep)

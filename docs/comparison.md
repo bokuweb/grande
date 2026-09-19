@@ -144,7 +144,9 @@ the pruning corpus); the unpruned Q4_0 scores 0.530 / 0.857 on the same rows.
 | Q4_0, unpruned | 2,841 MB | 0.530 | 0.857 | 1.06 s |
 | Q8_0, pruned | 2,355 MB | 0.533 | 0.860 | 1.15 s |
 | Q4_K_M, pruned | 1,408 MB | 0.517 | 0.843 | 1.14 s |
-| **Q4_0, pruned** | **1,273 MB** | 0.580 (n=400) | 0.855 (n=400) | 1.10 s |
+| **Q4_0, pruned** | **1,273 MB** | 0.533 (0.580 at n=400) | 0.847 (0.855 at n=400) | 1.10 s |
+| Q4_0, pruned v2 (exact merge paths, 25,392 tokens) | 1,247 MB | 0.513 | 0.840 | |
+| IQ4_XS + Japanese imatrix, pruned | 1,226 MB | 0.513 | 0.867 | |
 | Q3_K_M, pruned | 1,181 MB | 0.520 | 0.793 | 1.18 s |
 | Q2_K, pruned | 969 MB | 0.223 | 0.240 | – (model collapses) |
 | Q3_K_M, embeddings kept at Q8 | 1,255 MB | 0.520 | 0.790 | |
@@ -170,6 +172,35 @@ outside the corpus tokenizes into more pieces (synthetic contract state:
 549 → 612 branch tokens, +11%). Adding 3,000 Japanese + 1,500 English
 Wikipedia articles keeps 86,897 tokens (33%), the overhead drops to +6.6%
 (585 tokens), and the Q4_0 file would be ~1.6 GB. Pick by workload.
+
+Pruned v2 fixes two things in `prune_vocab.py` that made even *in-corpus*
+text tokenize longer than the full vocabulary (ticket example: 341 vs 313
+tokens, and `refund_requested` moved 0.037 → 0.035): the merge closure kept
+one producing pair per token instead of the path BPE actually takes
+(`Answer` came out as `An`+`sw`+`er`, `責任` fell to bytes), and the corpus
+saw the raw JSON strings, not the rendered `key: {"nested":"json"}` lines
+and the `Question: / A: / Answer with one letter.` scaffolding. With the
+real path replayed per token the set is *smaller* (25,392) and the examples
+tokenize byte-for-byte like the full model; the contract preset's overhead
+drops from +9.7% to +5.5% (639 → 674 tokens). JGLUE valid is out of corpus
+either way; on the same 300 rows v2 is −2.0 / −0.7 pts against v1, inside
+the n=150 noise but not in v2's favour, so the JGLUE train rows that v1 kept
+tokens for by accident may be worth keeping on purpose (a wider corpus).
+
+The same token set in the browser: the wgpu export of the pruned GGUF
+(`tools/export_wgpu_gguf.py`) is 1,245 MB instead of 2.8 GB — the per-layer
+table alone 1.3 GB → 128 MB — with the same answers to four decimals on the
+ticket; the transformers.js export pruned by `tools/prune_onnx_vocab.py`
+is 3,381 → 1,465 MB, logits bit-identical to the full export on identically
+tokenized text (`web/README.md`).
+
+What is left in the 1,247 MB: FFN 876 MB (69%), attention q/o 149 MB,
+per-layer embeddings 147 MB, token embeddings 48 MB, `per_layer_model_proj`
+27 MB (bf16; llama-quantize hard-codes it unquantized), the rest 2%. So
+"embeddings at Q3" is worth ~40 MB, not 250: below this the lever is the
+blocks. IQ4_XS on the blocks buys −47 MB for free; each dropped layer is
+~30 MB *and* ~3% of prefill compute (needs the PLE columns sliced and
+`shared_kv_layers` adjusted, `llama-quantize --prune-layers` does neither).
 
 The 270M backbone, same levers (`--keep-layers` trains the head on layer N
 and exports an N-layer GGUF; vocab pruning with the Wikipedia-broadened

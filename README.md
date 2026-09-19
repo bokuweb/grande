@@ -11,9 +11,9 @@ grande targets Japanese, Gemma 4, quantized local inference, and (later) the
 browser. Design notes live in `life/idea/local-jev`.
 
 **Demo:** https://bokuweb.github.io/grande/ (WebGPU; nothing leaves the browser).
-Default model is Gemma 4 E2B zero-shot (3.4 GB, cached in the browser after
-the first visit); the trained `grande-270m-ja` (211 MB, 5 questions in
-~270 ms) is selectable.
+Gemma 4 E2B zero-shot on grande's own wgpu engine with a 25k-token
+vocabulary: 1.2 GB streamed from the Hub once and cached in the browser,
+5 questions over a 90-token state in ~1.1 s on an M4.
 
 ## Status
 
@@ -56,7 +56,7 @@ the first visit); the trained `grande-270m-ja` (211 MB, 5 questions in
       + every branch in one block-causal pass, native (Metal / Vulkan) and
       WebGPU from the same kernels. Parity with llama.cpp on the trained 270M
       and on E2B Q4_0; `grande --model <checkpoint dir>` and the
-      `grande-270m-ja-wgpu` / `gemma-4-e2b-wgpu` browser models.
+      `gemma-4-e2b-wgpu-ja` browser model (1.2 GB after vocabulary pruning).
 - [ ] IIA test, permutation flip rate on a JGLUE sample
 
 ## First numbers (2026-09-19, M-series Mac, Metal)
@@ -134,9 +134,11 @@ See [docs/comparison.md](docs/comparison.md). Short version, same M4:
 - Browser, same 5-question Japanese ticket: grande E2B 2.8 s cold / 2.5 s
   with the state resident (was 4.2 s re-reading the state per question) and
   all 5 right; reflex 0.8B 6.7 s cold / 3.5 s warm and 3 of 5 wrong.
-- Vocabulary pruning cuts E2B Q4_0 from 2,841 MB to 1,273 MB with no JGLUE
+- Vocabulary pruning cuts E2B Q4_0 from 2,841 MB to 1,247 MB with no JGLUE
   accuracy change (`tools/prune_vocab.py`); Q3_K_M on top reaches 1,181 MB
-  at −6 pts JCQA, Q2_K collapses.
+  at −6 pts JCQA, Q2_K collapses. The same token set takes the browser
+  E2B from 2.8 GB to 1.2 GB (wgpu engine) and the ONNX export from 3.4 GB
+  to 1.5 GB (`tools/prune_onnx_vocab.py`).
 - Idle M4, 12 questions over a 500-token state: E2B Q4_0 1.94 s cold /
   1.01 s with the state resident; 270M 168 / 86 ms. A 2,000-token state
   that was seen before comes back from the state cache in 2–4 ms (RAM) or
