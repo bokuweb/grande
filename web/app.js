@@ -59,7 +59,8 @@ function setPreset(name) {
   syncState(); syncQuestions();
 }
 $("preset").addEventListener("change", (e) => setPreset(e.target.value));
-setPreset("ticket");
+setPreset("contract");
+$("preset").value = "contract";
 $("temp").addEventListener("input", (e) => ($("tempv").textContent = Number(e.target.value).toFixed(1)));
 
 for (const b of $("mode").querySelectorAll("button")) {
