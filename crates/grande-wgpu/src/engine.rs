@@ -11,6 +11,8 @@ use wgpu::util::DeviceExt;
 use crate::model::{Config, Tensor16, Weights};
 
 const PARAM_SLOT: u64 = 256;
+/// Workgroup memory the attention kernel declares (see attention.wgsl).
+const ATTN_WORKGROUP_BYTES: u32 = 2048 * 4 + 1024 * 4 + 128 * 4 + 8 * 8 + 16 * 8;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -61,15 +63,6 @@ struct AttnParams {
     _pad: u32,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct GegluParams {
-    t: u32,
-    f: u32,
-    _p0: u32,
-    _p1: u32,
-}
-
 struct Kernel {
     pipeline: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
@@ -84,7 +77,6 @@ struct LayerBinds {
     norm_post_attn: wgpu::BindGroup,
     norm_pre_ff: wgpu::BindGroup,
     mm_gate_up: wgpu::BindGroup,
-    geglu: wgpu::BindGroup,
     mm_down: wgpu::BindGroup,
     norm_post_ff: wgpu::BindGroup,
     sliding: bool,
@@ -103,9 +95,9 @@ pub struct Engine {
     embed: Kernel,
     norm: Kernel,
     matmul: Kernel,
+    matmul_gated: Kernel,
     qk: Kernel,
     attention: Kernel,
-    geglu: Kernel,
     params: wgpu::Buffer,
     param_slots: usize,
     ids: wgpu::Buffer,
@@ -195,6 +187,16 @@ impl Engine {
             .max_storage_buffer_binding_size
             .max(limits.max_storage_buffer_binding_size);
         limits.max_buffer_size = adapter.limits().max_buffer_size.max(limits.max_buffer_size);
+        // The attention kernel keeps a 16-row query tile and 8 keys (f16) in
+        // workgroup memory: ~13 KB, under the 16 KB WebGPU baseline; take the
+        // adapter's limit anyway.
+        let wg_mem = adapter.limits().max_compute_workgroup_storage_size;
+        if wg_mem < ATTN_WORKGROUP_BYTES {
+            bail!(
+                "attention needs {ATTN_WORKGROUP_BYTES} bytes of workgroup memory; adapter allows {wg_mem}"
+            );
+        }
+        limits.max_compute_workgroup_storage_size = wg_mem;
         if limits.max_storage_buffer_binding_size < need {
             bail!(
                 "embedding table needs a {need}-byte storage binding; adapter allows {}",
@@ -295,7 +297,11 @@ impl Engine {
             include_str!("shaders/attention.wgsl"),
             &[ro, ro, rw],
         );
-        let geglu = kernel("geglu", include_str!("shaders/geglu.wgsl"), &[ro, rw]);
+        let matmul_gated = kernel(
+            "matmul_gated",
+            include_str!("shaders/matmul_gated.wgsl"),
+            &[ro, ro, ro, rw],
+        );
 
         let f32_buf = |name: &str, n: usize| {
             device.create_buffer(&wgpu::BufferDescriptor {
@@ -333,7 +339,6 @@ impl Engine {
         let qkv = f32_buf("qkv", capacity * qkv_w);
         let attn = f32_buf("attn", capacity * cfg.heads * cfg.head_dim);
         let a = f32_buf("a", capacity * d);
-        let gu = f32_buf("gu", capacity * 2 * cfg.ff);
         let act = f32_buf("act", capacity * cfg.ff);
         let rows = f32_buf("rows", max_rows * d);
         let logits = f32_buf("logits", max_rows * cfg.vocab);
@@ -344,7 +349,7 @@ impl Engine {
             mapped_at_creation: false,
         });
         // Enough parameter slots for every dispatch of one request.
-        let param_slots = 2 + cfg.layers * 11 + 2;
+        let param_slots = 2 + cfg.layers * 10 + 2;
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("params"),
             size: PARAM_SLOT * param_slots as u64,
@@ -389,7 +394,8 @@ impl Engine {
             let w_o = weight_buf("o", &l.o);
             let w_pa = weight_buf("post_attn_norm", &l.post_attn_norm);
             let w_pf = weight_buf("pre_ff_norm", &l.pre_ff_norm);
-            let w_gu = weight_buf("gate_up", &l.gate_up);
+            let w_gate = weight_buf("gate", &l.gate);
+            let w_up = weight_buf("up", &l.up);
             let w_down = weight_buf("down", &l.down);
             let w_pff = weight_buf("post_ff_norm", &l.post_ff_norm);
             layers.push(LayerBinds {
@@ -400,13 +406,12 @@ impl Engine {
                 mm_o: bind(&matmul, "mm_o", &[&attn, &w_o, &a]),
                 norm_post_attn: bind(&norm, "norm_post_attn", &[&a, &w_pa, &x]),
                 norm_pre_ff: bind(&norm, "norm_pre_ff", &[&x, &w_pf, &h]),
-                mm_gate_up: bind(&matmul, "mm_gate_up", &[&h, &w_gu, &gu]),
-                geglu: bind(&geglu, "geglu", &[&gu, &act]),
+                mm_gate_up: bind(&matmul_gated, "mm_gate_up", &[&h, &w_gate, &w_up, &act]),
                 mm_down: bind(&matmul, "mm_down", &[&act, &w_down, &a]),
                 norm_post_ff: bind(&norm, "norm_post_ff", &[&a, &w_pff, &x]),
                 sliding: cfg.sliding[i],
                 _weights: vec![
-                    w_in, w_qkv, w_qn, w_kn, w_o, w_pa, w_pf, w_gu, w_down, w_pff,
+                    w_in, w_qkv, w_qn, w_kn, w_o, w_pa, w_pf, w_gate, w_up, w_down, w_pff,
                 ],
             });
         }
@@ -444,9 +449,9 @@ impl Engine {
             embed,
             norm,
             matmul,
+            matmul_gated,
             qk,
             attention,
-            geglu,
             params,
             param_slots,
             ids,
@@ -459,7 +464,7 @@ impl Engine {
             layers,
             final_norm_bg,
             mm_logits_bg,
-            _keep: vec![x, qkv, attn, a, gu, act, embed_w, final_w],
+            _keep: vec![x, qkv, attn, a, act, embed_w, final_w],
             profile,
         })
     }
@@ -619,26 +624,13 @@ impl Engine {
                 run("norm", &self.norm, &l.norm_post_attn, off, (t as u32, 1));
                 let off = params.push(norm_p(0));
                 run("norm", &self.norm, &l.norm_pre_ff, off, (t as u32, 1));
-                let off = params.push(mm(2 * cfg.ff, d));
+                let off = params.push(mm(cfg.ff, d));
                 run(
                     "mm_gate_up",
-                    &self.matmul,
+                    &self.matmul_gated,
                     &l.mm_gate_up,
                     off,
-                    mm_wg(2 * cfg.ff),
-                );
-                let off = params.push(GegluParams {
-                    t: t as u32,
-                    f: cfg.ff as u32,
-                    _p0: 0,
-                    _p1: 0,
-                });
-                run(
-                    "geglu",
-                    &self.geglu,
-                    &l.geglu,
-                    off,
-                    (div_ceil(t * cfg.ff, 256), 1),
+                    mm_wg(cfg.ff),
                 );
                 let off = params.push(mm(d, cfg.ff));
                 run("mm_down", &self.matmul, &l.mm_down, off, mm_wg(d));

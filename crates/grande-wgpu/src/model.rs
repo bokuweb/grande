@@ -104,8 +104,8 @@ pub struct Layer {
     pub o: Tensor16,
     pub post_attn_norm: Tensor16,
     pub pre_ff_norm: Tensor16,
-    /// [gate(ff) | up(ff), d]
-    pub gate_up: Tensor16,
+    pub gate: Tensor16,
+    pub up: Tensor16,
     pub down: Tensor16,
     pub post_ff_norm: Tensor16,
 }
@@ -253,7 +253,8 @@ impl Weights {
                 o: l("self_attn.o_proj.weight")?,
                 post_attn_norm: l("post_attention_layernorm.weight")?,
                 pre_ff_norm: l("pre_feedforward_layernorm.weight")?,
-                gate_up: concat_rows(&[l("mlp.gate_proj.weight")?, l("mlp.up_proj.weight")?]),
+                gate: l("mlp.gate_proj.weight")?,
+                up: l("mlp.up_proj.weight")?,
                 down: l("mlp.down_proj.weight")?,
                 post_ff_norm: l("post_feedforward_layernorm.weight")?,
             });

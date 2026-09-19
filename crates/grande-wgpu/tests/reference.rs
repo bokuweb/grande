@@ -66,7 +66,8 @@ fn weights(seed: u64) -> Weights {
             o: r.tensor(&[D, HEADS * HD], 0.08),
             post_attn_norm: r.tensor(&[D], 0.5),
             pre_ff_norm: r.tensor(&[D], 0.5),
-            gate_up: r.tensor(&[2 * FF, D], 0.2),
+            gate: r.tensor(&[FF, D], 0.2),
+            up: r.tensor(&[FF, D], 0.2),
             down: r.tensor(&[D, FF], 0.15),
             post_ff_norm: r.tensor(&[D], 0.5),
         })
@@ -181,8 +182,9 @@ fn reference(w: &Weights, ids: &[u32], meta: &[(i32, i32)]) -> Vec<Vec<f32>> {
                 x[i][d] += a[d];
             }
             let h = rmsnorm(&x[i], &l.pre_ff_norm, cfg.eps);
-            let gu = linear(&h, &l.gate_up);
-            let act: Vec<f32> = (0..FF).map(|j| gelu(gu[j]) * gu[FF + j]).collect();
+            let g = linear(&h, &l.gate);
+            let u = linear(&h, &l.up);
+            let act: Vec<f32> = (0..FF).map(|j| gelu(g[j]) * u[j]).collect();
             let m = rmsnorm(&linear(&act, &l.down), &l.post_ff_norm, cfg.eps);
             for d in 0..D {
                 x[i][d] += m[d];
