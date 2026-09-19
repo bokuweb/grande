@@ -1,6 +1,6 @@
 export const PRESETS = {
   ticket: {
-    label: "問い合わせトリアージ",
+    label: "Support ticket triage (ja)",
     state: {
       ticket: { subject: "振込が失敗します", body: "今週に入ってから売上の振込が3回連続で失敗しています。2回メールを送りましたが返事がありません。外注先への支払いが止まっていて困っています。金曜までに直らなければ他社に乗り換えます。" },
       customer: { plan: "pro", tenure_months: 27 },
@@ -14,7 +14,7 @@ export const PRESETS = {
     },
   },
   contract: {
-    label: "契約条項レビュー",
+    label: "Contract clause review (ja)",
     state: {
       document: "業務委託契約書",
       clause_number: "第8条",
@@ -34,7 +34,7 @@ export const PRESETS = {
     },
   },
   isolation: {
-    label: "分離テスト（sibling の秘密）",
+    label: "Isolation test — secret in a sibling question (ja)",
     state: { memo: "本日の会議は15時から第2会議室で行います。資料は事前に共有済みです。" },
     questions: {
       q1: { type: "noul", instructions: "合言葉は「青い象」である。この会議は15時に始まるか" },
@@ -43,7 +43,7 @@ export const PRESETS = {
     },
   },
   isolation_state: {
-    label: "分離テスト（state に秘密）",
+    label: "Isolation test — secret in state (ja)",
     state: { memo: "本日の会議は15時から第2会議室で行います。資料は事前に共有済みです。合言葉は「青い象」です。" },
     questions: {
       q1: { type: "noul", instructions: "この会議は15時に始まるか" },

@@ -1,69 +1,170 @@
 <!doctype html>
-<html lang="ja">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>grande — 判断モデルをブラウザで</title>
+<title>grande</title>
+<meta name="description" content="Decision model runtime in the browser: state and typed questions in, calibrated probabilities out, one forward pass, no generation.">
 <style>
-  :root { --bg: #fafafa; --fg: #1a1a1a; --muted: #6b6b6b; --line: #ddd; --card: #fff; --accent: #2563eb; --bar: #dbeafe; --ok: #16a34a; --warn: #d97706; }
-  @media (prefers-color-scheme: dark) { :root { --bg: #111; --fg: #eee; --muted: #9a9a9a; --line: #333; --card: #1a1a1a; --accent: #60a5fa; --bar: #1e3a5f; } }
+  :root {
+    --bg: #f6f7f9; --surface: #ffffff; --surface-2: #f1f3f6; --fg: #0f172a; --muted: #64748b; --line: #e2e8f0;
+    --accent: #2563eb; --accent-fg: #ffffff; --accent-soft: #dbeafe; --ok: #16a34a; --warn: #d97706; --err: #dc2626;
+    --shadow: 0 1px 2px rgba(15, 23, 42, .04), 0 8px 24px -12px rgba(15, 23, 42, .12);
+    --radius: 12px; --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b0f17; --surface: #111827; --surface-2: #0f1522; --fg: #e5e7eb; --muted: #94a3b8; --line: #1f2937;
+      --accent: #3b82f6; --accent-soft: #1e3a8a; --ok: #22c55e; --warn: #f59e0b; --err: #f87171;
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.6);
+    }
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; }
-  main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 64px; }
-  h1 { font-size: 20px; margin: 0 0 4px; }
-  .sub { color: var(--muted); margin: 0 0 20px; }
-  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
-  select, button, input[type=range] { font: inherit; }
-  select, button { padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--fg); }
-  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
-  button:disabled { opacity: .5; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  main { max-width: 1120px; margin: 0 auto; padding: 0 20px 80px; }
+
+  header { display: flex; align-items: center; justify-content: space-between; padding: 20px 0 8px; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 650; font-size: 16px; letter-spacing: -.01em; }
+  .brand .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
+  .links { display: flex; gap: 14px; align-items: center; font-size: 13px; color: var(--muted); }
+  .links a { color: inherit; }
+
+  .hero { padding: 24px 0 28px; }
+  .hero h1 { font-size: 30px; line-height: 1.15; letter-spacing: -.02em; margin: 0 0 10px; font-weight: 700; }
+  .hero p { margin: 0; color: var(--muted); max-width: 720px; font-size: 15px; }
+  .hero code { font-family: var(--mono); font-size: 13px; background: var(--surface-2); padding: 1px 6px; border-radius: 6px; }
+
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
+  main > .card + .card { margin-top: 16px; }
+  .card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .card-title { font-weight: 600; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  .card-body { padding: 16px; }
+
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .field { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); min-width: 0; max-width: 100%; }
+  select, button { font: inherit; font-size: 13px; height: 34px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface); color: var(--fg); padding: 0 12px; }
+  select { max-width: 100%; min-width: 0; padding-right: 28px; appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 10px center; }
+  select:focus, button:focus-visible, textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button { cursor: pointer; font-weight: 500; transition: background .12s, opacity .12s; }
+  button:hover { background: var(--surface-2); }
+  button.primary { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
+  button.primary:hover { filter: brightness(1.06); }
+  button:disabled { opacity: .5; cursor: default; filter: none; }
+  kbd { font: 11px var(--mono); padding: 1px 5px; border-radius: 4px; background: rgba(255,255,255,.18); margin-left: 6px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; height: 34px; }
+  .seg button { border: 0; border-radius: 0; height: 100%; padding: 0 12px; color: var(--muted); }
+  .seg button + button { border-left: 1px solid var(--line); }
+  .seg button.on { background: var(--surface-2); color: var(--fg); font-weight: 600; }
+  input[type=range] { accent-color: var(--accent); width: 110px; }
+  .spacer { flex: 1; }
+  @media (max-width: 600px) { #model { flex: 1; } .card-head .row { width: 100%; } .field { flex: 1 1 100%; } .field select { flex: 1; } .seg { flex: 1 1 100%; } .seg button { flex: 1; } #run { flex: 1 1 100%; } }
+
+  #status { color: var(--muted); font-size: 13px; min-width: 200px; flex: 1; }
+  #status.ok { color: var(--ok); }
+  #status.err { color: var(--err); }
+  #barwrap { height: 4px; background: var(--line); border-radius: 2px; margin-top: 12px; overflow: hidden; }
+  #bar { height: 100%; background: var(--accent); width: 0; transition: width .2s; }
+  #barwrap[hidden] { display: none; }
+
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
-  textarea { width: 100%; min-height: 260px; font: 12px/1.4 ui-monospace, Menlo, monospace; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--fg); resize: vertical; }
-  label.small { font-size: 12px; color: var(--muted); display: block; margin-bottom: 4px; }
-  #status { color: var(--muted); font-size: 13px; }
-  #bar { height: 4px; background: var(--accent); width: 0; transition: width .2s; border-radius: 2px; }
-  #barwrap { height: 4px; background: var(--line); border-radius: 2px; margin: 8px 0 16px; }
-  table { border-collapse: collapse; width: 100%; background: var(--card); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
-  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
-  th { font-weight: 600; color: var(--muted); font-size: 12px; }
-  .opt { display: grid; grid-template-columns: 140px 1fr 60px; gap: 8px; align-items: center; font-size: 12px; }
-  .opt .track { height: 10px; background: var(--bar); border-radius: 5px; overflow: hidden; }
-  .opt .fill { height: 100%; background: var(--accent); }
+  .editor label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 6px; font-weight: 500; }
+  .ed { position: relative; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); overflow: hidden; }
+  .ed:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .ed pre, .ed textarea { margin: 0; width: 100%; min-height: 280px; font: 12.5px/1.5 var(--mono); padding: 10px 12px; tab-size: 2; white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere; }
+  .ed pre { position: absolute; inset: 0; pointer-events: none; overflow: hidden; color: var(--fg); }
+  .ed textarea { position: relative; display: block; border: 0; background: transparent; color: transparent; caret-color: var(--fg); resize: vertical; outline: none; }
+  .ed textarea::selection { background: var(--accent-soft); }
+  .tk-k { color: #7c3aed; } .tk-s { color: #0f766e; } .tk-n { color: #b45309; } .tk-b { color: #2563eb; } .tk-p { color: var(--muted); }
+  @media (prefers-color-scheme: dark) { .tk-k { color: #c4b5fd; } .tk-s { color: #6ee7b7; } .tk-n { color: #fcd34d; } .tk-b { color: #93c5fd; } }
+
+  .usage { display: flex; gap: 8px; flex-wrap: wrap; margin: 20px 0 12px; min-height: 24px; align-items: center; }
+  .chip { font: 12px var(--mono); color: var(--muted); background: var(--surface); border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; }
+  .usage .err { color: var(--err); font-family: inherit; }
+
+  .results { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+  .q { padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+  .q-head { display: flex; align-items: baseline; gap: 8px; }
+  .q-id { font-weight: 600; font-family: var(--mono); font-size: 13px; }
+  .badge { font: 11px/1 var(--mono); padding: 3px 7px; border-radius: 999px; background: var(--surface-2); color: var(--muted); border: 1px solid var(--line); }
+  .q-inst { color: var(--muted); font-size: 13px; margin: -4px 0 2px; }
+  .opts { display: flex; flex-direction: column; gap: 6px; }
+  .opt { display: grid; grid-template-columns: minmax(0, 1fr) 52px; gap: 8px; align-items: center; font-size: 12.5px; }
+  .opt .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .opt .track { grid-column: 1 / -1; height: 6px; background: var(--surface-2); border-radius: 3px; overflow: hidden; margin-top: -2px; }
+  .opt .fill { height: 100%; background: var(--line); border-radius: 3px; transition: width .3s ease-out; }
   .opt.best .name { font-weight: 600; }
-  .mono { font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
-  .usage { color: var(--muted); font-size: 12px; margin: 8px 0; }
-  details pre { background: var(--card); border: 1px solid var(--line); padding: 10px; border-radius: 6px; overflow: auto; font-size: 12px; }
+  .opt.best .fill { background: var(--accent); }
+  .opt .pct { font-family: var(--mono); text-align: right; color: var(--muted); }
+  .opt.best .pct { color: var(--fg); }
+  .q-foot { display: flex; justify-content: space-between; align-items: center; margin-top: auto; padding-top: 8px; border-top: 1px solid var(--line); font: 12px var(--mono); color: var(--muted); }
+  .q-foot b { color: var(--fg); font-weight: 600; }
   .warn { color: var(--warn); }
+
+  details { margin-top: 20px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 13px; user-select: none; }
+  details pre { background: var(--surface); border: 1px solid var(--line); padding: 12px; border-radius: 8px; overflow: auto; font: 12px/1.5 var(--mono); margin-top: 10px; }
+  footer { margin-top: 40px; color: var(--muted); font-size: 12px; }
 </style>
 </head>
 <body>
 <main>
-  <h1>grande — 判断モデルをブラウザで</h1>
-  <p class="sub">state と型付き質問（choice / score / noul）を入れると、生成せずに 1 forward pass で全質問の確率分布が返ります。すべて自分の GPU（WebGPU）で動き、何もアップロードしません。<a href="https://github.com/bokuweb/grande">github.com/bokuweb/grande</a></p>
+  <header>
+    <div class="brand"><span class="dot"></span>grande</div>
+    <nav class="links">
+      <span id="gpu" class="badge">WebGPU</span>
+      <a href="https://github.com/bokuweb/grande">GitHub</a>
+    </nav>
+  </header>
 
-  <div class="row">
-    <select id="model"></select>
-    <button id="load" class="primary">モデルを読み込む</button>
-    <span id="status">未読み込み</span>
-  </div>
-  <div id="barwrap"><div id="bar"></div></div>
+  <section class="hero">
+    <h1>Typed questions in, calibrated probabilities out.</h1>
+    <p>Give the model a <code>state</code> and a set of typed questions (<code>choice</code>, <code>score</code>, <code>noul</code>). Every question is answered in a single forward pass with no text generation: the answer is read straight from the label logits. Everything runs on your GPU through WebGPU; nothing leaves the browser.</p>
+  </section>
 
-  <div class="row">
-    <label>プリセット <select id="preset"></select></label>
-    <label>温度 <input type="range" id="temp" min="0.5" max="4" step="0.1" value="1"> <span id="tempv" class="mono">1.0</span></label>
-    <label>実行方式 <select id="mode"><option value="batched">batched（1 forward）</option><option value="sequential">sequential（質問ごと）</option></select></label>
-    <button id="run" class="primary" disabled>実行 ⌘↵</button>
-  </div>
+  <section class="card">
+    <div class="card-head">
+      <span class="card-title">Model</span>
+    </div>
+    <div class="card-body">
+      <div class="row">
+        <select id="model" aria-label="Model"></select>
+        <button id="load" class="primary">Load model</button>
+        <span id="status">Not loaded. Weights stream from the Hugging Face Hub and are cached by the browser.</span>
+      </div>
+      <div id="barwrap" hidden><div id="bar"></div></div>
+    </div>
+  </section>
 
-  <div class="grid">
-    <div><label class="small">state（JSON または文字列）</label><textarea id="state"></textarea></div>
-    <div><label class="small">questions（JSON）</label><textarea id="questions"></textarea></div>
-  </div>
+  <section class="card">
+    <div class="card-head">
+      <span class="card-title">Request</span>
+      <div class="row">
+        <label class="field">Preset <select id="preset"></select></label>
+        <label class="field">Temperature <input type="range" id="temp" min="0.5" max="4" step="0.1" value="1"> <span id="tempv" class="chip">1.0</span></label>
+        <div class="seg" id="mode" role="radiogroup" aria-label="Execution mode">
+          <button type="button" data-mode="batched" class="on" title="One forward pass for every question">Batched</button>
+          <button type="button" data-mode="sequential" title="One forward pass per question">Sequential</button>
+        </div>
+        <button id="run" class="primary" disabled>Run<kbd>⌘↵</kbd></button>
+      </div>
+    </div>
+    <div class="card-body">
+      <div class="grid editor">
+        <div><label for="state">state — JSON or plain text</label><div class="ed"><pre id="state-hl" aria-hidden="true"></pre><textarea id="state" spellcheck="false"></textarea></div></div>
+        <div><label for="questions">questions — JSON</label><div class="ed"><pre id="questions-hl" aria-hidden="true"></pre><textarea id="questions" spellcheck="false"></textarea></div></div>
+      </div>
+    </div>
+  </section>
 
   <div class="usage" id="usage"></div>
-  <div id="results"></div>
-  <details><summary>レスポンス JSON</summary><pre id="raw"></pre></details>
+  <div id="results" class="results"></div>
+  <details><summary>Response JSON</summary><pre id="raw"></pre></details>
+
+  <footer>Zero-shot label readout on Gemma 3 / Gemma 4 ONNX via transformers.js. The request validation, prompt layout and probability math are the same Rust crate as the native runtime, compiled to wasm.</footer>
 </main>
 <script type="module" src="./app.js"></script>
 </body>
