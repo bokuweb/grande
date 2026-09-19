@@ -40,17 +40,24 @@ E2B label readout with no English tuning at all.
 
 | task | n | kev-0.5b (trained on these sources) | Jev | grande E2B zero-shot |
 |---|---|---|---|---|
-| agnews (4-way) | 80 | 0.913 | 0.813 | 0.775 |
-| agnews_yn (noul) | 160 | 0.925 | 0.906 | 0.844 |
+| agnews (4-way) | 80 | 0.913 | 0.813 | 0.787 |
+| agnews_yn (noul) | 160 | 0.925 | 0.906 | 0.831 |
 | boolq (noul) | 80 | 0.788 | **0.925** | 0.838 |
-| mnli (3-way) | 80 | 0.775 | 0.825 | 0.512 |
-| sst5 (5 levels) | 80 | 0.575 | 0.613 | 0.375 |
-| yelp (5 levels) | 80 | 0.613 | 0.650 | 0.425 |
+| mnli (3-way) | 80 | 0.775 | 0.825 | 0.500 |
+| sst5 (5 levels) | 80 | 0.575 | 0.613 | 0.388 |
+| yelp (5 levels) | 80 | 0.613 | 0.650 | 0.450 |
 | yelp_yn (noul) | 80 | 0.863 | 0.825 | 0.800 |
-| banking77 (77-way) | 80 | 0.800 | 0.838 | – (label readout caps at 52 options) |
-| **all but banking77** | 640 | **0.797** | **0.808** | **0.677** |
+| banking77 (77-way) | 80 | 0.800 | 0.838 | 0.575 (two-stage: 2 groups of 39 / 38, 52 finalists, 4.7 s) |
+| **all but banking77** | 640 | **0.797** | **0.808** | **0.678** |
+| all | 720 | – | – | 0.667 |
 
-grande ECE on this suite: 0.198 raw (no temperature), NLL 0.994.
+grande ECE on this suite: 0.197 raw (no temperature), NLL 1.337 (banking77's
+NLL is 4.04: in 6 of 80 records the gold intent was cut in the group stage
+and gets probability 0; the other 28 misses are second-stage errors).
+The nested and conversation states of the suite (`[{"role": …}]`) are
+rendered as `path: value` lines since the state-flattening change; the
+per-task numbers moved by at most ±1.3 points and the 640-question total
+by +0.1.
 
 Transfer (`transfer-v2` dev, clean, 560 questions; kev/Jev published numbers
 are on the older transfer-v1 sample of the same sources, so only rough):

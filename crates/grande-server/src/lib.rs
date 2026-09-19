@@ -128,6 +128,19 @@ fn diag_headers(diag: &grande_core::Diagnostics, model: &str, ms: u128) -> Heade
     if let Some(src) = diag.prefix_source {
         put(&mut h, "x-grande-state", src.as_str().to_string());
     }
+    if diag.orders > 1 {
+        put(&mut h, "x-grande-orders", diag.orders.to_string());
+        if let Some(s) = diag.order_spread.values().cloned().reduce(f64::max) {
+            put(&mut h, "x-grande-order-spread-max", format!("{s:.4}"));
+        }
+    }
+    if !diag.two_stage.is_empty() {
+        put(
+            &mut h,
+            "x-grande-two-stage",
+            diag.two_stage.keys().cloned().collect::<Vec<_>>().join(","),
+        );
+    }
     put(&mut h, "x-grande-latency-ms", ms.to_string());
     if let Some(m) = diag.candidate_mass.values().cloned().reduce(f64::min) {
         put(&mut h, "x-grande-candidate-mass-min", format!("{m:.4}"));
@@ -211,13 +224,8 @@ async fn permute<B: Backend + Send + 'static>(
             json!({"detail": "engine poisoned"}),
         )
     })?;
-    for r in 0..n {
-        // Deterministic rotations / reversals; enough to expose position bias.
-        let mut order: Vec<usize> = (0..k).collect();
-        order.rotate_left(r % k);
-        if r % 2 == 1 {
-            order.reverse();
-        }
+    // Deterministic rotations, then reversals; enough to expose position bias.
+    for order in grande_core::math::option_orders(k, n) {
         let mut orders = IndexMap::new();
         orders.insert(qid.clone(), order.clone());
         let (dists, _) = engine
