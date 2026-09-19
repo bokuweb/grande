@@ -71,7 +71,8 @@ on an M4.
 - [x] state rendered as `path: value` lines (`ticket.messages[0].text: …`),
       so questions can point at nested fields and conversation arrays the
       way TypeSafe's docs do; Python renderer mirrors it.
-- [ ] IIA test
+- [x] `grande iia`: kev's IIA test (log-odds shift from one irrelevant
+      option) on JGLUE JCQA and kev's suite.
 
 ## First numbers (2026-09-19, M-series Mac, Metal)
 
@@ -115,6 +116,27 @@ while other GPU jobs ran; see `grande bench` for clean numbers.
 
 Mechanism tests (`grande mechanism`): isolation sibling 0.098 / absent 0.098 /
 state 0.996, packed vs separate 3.5e-4, forged delimiters add no options.
+
+IIA (`grande iia`, kev's test): one irrelevant option is appended to a
+3–10-way Choice ("紫 — 紫という色", "税金 — 無関係：四半期の税務申告", …)
+and the log-odds between the original top-2 options are compared before
+and after. A model that reads the options against the state should not
+move; a letter-position or "pick the middle" heuristic does.
+
+| Choices | n | mean \|Δ log-odds\| | p90 | argmax flips | mass on the distractor |
+|---|---|---|---|---|---|
+| JCQA valid, E2B zero-shot | 250 | 0.54 | 1.20 | 3.6% | 2.4% |
+| JCQA valid, `--orders 3` | 250 | 0.47 | 1.03 | 4.4% | 1.5% |
+| kev suite (agnews, mnli), E2B zero-shot | 160 | 0.46 | 1.10 | 8.1% | 1.2% |
+| kev-0.5b (trained, kev's own number) | – | 0.13 | 0.34 | – | – |
+
+The distractor itself is almost never chosen, but its presence moves the
+odds between the real options by ~0.5 nats on average, four times kev's
+trained readout. Order averaging trims the shift a little and removes most
+of its sign (mean shift +0.39 → +0.14: unaveraged, the runner-up loses more
+than the top option when a sixth line appears). This is a zero-shot
+letter readout's weakness, not the packing's — the pointer head is what
+should close it, once a Gemma 4 head is trained.
 
 ## Training loop
 
