@@ -84,6 +84,9 @@ enum Cmd {
         /// alternating reversal) and report the argmax flip rate.
         #[arg(long, default_value_t = 1)]
         permute: usize,
+        /// Pointer head weights (safetensors); switches to the packed layout.
+        #[arg(long)]
+        head: Option<PathBuf>,
     },
     /// Prefill throughput: a synthetic state of about N tokens and Q
     /// questions, packed, repeated a few times.
@@ -146,6 +149,24 @@ enum Cmd {
     },
 }
 
+/// Pick layout + readout: a pointer head switches to the packed delimiter
+/// layout, otherwise the zero-shot label readout on the chat layout.
+fn readout_for(backend: &LlamaEngine, head: Option<&PathBuf>) -> Result<(Renderer, Readout)> {
+    match head {
+        Some(p) => {
+            let h = grande_core::readout::safetensors::load(&std::fs::read(p)?)?;
+            anyhow::ensure!(
+                h.d == backend.n_embd(),
+                "head d={} but model n_embd={}",
+                h.d,
+                backend.n_embd()
+            );
+            Ok((Renderer::gemma_pointer(), Readout::Pointer(h)))
+        }
+        None => Ok((Renderer::gemma_label(), Readout::Label)),
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -159,6 +180,7 @@ fn main() -> Result<()> {
             out,
             n_ctx,
             permute,
+            head,
         } => {
             use grande_eval::jglue::{self, Task};
             use grande_eval::report::{summarize, Row};
@@ -209,12 +231,13 @@ fn main() -> Result<()> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("model")
                 .to_lowercase();
-            let mut engine = Engine::new(
-                backend,
-                Renderer::gemma_label(),
-                Readout::Label,
-                name.clone(),
-            );
+            let (renderer, readout) = readout_for(&backend, head.as_ref())?;
+            let layout = if head.is_some() {
+                "gemma_pointer"
+            } else {
+                "gemma_label"
+            };
+            let mut engine = Engine::new(backend, renderer, readout, name.clone());
             let mut rows = Vec::with_capacity(items.len());
             let mut file = std::io::BufWriter::new(std::fs::File::create(&rows_path)?);
             use std::io::Write;
@@ -277,7 +300,7 @@ fn main() -> Result<()> {
             let summary = summarize(&rows);
             let full = serde_json::json!({
                 "model": name, "task": task, "data": data, "revision": jglue::REVISION,
-                "n": rows.len(), "readout": "label", "layout": "gemma_label", "summary": summary,
+                "n": rows.len(), "layout": layout, "head": head, "summary": summary,
             });
             std::fs::write(
                 out.join("summary.json"),
@@ -517,19 +540,7 @@ fn main() -> Result<()> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("model")
                 .to_lowercase();
-            let (renderer, readout) = match head {
-                Some(p) => {
-                    let h = grande_core::readout::safetensors::load(&std::fs::read(&p)?)?;
-                    anyhow::ensure!(
-                        h.d == backend.n_embd(),
-                        "head d={} but model n_embd={}",
-                        h.d,
-                        backend.n_embd()
-                    );
-                    (Renderer::gemma_pointer(), Readout::Pointer(h))
-                }
-                None => (Renderer::gemma_label(), Readout::Label),
-            };
+            let (renderer, readout) = readout_for(&backend, head.as_ref())?;
             let mut engine = Engine::new(backend, renderer, readout, name);
             engine.temperature = temperature;
 

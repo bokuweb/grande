@@ -29,12 +29,22 @@ from .model import DecisionModel
 from .render import Renderer
 
 
-def text_backbone(model):
-    """Return the decoder stack without lm_head for Gemma 4 checkpoints."""
-    m = model
+def backbone_path(model) -> list[str]:
+    """Attribute path from the CausalLM wrapper to the decoder stack without
+    lm_head: `["model"]` for text-only checkpoints, `["model", "language_model"]`
+    for the multimodal Gemma 4 E2B / E4B ones."""
+    path, m = [], model
     for attr in ("model", "language_model"):
         if hasattr(m, attr):
             m = getattr(m, attr)
+            path.append(attr)
+    return path
+
+
+def text_backbone(model):
+    m = model
+    for attr in backbone_path(model):
+        m = getattr(m, attr)
     return m
 
 
