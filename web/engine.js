@@ -50,7 +50,9 @@ function logSumExp(row, ids) {
 let wasmReady = null;
 
 export async function loadEngine({ transformers, model = "gemma-3-1b", device = "webgpu", onProgress } = {}) {
-  wasmReady ??= init();
+  // Fetch the wasm with a cache-busting query: GitHub Pages caches for 10 min
+  // and a stale wasm with a fresh grande.js fails at Table.grow.
+  wasmReady ??= init({ module_or_path: new URL(`./pkg/grande_bg.wasm?v=${Date.now()}`, import.meta.url) });
   await wasmReady;
   const spec = MODELS[model];
   if (!spec) throw new Error(`unknown model ${model}`);
