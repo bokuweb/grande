@@ -26,28 +26,47 @@ What runs where:
   Gemma 4 turn markers), option labels, temperature / softmax / confidence,
   the TypeSafe-shaped response. Same crate as the native runtime.
 - `engine.js`: tokenizes the rendered segments (control tokens in caller text
-  are neutralized the same way as native), runs one batched forward with
-  `num_logits_to_keep = 1`, reads the label logits and candidate mass.
+  are neutralized the same way as native), decodes the state once into a KV
+  cache, continues every question from it with `num_logits_to_keep = 1`, and
+  reads the label logits and candidate mass.
 
-Modes: `batched` is one forward where every row re-reads the state (ORT's
-GroupQueryAttention refuses a batched multi-token continuation from a cache,
-so state-once + one-forward is not available in the browser yet);
-`sequential` is one forward per question, for comparison.
+Modes:
 
-Padding: Gemma 3 causal-LM exports honour `attention_mask` / `position_ids`,
-so rows are left-padded and only one logits position is kept. The Gemma 4
-multimodal export does not — padded rows read the pads as context and the
-answers are wrong (noul questions collapsed to ~0.97 with candidate mass
-0.001). For it the batch is right-padded and logits are kept at every
-position (capped at 64M elements, above that it falls back to sequential).
+- `shared` (default): the state is decoded once and its KV cache stays
+  resident in the engine; every question continues from that cache as its
+  own forward, so a branch sees the state and itself only, exactly the
+  native layout. The next request over the same state skips the state pass
+  (`usage.state_resident: true`). One forward per question because ORT's
+  GroupQueryAttention requires `batch_size == 1` when a multi-token input
+  continues from a cache — and a refused run leaves the session unusable, so
+  the tiled-cache single forward is not attempted. A branch forward is
+  short (only its own tokens), so what remains is ORT's per-dispatch cost.
+- `batched`: one forward where every row is `state + question`, right- or
+  left-padded. The state is re-read once per question.
+- `sequential`: one forward per `state + question`, for comparison.
 
-Measured (M4, 16 GB, Chromium WebGPU, warm):
+Padding (`batched` only): Gemma 3 causal-LM exports honour `attention_mask`
+/ `position_ids`, so rows are left-padded and only one logits position is
+kept. The Gemma 4 multimodal export does not — padded rows read the pads as
+context and the answers are wrong (noul questions collapsed to ~0.97 with
+candidate mass 0.001). For it the batch is right-padded and logits are kept
+at every position (capped at 64M elements, above that it falls back to
+sequential). `shared` never pads, so it is not affected.
 
-| model | request | tokens | batched | sequential |
-|---|---|---|---|---|
-| gemma-3-270m q4f16 | ticket, 5 questions | 673 | 2.0 s | 1.7 s |
-| gemma-4-E2B q4f16 | ticket, 5 questions | 673 | 4.2 s | 4.3 s |
-| gemma-4-E2B q4f16 | contract, 8 questions | 2,263 | 11.4 s | — |
+Measured (M4, 16 GB, Chromium WebGPU, Gemma 4 E2B q4f16; `shared` cold =
+state decoded in this request, warm = state already resident):
 
+| request | tokens (shared / batched) | shared cold | shared warm | batched | sequential |
+|---|---|---|---|---|---|
+| ticket, 5 questions, 90-token state | 313 / 673 | 2.8 s | 2.5 s | 4.6 s | 4.2 s |
+| contract, 8 questions, 232-token state | 639 / 2,263 | 5.2 s | 3.1 s | 12.1 s | 13.1 s |
+
+gemma-3-270m on the contract: shared 1.7 s cold / 0.9 s warm, sequential
+3.2 s. The remaining cost per branch on E2B is ~90 ms fixed + ~7 ms per
+token (ORT WebGPU at small batch), which is why the ticket's five ~45-token
+branches take 2.5 s even with the state resident.
+
+`shared` and `sequential` agree to max |Δp| 1e-5 on the contract (logits
+differ by up to 0.8 in fp16 where the probability is already saturated);
 Gemma 4 E2B answers in the browser match the native llama.cpp run
 (`refund_requested` 0.010 vs 0.037 Q4_0; the rest within a few 1e-3).

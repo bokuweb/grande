@@ -7,15 +7,22 @@
 //! attends to prefix cells and to its own sequence only, which is exactly the
 //! block-causal mask kev uses in PyTorch. Positions restart at `prefix_len`
 //! per branch, so every branch is "state, then this question".
+//!
+//! The prefix stays resident between requests. When a request arrives over a
+//! different state, the outgoing state's KV cells are kept as a serialized
+//! sequence state (RAM, and optionally a file), so coming back to a state is a
+//! restore instead of a prefill: the cost of a document's second visit no
+//! longer depends on its length, and it survives a restart.
 
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 use std::num::NonZeroU32;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use anyhow::{anyhow, Context};
-use grande_core::{Backend, BranchOutput, BranchTokens, Error, Token, Want};
+use grande_core::{Backend, BranchOutput, BranchTokens, Error, PrefixSource, Token, Want};
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -23,6 +30,7 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::token::LlamaToken;
+use llama_cpp_2::{LlamaStateSeqFlags, SeqState};
 
 pub struct Options {
     pub n_ctx: u32,
@@ -41,6 +49,12 @@ pub struct Options {
     /// llama.cpp then computes logits only at requested positions, whereas
     /// embeddings mode marks every token as an output.
     pub embeddings: bool,
+    /// RAM budget for serialized states of recently seen prefixes (LRU).
+    /// 0 keeps only the resident prefix.
+    pub state_cache_bytes: usize,
+    /// Directory for the on-disk copy of every cached state, so a state
+    /// survives a restart. None = RAM only.
+    pub state_cache_dir: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -55,8 +69,72 @@ impl Default for Options {
             swa_full: false,
             flash: None,
             embeddings: false,
+            state_cache_bytes: 512 << 20,
+            state_cache_dir: None,
         }
     }
+}
+
+/// LRU of serialized sequence states keyed by the exact prefix tokens.
+struct StateCache {
+    budget: usize,
+    used: usize,
+    /// Most recently used last.
+    entries: Vec<(Vec<Token>, SeqState)>,
+}
+
+impl StateCache {
+    fn new(budget: usize) -> Self {
+        StateCache {
+            budget,
+            used: 0,
+            entries: Vec::new(),
+        }
+    }
+
+    fn take(&mut self, prefix: &[Token]) -> Option<SeqState> {
+        let i = self.entries.iter().position(|(p, _)| p == prefix)?;
+        let (_, s) = self.entries.remove(i);
+        self.used -= s.byte_len();
+        Some(s)
+    }
+
+    fn put(&mut self, prefix: Vec<Token>, state: SeqState) {
+        if state.byte_len() > self.budget {
+            return;
+        }
+        if let Some(i) = self.entries.iter().position(|(p, _)| *p == prefix) {
+            let (_, old) = self.entries.remove(i);
+            self.used -= old.byte_len();
+        }
+        while self.used + state.byte_len() > self.budget && !self.entries.is_empty() {
+            let (_, old) = self.entries.remove(0);
+            self.used -= old.byte_len();
+        }
+        self.used += state.byte_len();
+        self.entries.push((prefix, state));
+    }
+}
+
+/// Stable 64-bit key for a (model, prefix) pair: FNV-1a over the model's
+/// identity and the token ids. llama.cpp validates the KV layout on restore
+/// but not which weights produced it, so the model is part of the key.
+fn state_key(model_id: &str, prefix: &[Token]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |b: u8| {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for b in model_id.bytes() {
+        eat(b);
+    }
+    eat(0);
+    for t in prefix {
+        for b in t.0.to_le_bytes() {
+            eat(b);
+        }
+    }
+    h
 }
 
 pub struct LlamaEngine {
@@ -73,6 +151,10 @@ pub struct LlamaEngine {
     /// Prefix currently resident in sequence 0, if any. A request over the
     /// same state skips the prefix pass entirely.
     resident_prefix: Option<Vec<Token>>,
+    states: StateCache,
+    /// `<model file name>:<size>`; part of the on-disk state key.
+    model_id: String,
+    last_source: Option<PrefixSource>,
 }
 
 // SAFETY: every use of the context and model goes through `&mut self` or
@@ -139,6 +221,16 @@ impl LlamaEngine {
             }
         };
         let n_seq_max = opts.n_seq_max as usize;
+        if let Some(dir) = &opts.state_cache_dir {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("creating state cache dir {}", dir.display()))?;
+        }
+        let model_id = format!(
+            "{}:{}",
+            path.file_name().and_then(|s| s.to_str()).unwrap_or("model"),
+            std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+        );
+        let states = StateCache::new(opts.state_cache_bytes);
         Ok(LlamaEngine {
             ctx: ManuallyDrop::new(ctx),
             model: model_ptr,
@@ -147,6 +239,9 @@ impl LlamaEngine {
             n_seq_max,
             specials: Mutex::new(HashMap::new()),
             resident_prefix: None,
+            states,
+            model_id,
+            last_source: None,
         })
     }
 
@@ -167,12 +262,93 @@ impl LlamaEngine {
         self.ctx.n_ctx()
     }
 
-    fn decode_prefix(&mut self, prefix: &[Token]) -> anyhow::Result<()> {
-        if self.resident_prefix.as_deref() == Some(prefix) {
+    fn state_path(&self, prefix: &[Token]) -> Option<PathBuf> {
+        let dir = self.opts.state_cache_dir.as_ref()?;
+        Some(dir.join(format!("{:016x}.state", state_key(&self.model_id, prefix))))
+    }
+
+    /// Serialize sequence 0 into the RAM cache and, if configured, a file.
+    fn remember(&mut self, prefix: &[Token]) -> anyhow::Result<()> {
+        if self.states.budget == 0 && self.opts.state_cache_dir.is_none() {
             return Ok(());
         }
+        let t = Instant::now();
+        let state = self
+            .ctx
+            .state_seq_get(0, LlamaStateSeqFlags::empty())
+            .map_err(|e| anyhow!("state_seq_get: {e:?}"))?;
+        let bytes = state.byte_len();
+        if let Some(path) = self.state_path(prefix) {
+            let toks: Vec<LlamaToken> = prefix.iter().map(|t| LlamaToken(t.0)).collect();
+            self.ctx
+                .state_seq_save_file(&path, 0, &toks)
+                .map_err(|e| anyhow!("state_seq_save_file {}: {e:?}", path.display()))?;
+        }
+        self.states.put(prefix.to_vec(), state);
+        tracing::debug!(
+            "state cache: kept {} tokens ({bytes} bytes) in {} ms",
+            prefix.len(),
+            t.elapsed().as_millis()
+        );
+        Ok(())
+    }
+
+    /// Try to bring `prefix` back from RAM, then from disk. On success the
+    /// cells are in sequence 0 exactly as if they had been decoded.
+    fn restore(&mut self, prefix: &[Token]) -> Option<PrefixSource> {
+        if let Some(state) = self.states.take(prefix) {
+            let t = Instant::now();
+            let ok = self.ctx.state_seq_set(&state, 0).is_ok();
+            // Keep the bytes either way; a failed restore leaves the cache
+            // cleared and the caller decodes.
+            self.states.put(prefix.to_vec(), state);
+            if ok {
+                tracing::debug!("state cache: ram restore in {} ms", t.elapsed().as_millis());
+                return Some(PrefixSource::Ram);
+            }
+            self.ctx.clear_kv_cache();
+        }
+        let path = self.state_path(prefix)?;
+        if !path.is_file() {
+            return None;
+        }
+        let t = Instant::now();
+        match self.ctx.state_seq_load_file(&path, 0, prefix.len()) {
+            Ok((toks, _)) if toks.len() == prefix.len() && toks.iter().zip(prefix).all(|(a, b)| a.0 == b.0) => {
+                // Promote to RAM so the next switch back does not touch the disk.
+                if let Ok(state) = self.ctx.state_seq_get(0, LlamaStateSeqFlags::empty()) {
+                    self.states.put(prefix.to_vec(), state);
+                }
+                tracing::debug!("state cache: disk restore in {} ms", t.elapsed().as_millis());
+                Some(PrefixSource::Disk)
+            }
+            Ok(_) => {
+                tracing::warn!("state cache: {} holds a different prefix; ignoring", path.display());
+                self.ctx.clear_kv_cache();
+                None
+            }
+            Err(e) => {
+                tracing::warn!("state cache: {} unreadable ({e:?}); ignoring", path.display());
+                self.ctx.clear_kv_cache();
+                None
+            }
+        }
+    }
+
+    fn decode_prefix(&mut self, prefix: &[Token]) -> anyhow::Result<()> {
+        if self.resident_prefix.as_deref() == Some(prefix) {
+            self.last_source = Some(PrefixSource::Resident);
+            return Ok(());
+        }
+        // The outgoing prefix is already in the state cache (remembered when
+        // it was decoded), so its cells can simply go.
         self.resident_prefix = None;
         self.ctx.clear_kv_cache();
+        if let Some(src) = self.restore(prefix) {
+            self.resident_prefix = Some(prefix.to_vec());
+            self.last_source = Some(src);
+            return Ok(());
+        }
         let n_batch = self.opts.n_batch as usize;
         let mut pos = 0i32;
         for chunk in prefix.chunks(n_batch) {
@@ -184,12 +360,21 @@ impl LlamaEngine {
             self.ctx.decode(&mut batch).context("decoding prefix")?;
         }
         self.resident_prefix = Some(prefix.to_vec());
+        self.last_source = Some(PrefixSource::Decoded);
+        self.remember(prefix)?;
         Ok(())
     }
 
     /// Whether the last request's state is still resident (diagnostics).
     pub fn prefix_resident(&self, prefix: &[Token]) -> bool {
         self.resident_prefix.as_deref() == Some(prefix)
+    }
+
+    /// Drop the resident prefix (its serialized state stays cached). Lets a
+    /// benchmark measure a restore without switching states.
+    pub fn evict_resident(&mut self) {
+        self.resident_prefix = None;
+        self.ctx.clear_kv_cache();
     }
 
     /// Decode all branches, chunking at `n_batch`, collecting requested rows.
@@ -350,6 +535,10 @@ impl Backend for LlamaEngine {
             self.ctx.kv_cache_seq_rm(seq, None, None).ok();
         }
         out
+    }
+
+    fn prefix_source(&self) -> Option<PrefixSource> {
+        self.last_source
     }
 }
 

@@ -87,6 +87,10 @@ enum Cmd {
         /// Pointer head weights (safetensors); switches to the packed layout.
         #[arg(long)]
         head: Option<PathBuf>,
+        /// Label layout without the "Question:" / "Answer with one letter."
+        /// scaffolding (fewer branch tokens).
+        #[arg(long)]
+        terse: bool,
     },
     /// Prefill throughput: a synthetic state of about N tokens and Q
     /// questions, packed, repeated a few times.
@@ -106,6 +110,9 @@ enum Cmd {
         /// Flash attention: auto (default), on, off.
         #[arg(long, default_value = "auto")]
         flash: String,
+        /// Measure the state restore from this directory instead of RAM.
+        #[arg(long)]
+        state_cache_dir: Option<PathBuf>,
     },
     /// Mechanism tests (kev's): isolation, packed vs separate, boundary
     /// forgery. Prints one line per test with a pass/fail verdict.
@@ -130,6 +137,14 @@ enum Cmd {
         temperature: f32,
         #[arg(long, default_value_t = 8192)]
         n_ctx: u32,
+        /// RAM for serialized states of recently seen documents (MB). A
+        /// request over a cached state restores it instead of re-reading it.
+        #[arg(long, default_value_t = 512)]
+        state_cache_mb: usize,
+        /// Also keep every cached state as a file here, so it survives a
+        /// restart.
+        #[arg(long)]
+        state_cache_dir: Option<PathBuf>,
     },
     /// Dump the packed layout of a request as JSON: prefix token ids, and
     /// per branch the token ids, wanted positions and option keys. Used to
@@ -207,6 +222,25 @@ fn readout_for(backend: &LlamaEngine, head: Option<&PathBuf>) -> Result<(Rendere
     }
 }
 
+/// Largest difference between two responses' probabilities, over every
+/// question and option.
+fn answer_delta(a: &grande_core::Response, b: &grande_core::Response) -> f64 {
+    use grande_core::Answer;
+    let probs = |ans: &Answer| -> Vec<f64> {
+        match ans {
+            Answer::Noul { noul } => vec![*noul],
+            Answer::Choice { probabilities, .. } | Answer::Score { probabilities, .. } => {
+                probabilities.values().copied().collect()
+            }
+        }
+    };
+    a.answers
+        .iter()
+        .filter_map(|(id, x)| b.answers.get(id).map(|y| (probs(x), probs(y))))
+        .flat_map(|(x, y)| x.into_iter().zip(y).map(|(p, q)| (p - q).abs()).collect::<Vec<_>>())
+        .fold(0.0, f64::max)
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -221,6 +255,7 @@ fn main() -> Result<()> {
             n_ctx,
             permute,
             head,
+            terse,
         } => {
             use grande_eval::jglue::{self, Task};
             use grande_eval::report::{summarize, Row};
@@ -273,8 +308,11 @@ fn main() -> Result<()> {
                 .unwrap_or("model")
                 .to_lowercase();
             let (renderer, readout) = readout_for(&backend, head.as_ref())?;
+            let renderer = renderer.terse(terse);
             let layout = if head.is_some() {
                 "gemma_pointer"
+            } else if terse {
+                "gemma_label_terse"
             } else {
                 "gemma_label"
             };
@@ -357,6 +395,7 @@ fn main() -> Result<()> {
             n_ctx,
             n_ubatch,
             flash,
+            state_cache_dir,
         } => {
             let backend = LlamaEngine::load(
                 &model,
@@ -370,6 +409,10 @@ fn main() -> Result<()> {
                         "off" => Some(false),
                         _ => None,
                     },
+                    // With a directory the RAM cache is off, so the restore
+                    // measured below is the on-disk one.
+                    state_cache_bytes: if state_cache_dir.is_some() { 0 } else { 512 << 20 },
+                    state_cache_dir,
                     ..Default::default()
                 },
             )?;
@@ -415,10 +458,21 @@ fn main() -> Result<()> {
             let mut warm_ms = u128::MAX;
             let mut tokens = 0usize;
             let mut branch_tokens = 0usize;
+            let mut first: Option<grande_core::Response> = None;
+            let mut last: Option<grande_core::Response> = None;
+            // Round-to-round jitter of the backend itself (same resident
+            // cells, same batch), the floor any other delta is read against.
+            let mut round_delta = 0f64;
             for r in 0..rounds {
                 let t = Instant::now();
-                let (_, diag) = engine.answer(&req, Mode::Packed)?;
+                let (resp, diag) = engine.answer(&req, Mode::Packed)?;
                 let ms = t.elapsed().as_millis();
+                if let Some(f) = &first {
+                    round_delta = round_delta.max(answer_delta(f, &resp));
+                } else {
+                    first = Some(resp.clone());
+                }
+                last = Some(resp);
                 let branch: usize = diag.branch_tokens.iter().sum();
                 tokens = diag.prefix_tokens + branch;
                 branch_tokens = branch;
@@ -433,7 +487,20 @@ fn main() -> Result<()> {
                 );
             }
             // Round 0 evaluates the state and the branches; later rounds find the
-            // state resident and evaluate the branches only.
+            // state resident and evaluate the branches only. Then the state is
+            // evicted from the context and the same request restores it from the
+            // state cache: that is the cost of coming back to a document.
+            engine.backend.evict_resident();
+            let t = Instant::now();
+            let (resp, diag) = engine.answer(&req, Mode::Packed)?;
+            let restored_ms = t.elapsed().as_millis();
+            let source = diag.prefix_source.map(|s| s.as_str()).unwrap_or("?");
+            // A restored state must answer exactly like the decoded one.
+            let restored_delta = last
+                .as_ref()
+                .map(|l| answer_delta(l, &resp))
+                .unwrap_or(0.0);
+            eprintln!("restored ({source}): {restored_ms} ms, max |Δp| vs decoded {restored_delta:.2e} (round-to-round {round_delta:.2e})");
             println!(
                 "{}",
                 serde_json::json!({
@@ -441,6 +508,7 @@ fn main() -> Result<()> {
                     "cold_ms": cold_ms, "cold_tok_per_s": (tokens as f64 / (cold_ms.max(1) as f64 / 1000.0)).round(),
                     "warm_ms": if warm_ms == u128::MAX { serde_json::Value::Null } else { serde_json::json!(warm_ms) },
                     "warm_tok_per_s": if warm_ms == u128::MAX { serde_json::Value::Null } else { serde_json::json!((branch_tokens as f64 / (warm_ms as f64 / 1000.0)).round()) },
+                    "restored_ms": restored_ms, "restored_from": source, "restored_max_dp": restored_delta, "round_max_dp": round_delta,
                 })
             );
         }
@@ -544,12 +612,16 @@ fn main() -> Result<()> {
             api_key,
             temperature,
             n_ctx,
+            state_cache_mb,
+            state_cache_dir,
         } => {
             let backend = LlamaEngine::load(
                 &model,
                 Options {
                     n_ctx,
                     n_batch: n_ctx,
+                    state_cache_bytes: state_cache_mb << 20,
+                    state_cache_dir,
                     ..Default::default()
                 },
             )?;

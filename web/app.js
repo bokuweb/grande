@@ -6,7 +6,7 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&l
 const params = new URLSearchParams(location.search);
 let engine = null;
 let transformers = null;
-let mode = "batched";
+let mode = "shared";
 
 for (const [k, m] of Object.entries(MODELS)) {
   const o = document.createElement("option");
@@ -166,7 +166,8 @@ function bar(name, p, best) {
 
 function renderResults(request, resp) {
   const u = resp.usage;
-  const chips = [`${u.ms.toFixed(0)} ms`, u.mode, `${u.forwards} forward${u.forwards === 1 ? "" : "s"}`, `${u.input_tokens} tokens (state ${u.state_tokens})`, `${u.questions} question${u.questions === 1 ? "" : "s"}`];
+  const state = u.state_resident === undefined ? `state ${u.state_tokens}` : u.state_resident ? `state ${u.state_tokens} resident` : `state ${u.state_tokens} cold`;
+  const chips = [`${u.ms.toFixed(0)} ms`, u.mode, `${u.forwards} forward${u.forwards === 1 ? "" : "s"}`, `${u.input_tokens} tokens (${state})`, `${u.questions} question${u.questions === 1 ? "" : "s"}`];
   $("usage").innerHTML = chips.map((c) => `<span class="chip">${esc(c)}</span>`).join("");
   const cards = [];
   for (const [id, a] of Object.entries(resp.answers)) {
