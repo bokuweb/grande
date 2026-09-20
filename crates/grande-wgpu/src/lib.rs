@@ -24,7 +24,7 @@
 pub mod engine;
 pub mod model;
 
-pub use engine::{Engine, EngineBuilder};
+pub use engine::{Engine, EngineBuilder, SavedState};
 pub use model::{Config, Dtype, QTensor, Weights};
 
 #[cfg(feature = "native")]

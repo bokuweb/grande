@@ -59,13 +59,16 @@ on an M4.
       and on E2B / E4B Q4_0; `grande --model <checkpoint dir>` and the
       `gemma-4-e2b-wgpu-ja` / `gemma-4-e4b-wgpu-ja` browser models (1.2 GB /
       2.5 GB after vocabulary pruning).
+      The last state's K/V stays resident: a request over the same state
+      runs only its branches (E2B, 12 questions: 500-token state 3.0 → 1.7 s,
+      2,000 tokens 8.1 → 2.0 s native; browser ticket 1.0 → 0.77 s), and
+      every state seen is kept serialized (f16, sliding layers window-only:
+      19 MB per 2,000 tokens; RAM LRU, `--state-cache-dir` files natively,
+      RAM in the browser) so coming back to one is a ~50 ms restore.
 - [x] `grande jglue --shots N` (few-shot from the train split), `grande
       features` + `tools/train_head.py`: a pointer head on the frozen,
       quantized E2B / E4B read through the zero-shot chat prompt
       (`gemma_label_pointer`), trained on the engine's own hidden states.
-- [ ] IIA test, permutation flip rate on a JGLUE sample
-      and on E2B Q4_0; `grande --model <checkpoint dir>` and the
-      `gemma-4-e2b-wgpu-ja` browser model (1.2 GB after vocabulary pruning).
 - [x] `--orders N`: every Choice / Noul asked under N option orders in the
       same pass, logits averaged (position bias out); `order_spread` in the
       diagnostics. Permutation flip rate on JGLUE below.

@@ -8,10 +8,11 @@
 //! `finish` allocates the workspace and wires the bind groups.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytemuck::{Pod, Zeroable};
-use grande_core::{BranchOutput, BranchTokens, Want};
+use grande_core::{BranchOutput, BranchTokens, PrefixSource, Want};
 use half::f16;
 use wgpu::util::DeviceExt;
 
@@ -82,18 +83,21 @@ struct QkParams {
     offset: f32,
     q_stride: u32,
     kv_heads: u32,
-    _p1: u32,
+    /// Index of this pass's first token in the K/V cache and tok_meta.
+    base: u32,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct AttnParams {
+    /// Keys: tokens 0..t of the K/V cache (resident prefix + this pass).
     t: u32,
     heads: u32,
     window: u32,
     q_stride: u32,
     kv_heads: u32,
-    _p0: u32,
+    /// Queries are tokens base..t; their rows in the workspace start at 0.
+    base: u32,
     _p1: u32,
     _p2: u32,
 }
@@ -388,6 +392,163 @@ pub struct Engine {
     /// Per-dispatch GPU timings (timestamp queries), when the adapter has
     /// them and profiling is on. Native only; wasm never sets it.
     profile: Option<Profiler>,
+    /// The prefix whose K/V (and tok_meta) occupy cache rows 0..len after
+    /// the last pass: a request over the same prefix evaluates only its
+    /// branches, appended at row len. Every full pass leaves its prefix
+    /// resident; a continuation only overwrites rows past it.
+    resident: Mutex<Option<Vec<u32>>>,
+    last_source: Mutex<Option<PrefixSource>>,
+    /// K/V buffer per layer that owns one (`Config::has_kv`).
+    kv_bufs: Vec<Option<wgpu::Buffer>>,
+    /// Serialized states of prefixes seen before (RAM LRU) and, natively,
+    /// the directory they are also written to.
+    states: Mutex<StateCache>,
+    state_dir: Option<std::path::PathBuf>,
+    /// Part of the on-disk state key: a file holds a state of one model.
+    model_id: String,
+}
+
+/// A prefix's K/V rows as f16 (what the attention kernel rounds them to
+/// anyway, so a restore is exact), per layer that owns a K/V buffer; a row
+/// is all K heads then all V heads of one token. Sliding
+/// layers keep only the last `window` rows: no later token sees the rest.
+#[derive(Clone)]
+pub struct SavedState {
+    prefix: Vec<u32>,
+    /// (layer, first row, f16 little-endian rows of [2 x hd])
+    layers: Vec<(usize, usize, Vec<u8>)>,
+}
+
+impl SavedState {
+    pub fn byte_len(&self) -> usize {
+        self.layers.iter().map(|(_, _, b)| b.len()).sum::<usize>() + self.prefix.len() * 4
+    }
+
+    /// File format: magic, model id, prefix, then (layer, row0, len, bytes)
+    /// per layer.
+    pub fn to_bytes(&self, model_id: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.byte_len() + 64 + model_id.len());
+        out.extend_from_slice(b"GRWS1\0");
+        out.extend_from_slice(&(model_id.len() as u32).to_le_bytes());
+        out.extend_from_slice(model_id.as_bytes());
+        out.extend_from_slice(&(self.prefix.len() as u32).to_le_bytes());
+        for t in &self.prefix {
+            out.extend_from_slice(&t.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.layers.len() as u32).to_le_bytes());
+        for (l, r0, b) in &self.layers {
+            out.extend_from_slice(&(*l as u32).to_le_bytes());
+            out.extend_from_slice(&(*r0 as u32).to_le_bytes());
+            out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            out.extend_from_slice(b);
+        }
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8], model_id: &str) -> Result<Self> {
+        struct Cur<'a> {
+            b: &'a [u8],
+            at: usize,
+        }
+        impl<'a> Cur<'a> {
+            fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+                let s = self
+                    .b
+                    .get(self.at..self.at + n)
+                    .ok_or_else(|| anyhow!("state file truncated"))?;
+                self.at += n;
+                Ok(s)
+            }
+            fn u32(&mut self) -> Result<usize> {
+                Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()) as usize)
+            }
+        }
+        let mut c = Cur { b: bytes, at: 0 };
+        if c.take(6)? != b"GRWS1\0" {
+            bail!("not a grande wgpu state file");
+        }
+        let n = c.u32()?;
+        if c.take(n)? != model_id.as_bytes() {
+            bail!("state file is for a different model");
+        }
+        let n = c.u32()?;
+        let prefix: Vec<u32> = c
+            .take(n * 4)?
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|x| u32::from_le_bytes(*x))
+            .collect();
+        let n = c.u32()?;
+        let mut layers = Vec::with_capacity(n);
+        for _ in 0..n {
+            let l = c.u32()?;
+            let r0 = c.u32()?;
+            let len = c.u32()?;
+            layers.push((l, r0, c.take(len)?.to_vec()));
+        }
+        Ok(SavedState { prefix, layers })
+    }
+}
+
+/// LRU of saved states keyed by the exact prefix tokens; most recently used
+/// last.
+struct StateCache {
+    budget: usize,
+    used: usize,
+    entries: Vec<SavedState>,
+}
+
+impl StateCache {
+    fn new(budget: usize) -> Self {
+        StateCache {
+            budget,
+            used: 0,
+            entries: Vec::new(),
+        }
+    }
+
+    fn get(&mut self, prefix: &[u32]) -> Option<SavedState> {
+        let i = self.entries.iter().position(|s| s.prefix == prefix)?;
+        let s = self.entries.remove(i);
+        self.entries.push(s.clone());
+        Some(s)
+    }
+
+    fn put(&mut self, state: SavedState) {
+        let len = state.byte_len();
+        if len > self.budget {
+            return;
+        }
+        if let Some(i) = self.entries.iter().position(|s| s.prefix == state.prefix) {
+            self.used -= self.entries.remove(i).byte_len();
+        }
+        while self.used + len > self.budget && !self.entries.is_empty() {
+            self.used -= self.entries.remove(0).byte_len();
+        }
+        self.used += len;
+        self.entries.push(state);
+    }
+}
+
+/// Stable 64-bit key for a (model, prefix) pair (FNV-1a), the on-disk
+/// state file name.
+fn state_key(model_id: &str, prefix: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |b: u8| {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for b in model_id.bytes() {
+        eat(b);
+    }
+    eat(0);
+    for t in prefix {
+        for b in t.to_le_bytes() {
+            eat(b);
+        }
+    }
+    h
 }
 
 struct Profiler {
@@ -961,7 +1122,6 @@ impl EngineBuilder {
         });
         let embed_dtype = embed_t.dtype;
         let mut keep = vec![x, qkv, attn, a, act, dummy];
-        keep.extend(kv_bufs.into_iter().flatten());
         keep.extend(pli);
         Ok(Engine {
             device,
@@ -989,6 +1149,12 @@ impl EngineBuilder {
             _keep: keep,
             _weights: weights.into_values().collect(),
             profile,
+            kv_bufs,
+            resident: Mutex::new(None),
+            last_source: Mutex::new(None),
+            states: Mutex::new(StateCache::new(0)),
+            state_dir: None,
+            model_id: String::from("wgpu"),
         })
     }
 }
@@ -1053,7 +1219,13 @@ impl Engine {
                 .per_layer_table
                 .as_ref()
                 .ok_or_else(|| anyhow!("this model needs per-layer embedding rows; none loaded"))?;
-            let mut ids: Vec<u32> = prefix.to_vec();
+            // evaluate_rows slices the prefix rows off when it turns out to
+            // be resident or cached; only skip the gather when it is known.
+            let mut ids: Vec<u32> = if self.is_resident(prefix) {
+                Vec::new()
+            } else {
+                prefix.to_vec()
+            };
             for b in branches {
                 ids.extend(b.tokens.iter().map(|t| t.0 as u32));
             }
@@ -1088,7 +1260,9 @@ impl Engine {
         let cfg = &self.config;
         let d = cfg.d;
         // Pack: prefix at positions 0..P in sequence 0, each branch restarting
-        // at P in its own sequence.
+        // at P in its own sequence. With the prefix resident from the last
+        // pass, only the branches run: K/V rows and tok_meta 0..P are kept and
+        // this pass's tokens take cache rows P.., workspace rows 0...
         let p = prefix.len();
         let total = p + branches.iter().map(|b| b.tokens.len()).sum::<usize>();
         if total > self.capacity {
@@ -1100,14 +1274,22 @@ impl Engine {
         if total == 0 {
             bail!("empty request");
         }
-        let mut ids: Vec<u32> = Vec::with_capacity(total);
-        let mut meta: Vec<i32> = Vec::with_capacity(total * 2);
-        // (branch, slot, packed index)
+        let mut source = if self.is_resident(prefix) {
+            Some(PrefixSource::Resident)
+        } else {
+            self.restore_from_cache(prefix).await
+        };
+        let base = if source.is_some() { p } else { 0 };
+        let mut ids: Vec<u32> = Vec::with_capacity(total - base);
+        let mut meta: Vec<i32> = Vec::with_capacity((total - base) * 2);
+        // (branch, slot, workspace row)
         let mut wanted: Vec<(usize, usize, usize)> = Vec::new();
-        ids.extend_from_slice(prefix);
-        for i in 0..p {
-            meta.push(i as i32);
-            meta.push(0);
+        if base == 0 {
+            ids.extend_from_slice(prefix);
+            for i in 0..p {
+                meta.push(i as i32);
+                meta.push(0);
+            }
         }
         for (bi, b) in branches.iter().enumerate() {
             let start = ids.len();
@@ -1136,18 +1318,31 @@ impl Engine {
         if let Some(&id) = ids.iter().find(|&&id| id as usize >= cfg.vocab) {
             bail!("token id {id} outside the vocabulary of {}", cfg.vocab);
         }
-        let t = total;
+        // Tokens this pass runs (workspace rows); keys seen by attention are
+        // the cache rows 0..base + t.
+        let t = total - base;
         self.queue
             .write_buffer(&self.ids, 0, bytemuck::cast_slice(&ids));
         self.queue
-            .write_buffer(&self.meta, 0, bytemuck::cast_slice(&meta));
+            .write_buffer(&self.meta, (base * 8) as u64, bytemuck::cast_slice(&meta));
         if let Some(plg) = &self.plg {
             let rows =
                 per_layer_rows.ok_or_else(|| anyhow!("per-layer embedding rows required"))?;
-            let need = t * cfg.per_layer_dim * cfg.layers * 2;
-            if rows.len() != need {
-                bail!("per-layer rows: {} bytes, expected {need}", rows.len());
-            }
+            let row_bytes = cfg.per_layer_dim * cfg.layers * 2;
+            // Callers may gather rows for prefix + branches regardless of
+            // residency; only this pass's tokens are uploaded.
+            let rows = if rows.len() == total * row_bytes {
+                &rows[base * row_bytes..]
+            } else if rows.len() == t * row_bytes {
+                rows
+            } else {
+                bail!(
+                    "per-layer rows: {} bytes, expected {} (or {} with the prefix)",
+                    rows.len(),
+                    t * row_bytes,
+                    total * row_bytes
+                );
+            };
             self.queue.write_buffer(plg, 0, rows);
         }
 
@@ -1206,7 +1401,7 @@ impl Engine {
                     emb_scale: (pl as f32).sqrt(),
                     out_scale: 1.0 / 2f32.sqrt(),
                 });
-                run("pl_combine", combine, off, ((t * cfg.layers) as u32, 1));
+                run("pl_combine", combine, off, (cfg.layers as u32, t as u32));
             }
             #[cfg(not(target_arch = "wasm32"))]
             let n_layers = std::env::var("GRANDE_WGPU_LAYERS")
@@ -1236,16 +1431,16 @@ impl Engine {
                     offset: cfg.norm_offset,
                     q_stride: l.qkv_width as u32,
                     kv_heads: cfg.kv_heads as u32,
-                    _p1: 0,
+                    base: base as u32,
                 });
                 run("qk_prep", &l.qk, off, (t as u32, 1));
                 let off = params.push(AttnParams {
-                    t: t as u32,
+                    t: (base + t) as u32,
                     heads: cfg.heads as u32,
                     window: if l.sliding { cfg.window as u32 } else { 0 },
                     q_stride: l.qkv_width as u32,
                     kv_heads: cfg.kv_heads as u32,
-                    _p0: 0,
+                    base: base as u32,
                     _p1: 0,
                     _p2: 0,
                 });
@@ -1460,7 +1655,234 @@ impl Engine {
                 .rows
                 .push(data[r * width..(r + 1) * width].to_vec());
         }
+        // Whichever way this pass ran, cache rows 0..p now hold the prefix.
+        *self.resident.lock().unwrap() = Some(prefix.to_vec());
+        if source.is_none() {
+            source = Some(PrefixSource::Decoded);
+            self.remember(prefix).await?;
+        }
+        *self.last_source.lock().unwrap() = source;
         Ok(outputs)
+    }
+
+    /// Keep the states of prefixes seen before: a RAM LRU of `bytes` and,
+    /// natively, a file per state in `dir`. `model_id` names the checkpoint
+    /// in the files so a state is never restored into different weights.
+    pub fn set_state_cache(
+        &mut self,
+        bytes: usize,
+        dir: Option<std::path::PathBuf>,
+        model_id: &str,
+    ) {
+        *self.states.lock().unwrap() = StateCache::new(bytes);
+        self.state_dir = dir;
+        self.model_id = model_id.to_string();
+    }
+
+    fn state_cache_on(&self) -> bool {
+        self.states.lock().unwrap().budget > 0 || self.state_dir.is_some()
+    }
+
+    fn state_path(&self, prefix: &[u32]) -> Option<std::path::PathBuf> {
+        let dir = self.state_dir.as_ref()?;
+        Some(dir.join(format!("{:016x}.state", state_key(&self.model_id, prefix))))
+    }
+
+    /// Rows of layer `l`'s K/V buffer a state of `p` tokens has to keep.
+    fn state_rows(&self, l: usize, p: usize) -> (usize, usize) {
+        let cfg = &self.config;
+        if cfg.sliding[l] && cfg.window > 0 {
+            (p.saturating_sub(cfg.window), p)
+        } else {
+            (0, p)
+        }
+    }
+
+    /// Read the resident prefix's K/V rows back as f16.
+    pub async fn save_state(&self, prefix: &[u32]) -> Result<SavedState> {
+        let cfg = &self.config;
+        let p = prefix.len();
+        let mut chunks: Vec<(usize, usize, usize, u64)> = Vec::new(); // (layer, row0, rows, byte offset)
+        let mut total = 0u64;
+        for (l, buf) in self.kv_bufs.iter().enumerate() {
+            if buf.is_none() {
+                continue;
+            }
+            let (r0, r1) = self.state_rows(l, p);
+            let bytes = ((r1 - r0) * 2 * cfg.kv_heads * cfg.head_dim[l] * 4) as u64;
+            chunks.push((l, r0, r1 - r0, total));
+            total += bytes;
+        }
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("state readback"),
+            size: total.max(4),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("state save"),
+            });
+        for &(l, r0, rows, off) in &chunks {
+            let row_bytes = (2 * cfg.kv_heads * cfg.head_dim[l] * 4) as u64;
+            enc.copy_buffer_to_buffer(
+                self.kv_bufs[l].as_ref().unwrap(),
+                r0 as u64 * row_bytes,
+                &staging,
+                off,
+                rows as u64 * row_bytes,
+            );
+        }
+        self.queue.submit(Some(enc.finish()));
+        let slice = staging.slice(..total.max(4));
+        let (tx, rx) = futures_channel::oneshot::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).ok();
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| anyhow!("device poll: {e:?}"))?;
+        rx.await
+            .context("map callback dropped")?
+            .map_err(|e| anyhow!("map_async: {e:?}"))?;
+        let mapped = slice.get_mapped_range();
+        let mut layers = Vec::with_capacity(chunks.len());
+        for &(l, r0, rows, off) in &chunks {
+            let n = rows * 2 * cfg.kv_heads * cfg.head_dim[l];
+            let src: &[f32] = bytemuck::cast_slice(&mapped[off as usize..off as usize + n * 4]);
+            let mut out = Vec::with_capacity(n * 2);
+            for &v in src {
+                out.extend_from_slice(&f16::from_f32(v).to_le_bytes());
+            }
+            layers.push((l, r0, out));
+        }
+        drop(mapped);
+        staging.unmap();
+        Ok(SavedState {
+            prefix: prefix.to_vec(),
+            layers,
+        })
+    }
+
+    /// Put a saved state's K/V rows and positions back into the cache; the
+    /// prefix is then resident.
+    pub fn restore_state(&self, state: &SavedState) -> Result<()> {
+        let cfg = &self.config;
+        let p = state.prefix.len();
+        if p > self.capacity {
+            bail!(
+                "state of {p} tokens exceeds the engine capacity {}",
+                self.capacity
+            );
+        }
+        for (l, r0, bytes) in &state.layers {
+            let buf = self
+                .kv_bufs
+                .get(*l)
+                .and_then(|b| b.as_ref())
+                .ok_or_else(|| anyhow!("state has K/V for layer {l}, which owns none"))?;
+            let row = 2 * cfg.kv_heads * cfg.head_dim[*l];
+            let (want_r0, want_r1) = self.state_rows(*l, p);
+            if *r0 != want_r0 || bytes.len() != (want_r1 - want_r0) * row * 2 {
+                bail!(
+                    "state layer {l}: {} bytes at row {r0}, expected {} at {want_r0}",
+                    bytes.len(),
+                    (want_r1 - want_r0) * row * 2
+                );
+            }
+            let f32s: Vec<f32> = bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| f16::from_le_bytes(*c).to_f32())
+                .collect();
+            self.queue
+                .write_buffer(buf, (*r0 * row * 4) as u64, bytemuck::cast_slice(&f32s));
+        }
+        let mut meta: Vec<i32> = Vec::with_capacity(p * 2);
+        for i in 0..p {
+            meta.push(i as i32);
+            meta.push(0);
+        }
+        self.queue
+            .write_buffer(&self.meta, 0, bytemuck::cast_slice(&meta));
+        *self.resident.lock().unwrap() = Some(state.prefix.clone());
+        Ok(())
+    }
+
+    /// Make `prefix` resident without decoding it if a saved state exists:
+    /// RAM first, then the state directory (promoted to RAM).
+    async fn restore_from_cache(&self, prefix: &[u32]) -> Option<PrefixSource> {
+        if prefix.is_empty() || !self.state_cache_on() {
+            return None;
+        }
+        let ram = self.states.lock().unwrap().get(prefix);
+        if let Some(state) = ram {
+            return match self.restore_state(&state) {
+                Ok(()) => Some(PrefixSource::Ram),
+                Err(_) => None,
+            };
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let path = self.state_path(prefix)?;
+            let bytes = std::fs::read(&path).ok()?;
+            let state = SavedState::from_bytes(&bytes, &self.model_id).ok()?;
+            if state.prefix != prefix || self.restore_state(&state).is_err() {
+                return None;
+            }
+            self.states.lock().unwrap().put(state);
+            Some(PrefixSource::Disk)
+        }
+        #[cfg(target_arch = "wasm32")]
+        None
+    }
+
+    /// Serialize the resident prefix into the RAM cache and, if configured,
+    /// its file.
+    async fn remember(&self, prefix: &[u32]) -> Result<()> {
+        if prefix.is_empty() || !self.state_cache_on() {
+            return Ok(());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let t0 = std::time::Instant::now();
+        let state = self.save_state(prefix).await?;
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.profile.is_some() {
+            eprintln!(
+                "state cache: kept {} tokens ({} bytes) in {:.1} ms",
+                prefix.len(),
+                state.byte_len(),
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(path) = self.state_path(prefix) {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).ok();
+            }
+            std::fs::write(&path, state.to_bytes(&self.model_id))
+                .with_context(|| format!("writing {}", path.display()))?;
+        }
+        self.states.lock().unwrap().put(state);
+        Ok(())
+    }
+
+    /// Whether `prefix` is the resident one, so a request over it can skip
+    /// straight to its branches.
+    pub fn is_resident(&self, prefix: &[u32]) -> bool {
+        !prefix.is_empty() && self.resident.lock().unwrap().as_deref() == Some(prefix)
+    }
+
+    /// How the last `evaluate` obtained its prefix.
+    pub fn prefix_source(&self) -> Option<PrefixSource> {
+        *self.last_source.lock().unwrap()
+    }
+
+    /// Forget the resident prefix: the next request decodes it again.
+    pub fn evict_resident(&self) {
+        *self.resident.lock().unwrap() = None;
     }
 
     /// Storage type of the embedding table (also the logits projection).

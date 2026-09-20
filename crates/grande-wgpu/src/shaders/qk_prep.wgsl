@@ -6,13 +6,15 @@
 // roped, each v head is RMS-normalized without a weight when `v_norm` is set,
 // and both are written to the layer's K/V buffer
 // [t][kv_heads x HD | kv_heads x HD] for the attention kernel (and for the
-// later layers that share this layer's K/V). One workgroup per token,
-// one invocation per HD/256 elements. HD is substituted by the engine.
+// later layers that share this layer's K/V). Workspace token t is cache
+// token base + t: with a resident prefix only the branches are in the
+// workspace. One workgroup per token, one invocation per HD/256 elements. HD
+// is substituted by the engine.
 
 struct Params {
     t: u32, heads: u32, theta: f32, scale: f32,
     eps: f32, rope_dims: u32, has_kv: u32, v_norm: u32,
-    offset: f32, q_stride: u32, kv_heads: u32, _p1: u32,
+    offset: f32, q_stride: u32, kv_heads: u32, base: u32,
 }
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -67,10 +69,12 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) l: v
     if (t >= p.t) { return; }
     let li = l.x;
     let row = t * p.q_stride;
-    let pos = f32(tok_meta[2u * t]);
+    // Workspace row t is cache row base + t (the prefix may be resident).
+    let tc = p.base + t;
+    let pos = f32(tok_meta[2u * tc]);
 
     // q heads, then the k heads (both normed with a weight and roped).
-    let kv_row = t * 2u * p.kv_heads * HD;
+    let kv_row = tc * 2u * p.kv_heads * HD;
     let n_heads = p.heads + p.has_kv * p.kv_heads;
     for (var h = 0u; h < n_heads; h++) {
         let base = row + h * HD;

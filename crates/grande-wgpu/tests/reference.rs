@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use grande_core::{BranchTokens, Token, Want};
+use grande_core::{BranchTokens, PrefixSource, Token, Want};
 use grande_wgpu::model::{Arch, Config, Dtype, QTensor, Weights};
 use grande_wgpu::Engine;
 
@@ -425,6 +425,100 @@ fn gemma4_q4_matches_cpu_reference() {
 #[test]
 fn gemma4_f16_matches_cpu_reference() {
     check_hidden(&weights(&gemma4_config(), 5, Dtype::F16, Dtype::F16), 2e-2);
+}
+
+/// A request over the prefix of the previous one runs only its branches on
+/// top of the resident K/V and must produce the same rows as a full pass.
+#[test]
+fn resident_prefix_matches_full_pass() {
+    for w in [
+        weights(&gemma3_config(), 13, Dtype::F16, Dtype::F16),
+        weights(&gemma4_config(), 13, Dtype::Q4, Dtype::Q8),
+        weights(&gemma4_gqa_config(), 13, Dtype::Q4, Dtype::Q8),
+    ] {
+        let Some(eng) = engine(&w) else { return };
+        let prefix: Vec<u32> = vec![2, 5, 9, 14, 20, 31, 7];
+        let branches = vec![
+            BranchTokens {
+                tokens: [11, 12, 13, 14, 15].map(Token).to_vec(),
+                want: vec![1, 4],
+            },
+            BranchTokens {
+                tokens: [30, 31, 32].map(Token).to_vec(),
+                want: vec![0, 2],
+            },
+        ];
+        let other = vec![BranchTokens {
+            tokens: [33, 34, 35, 36, 37, 38].map(Token).to_vec(),
+            want: vec![5],
+        }];
+        let full = pollster::block_on(eng.evaluate(&prefix, &branches, Want::Hidden)).unwrap();
+        assert_eq!(eng.prefix_source(), Some(PrefixSource::Decoded));
+        // Same prefix, different branches: resident, appended past the prefix.
+        let cont = pollster::block_on(eng.evaluate(&prefix, &other, Want::Hidden)).unwrap();
+        assert_eq!(eng.prefix_source(), Some(PrefixSource::Resident));
+        eng.evict_resident();
+        let cold = pollster::block_on(eng.evaluate(&prefix, &other, Want::Hidden)).unwrap();
+        assert_eq!(eng.prefix_source(), Some(PrefixSource::Decoded));
+        assert_eq!(cont[0].rows, cold[0].rows);
+        // Back to the first branches, resident again.
+        let again = pollster::block_on(eng.evaluate(&prefix, &branches, Want::Hidden)).unwrap();
+        assert_eq!(eng.prefix_source(), Some(PrefixSource::Resident));
+        for (a, b) in full.iter().zip(&again) {
+            assert_eq!(a.rows, b.rows);
+        }
+        // A different prefix decodes and becomes resident in turn.
+        let prefix2: Vec<u32> = vec![2, 3, 4];
+        let p2 = pollster::block_on(eng.evaluate(&prefix2, &branches, Want::Logits)).unwrap();
+        assert_eq!(eng.prefix_source(), Some(PrefixSource::Decoded));
+        let p2r = pollster::block_on(eng.evaluate(&prefix2, &branches, Want::Logits)).unwrap();
+        assert_eq!(eng.prefix_source(), Some(PrefixSource::Resident));
+        for (a, b) in p2.iter().zip(&p2r) {
+            assert_eq!(a.rows, b.rows);
+        }
+    }
+}
+
+/// A prefix that was decoded before comes back from the state cache (RAM,
+/// or a file round-tripped through `SavedState`) with the same rows.
+#[test]
+fn state_cache_restores_exactly() {
+    for w in [
+        weights(&gemma3_config(), 17, Dtype::F16, Dtype::F16),
+        weights(&gemma4_config(), 17, Dtype::Q4, Dtype::Q8),
+        weights(&gemma4_gqa_config(), 17, Dtype::Q4, Dtype::Q8),
+    ] {
+        let Some(mut eng) = engine(&w) else { return };
+        eng.set_state_cache(64 << 20, None, "test");
+        // Longer than the sliding window (5 / 6), so the window-only rows of
+        // sliding layers are exercised.
+        let a: Vec<u32> = vec![2, 5, 9, 14, 20, 31, 7, 8, 3, 22, 4, 6];
+        let b: Vec<u32> = vec![2, 3, 4];
+        let branches = vec![BranchTokens {
+            tokens: [11, 12, 13, 14, 15].map(Token).to_vec(),
+            want: vec![0, 2, 4],
+        }];
+        let full_a = pollster::block_on(eng.evaluate(&a, &branches, Want::Hidden)).unwrap();
+        assert_eq!(eng.prefix_source(), Some(PrefixSource::Decoded));
+        let saved = pollster::block_on(eng.save_state(&a)).unwrap();
+        pollster::block_on(eng.evaluate(&b, &branches, Want::Hidden)).unwrap();
+        assert_eq!(eng.prefix_source(), Some(PrefixSource::Decoded));
+        // a is not resident (b is) but in the RAM cache.
+        let ram_a = pollster::block_on(eng.evaluate(&a, &branches, Want::Hidden)).unwrap();
+        assert_eq!(eng.prefix_source(), Some(PrefixSource::Ram));
+        assert_eq!(full_a[0].rows, ram_a[0].rows);
+        // File round trip, restored by hand into a cache that has moved on.
+        let bytes = saved.to_bytes("test");
+        let back = grande_wgpu::SavedState::from_bytes(&bytes, "test").unwrap();
+        assert!(grande_wgpu::SavedState::from_bytes(&bytes, "other").is_err());
+        pollster::block_on(eng.evaluate(&b, &branches, Want::Hidden)).unwrap();
+        eng.evict_resident();
+        eng.restore_state(&back).unwrap();
+        assert!(eng.is_resident(&a));
+        let file_a = pollster::block_on(eng.evaluate(&a, &branches, Want::Hidden)).unwrap();
+        assert_eq!(eng.prefix_source(), Some(PrefixSource::Resident));
+        assert_eq!(full_a[0].rows, file_a[0].rows);
+    }
 }
 
 #[test]

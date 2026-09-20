@@ -305,7 +305,9 @@ enum Cmd {
 fn load_backend(path: &Path, opts: Options) -> Result<Box<dyn Backend>> {
     if path.is_dir() {
         let n_ctx = opts.n_ctx as usize;
-        Ok(Box::new(grande_wgpu::WgpuBackend::load(path, n_ctx, 256)?))
+        let mut b = grande_wgpu::WgpuBackend::load(path, n_ctx, 256)?;
+        b.set_state_cache(path, opts.state_cache_bytes, opts.state_cache_dir.clone());
+        Ok(Box::new(b))
     } else {
         Ok(Box::new(LlamaEngine::load(path, opts)?))
     }
