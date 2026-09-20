@@ -101,6 +101,13 @@ pub enum Renderer {
         /// the answer.
         #[serde(default)]
         terse: bool,
+        /// Same prompt, read with a pointer head instead of the letter
+        /// logits: every option line's last token is marked `OptEnd` and the
+        /// model-turn position `Decide`. The backbone stays as it is (frozen,
+        /// quantized); only the head is trained, on hidden states this
+        /// engine produced.
+        #[serde(default)]
+        pointer: bool,
     },
     /// Packed layout with reserved delimiters and a trained pointer head.
     Pointer(Delimiters),
@@ -117,6 +124,7 @@ impl Renderer {
             user: "user".into(),
             model: "model".into(),
             terse: false,
+            pointer: false,
         }
     }
 
@@ -128,6 +136,7 @@ impl Renderer {
             user: "user".into(),
             model: "model".into(),
             terse: false,
+            pointer: false,
         }
     }
 
@@ -137,6 +146,24 @@ impl Renderer {
             *terse = on;
         }
         self
+    }
+
+    /// The same layout read by a pointer head (see [`Renderer::Label`]).
+    pub fn pointer(mut self, on: bool) -> Self {
+        if let Renderer::Label { pointer, .. } = &mut self {
+            *pointer = on;
+        }
+        self
+    }
+
+    /// Short name for logs and summaries.
+    pub fn layout_name(&self) -> &'static str {
+        match self {
+            Renderer::Label { pointer: true, .. } => "gemma_label_pointer",
+            Renderer::Label { terse: true, .. } => "gemma_label_terse",
+            Renderer::Label { .. } => "gemma_label",
+            Renderer::Pointer(_) => "gemma_pointer",
+        }
     }
 
     pub fn gemma_pointer() -> Self {
@@ -192,6 +219,7 @@ impl Renderer {
                 turn_end,
                 model,
                 terse,
+                pointer,
                 ..
             } => {
                 let mut text = if *terse {
@@ -209,10 +237,18 @@ impl Renderer {
                         .map_or_else(|| i.to_string(), char::to_string);
                     match desc {
                         Some(d) if !d.is_empty() => {
-                            text.push_str(&format!("{letter}: {key} — {d}\n"))
+                            text.push_str(&format!("{letter}: {key} — {d}"))
                         }
-                        _ => text.push_str(&format!("{letter}: {key}\n")),
+                        _ => text.push_str(&format!("{letter}: {key}")),
                     }
+                    if *pointer {
+                        // Each option line is its own segment so its last
+                        // token can be read; the newline goes in the next
+                        // segment so the read token is content, not "\n".
+                        segments.push(Segment::Text(std::mem::take(&mut text)));
+                        marks.push((segments.len() - 1, Mark::OptEnd(i)));
+                    }
+                    text.push('\n');
                 }
                 if *terse {
                     text.pop();
@@ -224,7 +260,10 @@ impl Renderer {
                 segments.push(Segment::Text("\n".into()));
                 segments.push(Segment::Special(turn_start.clone()));
                 segments.push(Segment::Text(format!("{model}\n")));
-                marks.push((segments.len() - 1, Mark::Last));
+                marks.push((
+                    segments.len() - 1,
+                    if *pointer { Mark::Decide } else { Mark::Last },
+                ));
             }
             Renderer::Pointer(d) => {
                 segments.push(Segment::Special(d.question.clone()));
@@ -327,6 +366,46 @@ mod tests {
             panic!()
         };
         assert!(p.contains("ticket: 二重請求です。返金してください。"));
+    }
+
+    #[test]
+    fn label_pointer_layout_keeps_the_prompt_and_marks_option_ends() {
+        let plain = Renderer::gemma_label().render(&req());
+        let r = Renderer::gemma_label().pointer(true).render(&req());
+        let dept = &r.branches[1];
+        // Same text as the label layout, split so each option line's last
+        // token and the model-turn position can be read.
+        let text = |b: &RenderedBranch| {
+            b.segments
+                .iter()
+                .map(|s| match s {
+                    Segment::Text(t) => t.clone(),
+                    Segment::Special(t) => t.clone(),
+                    Segment::Bos => String::new(),
+                })
+                .collect::<String>()
+        };
+        assert_eq!(text(dept), text(&plain.branches[1]));
+        assert_eq!(
+            dept.marks,
+            vec![
+                (0, Mark::OptEnd(0)),
+                (1, Mark::OptEnd(1)),
+                (dept.segments.len() - 1, Mark::Decide)
+            ]
+        );
+        let Segment::Text(t) = &dept.segments[0] else {
+            panic!()
+        };
+        assert!(t.ends_with("A: billing — 請求・返金"));
+        let Segment::Text(t) = &dept.segments[1] else {
+            panic!()
+        };
+        assert_eq!(t, "\nB: technical");
+        assert_eq!(
+            Renderer::gemma_label().pointer(true).layout_name(),
+            "gemma_label_pointer"
+        );
     }
 
     #[test]

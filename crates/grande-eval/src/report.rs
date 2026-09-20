@@ -34,6 +34,11 @@ pub struct Permutation {
     /// Mean over items of the max L1 distance between any two orders'
     /// distributions (original option indexing).
     pub mean_max_l1: f64,
+    /// Accuracy of the argmax of the mean distribution over all orders
+    /// (permutation averaging as a readout), on all rows.
+    pub averaged_accuracy: f64,
+    /// Accuracy of the majority vote over orders (ties to the natural order).
+    pub vote_accuracy: f64,
 }
 
 pub fn permutation(rows: &[Row]) -> Option<Permutation> {
@@ -64,11 +69,36 @@ pub fn permutation(rows: &[Row]) -> Option<Permutation> {
         })
         .sum::<f64>()
         / rows.len() as f64;
+    let mut avg_ok = 0usize;
+    let mut vote_ok = 0usize;
+    for r in &rows {
+        let k = r.permuted_probs[0].len();
+        let mut mean = vec![0.0f64; k];
+        for p in &r.permuted_probs {
+            for (m, x) in mean.iter_mut().zip(p) {
+                *m += x;
+            }
+        }
+        avg_ok += usize::from(argmax(&mean) == r.gold);
+        let mut votes = vec![0usize; k];
+        for &p in &r.permuted_preds {
+            votes[p] += 1;
+        }
+        let best = *votes.iter().max().unwrap();
+        let vote = if votes[r.permuted_preds[0]] == best {
+            r.permuted_preds[0]
+        } else {
+            argmax(&votes.iter().map(|&v| v as f64).collect::<Vec<_>>())
+        };
+        vote_ok += usize::from(vote == r.gold);
+    }
     Some(Permutation {
         n: rows.len(),
         orders,
         flip_rate: flips as f64 / rows.len() as f64,
         mean_max_l1: l1,
+        averaged_accuracy: avg_ok as f64 / rows.len() as f64,
+        vote_accuracy: vote_ok as f64 / rows.len() as f64,
     })
 }
 

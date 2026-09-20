@@ -6,7 +6,7 @@ use indexmap::IndexMap;
 use serde::Serialize;
 
 use crate::api::{Answer, Question, Request, Response, Usage};
-use crate::backend::{Backend, BranchTokens, PrefixSource, Token, Want};
+use crate::backend::{Backend, BranchOutput, BranchTokens, PrefixSource, Token, Want};
 use crate::math::{argmax, confidence, expected_index};
 use crate::plan::Plan;
 use crate::readout::{Distribution, Readout};
@@ -176,6 +176,22 @@ impl<B: Backend> Engine<B> {
             out.push(BranchTokens { tokens, want });
         }
         Ok(out)
+    }
+
+    /// Hidden-state rows at every mark of every branch, one packed pass,
+    /// under explicit option orders. Feature extraction for training a
+    /// pointer head on this backend's own numbers; no readout involved.
+    pub fn hidden_rows(
+        &mut self,
+        req: &Request,
+        orders: &IndexMap<String, Vec<usize>>,
+    ) -> Result<Vec<(RenderedBranch, BranchOutput)>> {
+        let rendered = self.renderer.render_with(req, orders);
+        let packed = self.pack(&rendered)?;
+        let outs = self
+            .backend
+            .evaluate(&packed.prefix, &packed.branches, Want::Hidden)?;
+        Ok(rendered.branches.into_iter().zip(outs).collect())
     }
 
     /// Evaluate `branches` over the prefix (one pass, or one per branch)
