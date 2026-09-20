@@ -25,6 +25,8 @@
 //! only the first n layers.
 
 pub mod engine;
+#[cfg(feature = "laya")]
+pub mod laya;
 pub mod model;
 
 pub use engine::{Engine, EngineBuilder, Group, SavedState, SEQ_GROUP_SHIFT};
@@ -34,3 +36,5 @@ pub use model::{Config, Dtype, QTensor, Weights};
 mod backend;
 #[cfg(feature = "native")]
 pub use backend::WgpuBackend;
+#[cfg(all(feature = "native", feature = "laya"))]
+pub use laya::LayaBackend;

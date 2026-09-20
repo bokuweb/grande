@@ -46,6 +46,7 @@ are ours (`tools/jevbench_compare.py`).
 | 16 | jeff (GLiFormer 400M) | 100.0 | 75.0 | 38.7 | 64.8 |
 | **17** | **grande, Gemma 4 E2B it Q4_0 vocab-pruned (1.2 GB), zero-shot** | 97.9 | 73.6 | 34.2 | 61.9 |
 | 18 | Laya (ModernBERT-large 421M) | 95.8 | 69.4 | 35.1 | 60.3 |
+| – | laya-multilingual (mmBERT-base 322M) through laya-mlx, our run — see [laya.md](laya.md) | 89.6 | 40.3 | 33.3 | 47.0 |
 | 19 | GLiNER2 (gliner2.5-base) | 97.9 | 63.9 | 36.9 | 59.3 |
 | 20 | openJev Verdict (ModernBERT-base 151M) | 85.4 | 62.5 | 37.8 | 56.7 |
 | 21 | open-jev-deberta-v3-large | 100.0 | 43.1 | 37.8 | 52.0 |

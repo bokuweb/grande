@@ -45,6 +45,11 @@ pub struct Diagnostics {
     /// Gated re-read ([`Engine::recheck`]): the questions whose first read
     /// fell below the threshold and were re-asked under the other orders.
     pub rechecked: Vec<String>,
+    /// Backends with an action head (Laya): per question, the head's
+    /// probability for acting on the answer (its `act_probability`; the
+    /// rest is the mass on the actions in `act_costs`, e.g. escalate).
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub act_probability: IndexMap<String, f64>,
 }
 
 /// How branches are evaluated.
@@ -58,6 +63,58 @@ pub enum Mode {
 }
 
 pub use crate::plan::EXCLUDED_LOGIT;
+
+/// What a server or CLI needs from a decision model, however it is built:
+/// [`Engine`] (a decoder read at the answer position) or an encoder with a
+/// decision head (grande-wgpu's Laya backend).
+pub trait Decider {
+    /// The model name written into responses.
+    fn model(&self) -> &str;
+    /// Answer one request.
+    fn answer(&mut self, req: &Request, mode: Mode) -> Result<(Response, Diagnostics)>;
+    /// Answer several requests, sharing a pass where the model can. The
+    /// default answers them one by one.
+    fn answer_many(
+        &mut self,
+        reqs: &[&Request],
+        mode: Mode,
+    ) -> Vec<Result<(Response, Diagnostics)>> {
+        reqs.iter().map(|r| self.answer(r, mode)).collect()
+    }
+    /// One distribution per question, with the option order given per
+    /// question in `orders` (slot order as original indices; the natural
+    /// order where absent).
+    fn distributions(
+        &mut self,
+        req: &Request,
+        orders: &IndexMap<String, Vec<usize>>,
+        mode: Mode,
+    ) -> Result<Distributions>;
+}
+
+impl<B: Backend> Decider for Engine<B> {
+    fn model(&self) -> &str {
+        &self.model
+    }
+    fn answer(&mut self, req: &Request, mode: Mode) -> Result<(Response, Diagnostics)> {
+        Engine::answer(self, req, mode)
+    }
+    fn answer_many(
+        &mut self,
+        reqs: &[&Request],
+        mode: Mode,
+    ) -> Vec<Result<(Response, Diagnostics)>> {
+        Engine::answer_many(self, reqs, mode)
+    }
+    fn distributions(
+        &mut self,
+        req: &Request,
+        orders: &IndexMap<String, Vec<usize>>,
+        mode: Mode,
+    ) -> Result<Distributions> {
+        Engine::distributions(self, req, orders, mode)
+    }
+}
 
 /// What [`Engine::distributions`] returns: one distribution per question
 /// (with its rendered branch) plus the request's diagnostics.

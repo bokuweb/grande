@@ -111,7 +111,22 @@ fn store_stage(li: u32, s: Stage) {
     }
 }
 
+// 1 = exact (erf) GELU, what ModernBERT's GeGLU uses; 0 = Gemma's tanh form.
+override GELU_ERF: u32 = 0u;
+
+// erf to 1.5e-7 (Abramowitz & Stegun 7.1.26); WGSL has no erf.
+fn erf4(x: vec4<f32>) -> vec4<f32> {
+    let s = sign(x);
+    let a = abs(x);
+    let t = 1.0 / (1.0 + 0.3275911 * a);
+    let y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-a * a);
+    return s * y;
+}
+
 fn gelu(x: vec4<f32>) -> vec4<f32> {
+    if (GELU_ERF == 1u) {
+        return 0.5 * x * (1.0 + erf4(x * 0.7071067811865476));
+    }
     // tanh(z) is +-1 to f32 precision beyond |z| ~ 15; naive GPU tanh
     // implementations overflow to NaN there, so clamp the argument.
     let z = clamp(0.7978845608028654 * (x + 0.044715 * x * x * x), vec4<f32>(-15.0), vec4<f32>(15.0));

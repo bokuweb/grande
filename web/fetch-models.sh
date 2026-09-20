@@ -23,3 +23,15 @@ for f in config.json tokenizer.json tokenizer_config.json head.safetensors model
     || { echo "no $WTAG release; skipping the wgpu model"; rm -rf "$WDEST"; break; }
 done
 ls -la "$WDEST" 2>/dev/null || true
+
+# Laya (mmBERT encoder + decision head, tools/export_laya.py), 180 MB: small
+# enough for the Pages site itself, so it is served same-origin from here
+# rather than from the Hub.
+LTAG="${3:-laya-v1}"
+LDEST="models/laya-multilingual-wgpu"
+mkdir -p "$LDEST"
+for f in config.json tokenizer.json tokenizer_config.json manifest.json embed.bin enc.bin head.bin; do
+  gh release download "$LTAG" --repo bokuweb/grande --pattern "$f" --output "$LDEST/$f" --clobber \
+    || { echo "no $LTAG release; skipping the Laya model"; rm -rf "$LDEST"; break; }
+done
+ls -la "$LDEST" 2>/dev/null || true

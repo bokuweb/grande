@@ -20,9 +20,14 @@ python3 -m http.server 8765 --directory web
 open "http://localhost:8765/"
 ```
 
-The page offers two models: `gemma-4-e2b-wgpu-ja` (the default) and
-`gemma-4-e4b-wgpu-ja`, Gemma 4 E2B / E4B on grande's own wgpu engine with
-the same 25k-token vocabulary, 1.2 GB / 2.5 GB, streamed from the Hugging
+The page offers three models: `gemma-4-e2b-wgpu-ja` (the default) and
+`gemma-4-e4b-wgpu-ja`, Gemma 4 E2B / E4B on grande's own wgpu engine, and
+`laya-multilingual-wgpu`, Convai's Laya (mmBERT encoder + decision head,
+docs/laya.md) on the same engine — 180 MB (Q8, 56k-token vocabulary,
+`tools/export_laya.py`), one bidirectional sequence per question, ~50 ms
+for a 3-question request; fetched from the `laya-v1` release into
+`./models/` by `fetch-models.sh` (small enough for the Pages site). The
+Gemma models share the same 25k-token vocabulary, 1.2 GB / 2.5 GB, streamed from the Hugging
 Face repos `bokuweb/gemma-4-E2B-it-grande-wgpu-ja` /
 `bokuweb/gemma-4-E4B-it-grande-wgpu-ja` (or from `./models/<id>/` when
 that directory exists). Requires WebGPU (Chrome / Edge, Safari 26+). `engine.js` still carries the loaders

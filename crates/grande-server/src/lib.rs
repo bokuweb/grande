@@ -19,7 +19,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use grande_core::readout::Distribution;
-use grande_core::{Backend, Diagnostics, Engine, Error, Mode, RenderedBranch, Request};
+use grande_core::{Decider, Diagnostics, Error, Mode, RenderedBranch, Request};
 use indexmap::IndexMap;
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
@@ -54,7 +54,7 @@ impl EngineHandle {
     /// `max_batch` queued `/v1/systemone` requests share one
     /// [`Engine::answer_many`] call; the engine still splits them by the
     /// backend's limits.
-    pub fn spawn<B: Backend + Send + 'static>(mut engine: Engine<B>, max_batch: usize) -> Self {
+    pub fn spawn<D: Decider + Send + 'static>(mut engine: D, max_batch: usize) -> Self {
         let (tx, rx) = mpsc::channel::<Work>();
         std::thread::Builder::new()
             .name("grande-engine".into())

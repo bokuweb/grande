@@ -12,6 +12,8 @@ use grande_core::{Plan, Renderer, Request, Response, Usage};
 use indexmap::IndexMap;
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
+#[cfg(feature = "wgpu")]
+use wasm_bindgen::JsCast;
 
 /// Render a request. `layout` is a JSON `Renderer`, e.g.
 /// `{"layout":"label","turn_start":"<|turn>","turn_end":"<turn|>","user":"user","model":"model"}`
@@ -456,5 +458,172 @@ impl WgpuLoader {
             .finish(capacity as usize, max_rows as usize)
             .map_err(|e| JsError::new(&format!("{e:#}")))?;
         Ok(WgpuEngine { inner })
+    }
+}
+
+/// Laya (ModernBERT / mmBERT encoder + decision head) on WebGPU: every
+/// question of a request is one bidirectional sequence, all packed into one
+/// pass; the scorer reads each option's `[MASK]` row. Tokenization is the
+/// page's (transformers.js), handed in as a JS function.
+#[cfg(feature = "wgpu")]
+#[wasm_bindgen]
+pub struct LayaEngine {
+    inner: grande_wgpu::laya::LayaEngine,
+    name: String,
+}
+
+#[cfg(feature = "wgpu")]
+struct JsTokenize<'a>(&'a js_sys::Function);
+
+#[cfg(feature = "wgpu")]
+impl grande_wgpu::laya::prompt::Tokenize for JsTokenize<'_> {
+    fn encode(&self, text: &str) -> Vec<u32> {
+        let out = self
+            .0
+            .call1(&JsValue::NULL, &JsValue::from_str(text))
+            .unwrap_or(JsValue::NULL);
+        if let Some(a) = out.dyn_ref::<js_sys::Uint32Array>() {
+            return a.to_vec();
+        }
+        js_sys::Array::from(&out)
+            .iter()
+            .map(|v| v.as_f64().unwrap_or(0.0) as u32)
+            .collect()
+    }
+}
+
+#[cfg(feature = "wgpu")]
+#[wasm_bindgen]
+impl LayaEngine {
+    /// The checkpoint's `config.json` (tools/export_laya.py) as JSON and
+    /// the model name written into responses.
+    pub fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    /// Hidden width, vocabulary, prompt budgets and special ids, as JSON.
+    pub fn config(&self) -> String {
+        let c = &self.inner.config;
+        serde_json::json!({
+            "d": c.d, "vocab": c.vocab, "layers": c.layers, "head_layers": c.head_layers,
+            "max_len": c.max_len, "head_max_len": c.head_max_len,
+            "cls": c.cls, "sep": c.sep, "mask": c.mask, "pad": c.pad,
+        })
+        .to_string()
+    }
+
+    pub async fn warmup(&self) -> Result<(), JsError> {
+        self.inner
+            .warmup()
+            .await
+            .map_err(|e| JsError::new(&format!("{e:#}")))
+    }
+
+    /// Answer a request (JSON). `tokenize` maps text to token ids without
+    /// special tokens (a `Uint32Array` or array). `temperature` multiplies
+    /// the checkpoint's own calibration temperatures. Returns
+    /// `{"response": Response, "diagnostics": {"act_probability": {qid: p},
+    /// "branch_tokens": [...], "state_tokens": n}}`.
+    pub async fn answer(
+        &self,
+        request: &str,
+        tokenize: &js_sys::Function,
+        temperature: f32,
+    ) -> Result<String, JsError> {
+        let req: Request = js(serde_json::from_str(request), "request")?;
+        let tok = JsTokenize(tokenize);
+        let (resp, _, diag) = self
+            .inner
+            .decide(&tok, &self.name, temperature, &req, &IndexMap::new())
+            .await
+            .map_err(|e| JsError::new(&format!("{e:#}")))?;
+        js(
+            serde_json::to_string(&serde_json::json!({
+                "response": resp,
+                "diagnostics": {
+                    "act_probability": diag.act_probability,
+                    "branch_tokens": diag.branch_tokens,
+                    "state_tokens": diag.prefix_tokens,
+                },
+            })),
+            "response",
+        )
+    }
+}
+
+/// Streams an exported Laya directory (tools/export_laya.py) into the
+/// engine one tensor at a time.
+#[cfg(feature = "wgpu")]
+#[wasm_bindgen]
+pub struct LayaLoader {
+    inner: Option<grande_wgpu::laya::LayaBuilder>,
+    name: String,
+}
+
+#[cfg(feature = "wgpu")]
+#[wasm_bindgen]
+impl LayaLoader {
+    /// `config` is the directory's config.json; `specials` maps the special
+    /// tokens' surface forms (`<bos>`, `<mask>`, …) to their ids in the
+    /// page's tokenizer, as JSON.
+    pub async fn open(config: &str, specials: &str) -> Result<LayaLoader, JsError> {
+        let v: serde_json::Value = js(serde_json::from_str(config), "config")?;
+        let ids: std::collections::HashMap<String, u32> =
+            js(serde_json::from_str(specials), "specials")?;
+        let cfg = grande_wgpu::laya::config_from_export(&v, |s| ids.get(s).copied())
+            .map_err(|e| JsError::new(&format!("{e:#}")))?;
+        let name = v["laya_name"].as_str().unwrap_or("laya").to_string();
+        let inner = grande_wgpu::laya::LayaBuilder::new(cfg)
+            .await
+            .map_err(|e| JsError::new(&format!("{e:#}")))?;
+        Ok(LayaLoader {
+            inner: Some(inner),
+            name,
+        })
+    }
+
+    pub fn push(
+        &mut self,
+        name: &str,
+        dtype: &str,
+        shape: Vec<u32>,
+        data: Vec<u8>,
+        scales: Vec<u8>,
+    ) -> Result<(), JsError> {
+        let b = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| JsError::new("loader already finished"))?;
+        let dtype =
+            grande_wgpu::Dtype::parse(dtype).map_err(|e| JsError::new(&format!("{e:#}")))?;
+        let t = grande_wgpu::QTensor::from_raw(
+            dtype,
+            shape.into_iter().map(|x| x as usize).collect(),
+            data,
+            scales,
+        )
+        .map_err(|e| JsError::new(&format!("{name}: {e:#}")))?;
+        b.push(name, &t)
+            .map_err(|e| JsError::new(&format!("{name}: {e:#}")))
+    }
+
+    pub fn missing(&self) -> Vec<String> {
+        self.inner.as_ref().map(|b| b.missing()).unwrap_or_default()
+    }
+
+    /// `capacity` is the packed-token budget per pass, `max_rows` the rows
+    /// read back (one per option plus one per question).
+    pub fn finish(&mut self, capacity: u32, max_rows: u32) -> Result<LayaEngine, JsError> {
+        let b = self
+            .inner
+            .take()
+            .ok_or_else(|| JsError::new("loader already finished"))?;
+        let inner = b
+            .finish(capacity as usize, max_rows as usize)
+            .map_err(|e| JsError::new(&format!("{e:#}")))?;
+        Ok(LayaEngine {
+            inner,
+            name: self.name.clone(),
+        })
     }
 }

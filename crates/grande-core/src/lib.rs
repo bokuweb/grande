@@ -19,7 +19,7 @@ pub use api::{Answer, Question, Request, Response, Usage};
 pub use backend::{
     Backend, BranchOutput, BranchTokens, Group, GroupOutput, Limits, PrefixSource, Token, Want,
 };
-pub use engine::{Diagnostics, Engine, Mode};
+pub use engine::{Decider, Diagnostics, Distributions, Engine, Mode};
 pub use plan::{Folded, Plan};
 pub use readout::Readout;
 pub use render::{Rendered, RenderedBranch, Renderer, Segment};
