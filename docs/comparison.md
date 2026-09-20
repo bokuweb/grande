@@ -18,6 +18,8 @@ on identical questions), and **latency** on one machine.
 | grande Gemma 3 270M + LoRA + pointer head | 1,500 JNLI + 1,500 JCQA train, 2 ep | 0.540 (n=200) | 0.112 → 0.091 | 0.670 (n=200) | 0.074 | 47–77 |
 | grande 270M + head, **12k records** (6,000 + 6,000, 1 ep) | 12k | **0.710** (n=200) | 0.160 → 0.086 | 0.710 (n=200) | 0.050 | 73–77 |
 | grande 270M **12 of 18 layers** + head, 6k records, vocab-pruned (**256 MB**) | 6k | 0.685 (n=200) | 0.063 | 0.630 (n=200) | 0.064 | **26–34** |
+| **grande Gemma 4 E2B Q4_0, frozen, + pointer head on the chat prompt** (`grande features` + `tools/train_head.py`) | 6k JNLI / 4k JCQA, one head each | **0.848** (first 400) | **0.056** | 0.835 (first 400; zero-shot 0.855 on the same rows) | 0.037 | 421 / 280 |
+| grande Gemma 4 E4B Q4_0, zero-shot (`--shots 6` on JNLI) | – | 0.775 (first 400; zero-shot 0.595) | 0.055 | **0.932** (first 400) | **0.017** | 1,770 / 466 |
 | **kev-0.5b** (Qwen2.5-0.5B, English-trained), via its `/v1/systemone` | 6 English datasets | 0.450 (n=300) | 0.168 | 0.577 (n=300) | 0.059 | 136–234 |
 | reflex | – | not run: Python engine needs CUDA; browser 0.8B below | | | | |
 | jev_local (LFM2.5-1.2B) / Jev | – | not run here | | | | |
@@ -31,6 +33,14 @@ zero-shot on JNLI (0.710 vs 0.614) at a tenth of the latency**, and a
 finding (data and a trained readout beat zero-shot size in-distribution)
 reproduced in Japanese. JCQA still favours the bigger backbone (0.853 vs
 0.71): commonsense is knowledge, NLI is a skill.
+
+The same readout lesson applies to the 2B itself: a pointer head trained
+on the frozen, quantized E2B's own hidden states (read through the
+zero-shot chat prompt, no LoRA) takes JNLI to **0.848** at 421 ms, past
+E4B with six in-context examples (0.775) and the 270M LoRA model (0.710).
+On JCQA the head loses 2 points to the letter readout and the answer is
+the bigger backbone: E4B zero-shot 0.932. See the README's "Raising E2B /
+E4B accuracy" for the full sweep (few-shot, order averaging, Q8).
 
 ## 2. Accuracy, kev's frozen English suite (identical questions)
 

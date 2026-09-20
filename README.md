@@ -420,7 +420,38 @@ python tools/train_head.py --features runs/feat/e2b-jnli.safetensors runs/feat/e
 ```
 
 Extraction runs at ~0.7 s per record on the M4 (the second order reuses
-the resident state). Results: see below once the E2B run lands.
+the resident state); 6k JNLI records are 148 MB of F16 rows and the head
+trains in under 30 s. Same first 400 valid records as the table above,
+E2B Q4_0, no temperature:
+
+| readout | JNLI acc | JNLI ECE | JNLI NLL | JCQA acc | JCQA ECE | ms / record |
+|---|---|---|---|---|---|---|
+| zero-shot letters | 0.575 | 0.279 | 1.36 | 0.855 | 0.046 | 750 |
+| head trained on 6k JNLI / 4k JCQA (one per task) | **0.848** | **0.056** | 0.44 | 0.835 | 0.037 | 421 / 280 |
+| one head trained on both | 0.708 | 0.216 | | 0.843 | 0.040 | |
+| for reference: E4B `--shots 6` | 0.775 | 0.055 | | | | 1,770 |
+| for reference: 270M + LoRA + head, 12k records | 0.710 | 0.160 | | 0.710 | 0.050 | 75 |
+
+- **JNLI 0.575 → 0.848 with the weights untouched**, and the readout is
+  calibrated on its own (ECE 0.056; 6% of the ≥0.9 answers are wrong,
+  against 41% zero-shot). It beats E4B with few-shot by 7 points at a
+  quarter of the latency (no example prefix; hidden rows are cheaper
+  than a vocabulary projection) and the 270M LoRA model by 14.
+- JCQA does not want a head: 0.835 against 0.855 zero-shot. The options
+  carry the content there and the letter logits already read it; the
+  head can only lose information. Use the zero-shot readout (or E4B) for
+  knowledge questions and a head for skill questions.
+- One head for both tasks costs JNLI 14 points: a single 256-wide
+  pointer cannot serve fixed-label NLI and content-bearing options at
+  once. Heads are per question family; `--head` is per request, so a
+  server can hold one per question type.
+
+The head-only path is the cheap half of the training story: no HF
+checkpoint, no bf16 memory, no re-quantization, and the wgpu engine
+serves it unchanged since the hidden rows already come out of
+`Want::Hidden`. LoRA on the backbone remains the next step for the
+last points; distillation only makes sense with a teacher stronger
+than E4B.
 
 ## Notes
 
