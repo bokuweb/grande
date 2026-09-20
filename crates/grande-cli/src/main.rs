@@ -71,6 +71,10 @@ enum Cmd {
         recheck: Option<f64>,
         #[arg(long, default_value_t = 8192)]
         n_ctx: u32,
+        /// Answer the request this many times and report min / median wall
+        /// time (the GPU clocks up over the first few).
+        #[arg(long, default_value_t = 1)]
+        repeat: usize,
         #[arg(long, default_value_t = 999)]
         n_gpu_layers: u32,
         /// Keep the full sliding-window cache. Not needed for branch isolation
@@ -1480,6 +1484,7 @@ fn main() -> Result<()> {
             orders,
             recheck,
             n_ctx,
+            repeat,
             n_gpu_layers,
             swa_full,
         } => {
@@ -1493,11 +1498,22 @@ fn main() -> Result<()> {
                 eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f32());
                 let t = Instant::now();
                 let (resp, diag) = laya.answer(&req, Mode::Packed)?;
-                let ms = t.elapsed().as_millis();
+                let mut times = vec![t.elapsed().as_secs_f64() * 1e3];
+                for _ in 1..repeat {
+                    let t = Instant::now();
+                    laya.answer(&req, Mode::Packed)?;
+                    times.push(t.elapsed().as_secs_f64() * 1e3);
+                }
+                times.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 println!("{}", serde_json::to_string_pretty(&resp)?);
                 eprintln!(
-                    "laya: {} ms, state {} tok, sequences {:?} tok",
-                    ms, diag.prefix_tokens, diag.branch_tokens
+                    "laya: {:.1} ms (min {:.1}, median {:.1} over {}), state {} tok, sequences {:?} tok",
+                    times[0],
+                    times[0],
+                    times[times.len() / 2],
+                    times.len(),
+                    diag.prefix_tokens,
+                    diag.branch_tokens
                 );
                 for (id, p) in &diag.act_probability {
                     eprintln!("  act_probability {id}: {p:.4}");

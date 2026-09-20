@@ -38,7 +38,7 @@ pub fn sequences(
     tok: &dyn Tokenize,
     req: &Request,
     orders: &IndexMap<String, Vec<usize>>,
-) -> Result<(Vec<Sequence>, Vec<RenderedBranch>, usize)> {
+) -> Result<Built> {
     req.validate().map_err(|e| anyhow!("{e}"))?;
     let state = prompt::state_ids(tok, cfg, &req.state);
     let mut seqs = Vec::with_capacity(req.questions.len());
@@ -126,7 +126,98 @@ pub fn response(
     }
 }
 
+/// One answered request: response, per-question distributions, diagnostics.
+pub type Decided = (Response, Vec<(RenderedBranch, Distribution)>, Diagnostics);
+/// A request's sequences, branches and state token count.
+pub type Built = (Vec<Sequence>, Vec<RenderedBranch>, usize);
+
 impl LayaEngine {
+    /// Several requests in as few passes as the capacity allows: their
+    /// sequences are packed together (each is its own sequence, so nothing
+    /// changes for the mask) and split back afterwards. One result per
+    /// request, in order; a request that fails on its own stays a failure
+    /// without taking the others down.
+    pub async fn decide_many(
+        &self,
+        tok: &dyn Tokenize,
+        model: &str,
+        temperature: f32,
+        reqs: &[&Request],
+    ) -> Vec<Result<Decided>> {
+        let none = IndexMap::new();
+        // Build every request's sequences first; keep the failures.
+        let built: Vec<Result<Built>> = reqs
+            .iter()
+            .map(|r| sequences(&self.config, tok, r, &none))
+            .collect();
+        let mut results: Vec<Option<Result<Decided>>> = (0..reqs.len()).map(|_| None).collect();
+        // Greedy passes over the requests that built, in order, within the
+        // engine's token and row capacity.
+        let mut passes: Vec<Vec<usize>> = Vec::new();
+        let mut batch: Vec<usize> = Vec::new();
+        let (mut tokens, mut rows) = (0usize, 0usize);
+        for (i, b) in built.iter().enumerate() {
+            let Ok((seqs, _, _)) = b else { continue };
+            let t: usize = seqs.iter().map(|s| s.ids.len()).sum();
+            let r: usize = seqs.iter().map(|s| s.markers.len() + 1).sum();
+            if !batch.is_empty() && (tokens + t > self.capacity || rows + r > self.max_rows) {
+                passes.push(std::mem::take(&mut batch));
+                tokens = 0;
+                rows = 0;
+            }
+            batch.push(i);
+            tokens += t;
+            rows += r;
+        }
+        if !batch.is_empty() {
+            passes.push(batch);
+        }
+        for pass in passes {
+            let mut all: Vec<Sequence> = Vec::new();
+            for &i in &pass {
+                if let Ok((seqs, _, _)) = &built[i] {
+                    all.extend(seqs.iter().cloned());
+                }
+            }
+            match self.evaluate(&all).await {
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    for &i in &pass {
+                        results[i] = Some(Err(anyhow!("{msg}")));
+                    }
+                }
+                Ok(mut outs) => {
+                    for &i in &pass {
+                        let Ok((seqs, branches, state_tokens)) = &built[i] else {
+                            continue;
+                        };
+                        let mine: Vec<Output> = outs.drain(..seqs.len()).collect();
+                        let (dists, mut diag) = distributions(
+                            &self.config,
+                            temperature,
+                            seqs,
+                            branches.clone(),
+                            mine,
+                            *state_tokens,
+                        );
+                        diag.batch = pass.len();
+                        let resp = response(model, reqs[i], &dists, &diag);
+                        results[i] = Some(Ok((resp, dists, diag)));
+                    }
+                }
+            }
+        }
+        results
+            .into_iter()
+            .zip(built)
+            .map(|(r, b)| match (r, b) {
+                (Some(r), _) => r,
+                (None, Err(e)) => Err(e),
+                (None, Ok(_)) => Err(anyhow!("request not evaluated")),
+            })
+            .collect()
+    }
+
     /// Answer a whole request: tokenize with `tok`, one pass, distributions
     /// and the response.
     pub async fn decide(

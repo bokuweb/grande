@@ -150,6 +150,23 @@ impl Decider for LayaBackend {
         Ok((resp, diag))
     }
 
+    /// Queued requests share a pass (each question is its own sequence, so
+    /// packing them changes nothing but the throughput).
+    fn answer_many(
+        &mut self,
+        reqs: &[&Request],
+        _mode: Mode,
+    ) -> Vec<grande_core::Result<(Response, Diagnostics)>> {
+        let tok = Tok(&self.tokenizer);
+        pollster::block_on(
+            self.engine
+                .decide_many(&tok, &self.model, self.temperature, reqs),
+        )
+        .into_iter()
+        .map(|r| r.map(|(resp, _, diag)| (resp, diag)).map_err(backend_err))
+        .collect()
+    }
+
     fn distributions(
         &mut self,
         req: &Request,

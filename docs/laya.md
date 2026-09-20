@@ -152,15 +152,33 @@ Parity with laya-mlx (fp16), M4:
 | ticket-ja, 5 questions, 637 tokens | 78 ms | 211 ms | – |
 | contract preset, 8 questions, 2,361 tokens (browser) | – | – | 765 ms |
 
-The answers match; the speed does not yet: the matmul kernel is the one
-tuned for Gemma's large, quantized, bandwidth-bound layers and reaches
-~0.9 TFLOPS on Laya's 768-wide f16 / Q8 layers (`mm_qkv` + `mm_wi` +
-`mm_wo` + `mm_o` = 75 % of GPU time; `GRANDE_WGPU_PROFILE=1 grande probe`),
-against MLX's steel GEMM at 2–3×. A compute-shaped tile (8 × 8 outputs per
-thread, f32 staging, no unpacks) is the next step and should close most of
-it. Even so, the browser answers the 8-question contract preset in 0.77 s
-where E2B takes several seconds, and Laya's act head (`act_probability`,
-1 − the escalate mass) comes back per question for routing to E2B / E4B.
+The answers match; the speed is within 2× of MLX and stays there. Where the
+time goes (`GRANDE_WGPU_PROFILE=1 grande probe --repeat 20`, Q8 export,
+3-question request, 175 tokens): 41.6 ms of GPU time over 291 dispatches,
+the four encoder matmuls 25 ms (`mm_qkv` 0.44 ms a layer = 1.4 TFLOPS on
+Q8, `mm_o` 1.2 TFLOPS), attention 4.4 ms, everything else under 2 ms.
+Two compute-shaped tiles were tried against the shipped kernel (f32 tiles
+staged k-major in workgroup memory, no unpacking, register blocks unrolled
+by hand) and both lost on the M4:
+
+| matmul tile (Q8 export) | 3 q / 175 tok | 5 q / 637 tok |
+|---|---|---|
+| **matmul.wgsl** (32 × 128, 4 × 8 per thread, f16-pair tiles) | **43 ms** | **140 ms** |
+| 64 × 64, 8 × 8 per thread, f32 tiles | 55 ms | 184 ms |
+| 32 × 32, 4 × 4 per thread, f32 tiles | 61 ms | 208 ms |
+| laya-mlx (MLX steel GEMM, fp16) | 24 ms | 78 ms |
+
+f32 staging costs more workgroup-memory bandwidth than the unpacks save
+(the same result the Gemma kernel's notes record), so a plain WGSL tile
+sits at ~1.3 TFLOPS here; MLX's 2× comes from the simdgroup matrix units,
+which WGSL cannot reach in shipping wgpu / browsers. Cross-request
+batching (`answer_many` packs queued requests into one pass, `X-Grande-Batch`)
+is in, and worth +25 % throughput at 16 concurrent clients (23 → 29 req/s)
+— the pass is compute-bound, so it cannot do more. What would move the
+number now is fewer tokens, not a faster kernel: Laya re-reads the state
+for every question, so an 8-question request over a 245-token state is
+2,361 tokens (765 ms in the browser) where grande's shared prefix would
+read it once.
 
 ## Rerun
 
