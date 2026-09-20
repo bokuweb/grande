@@ -59,13 +59,16 @@ on an M4.
       and on E2B / E4B Q4_0; `grande --model <checkpoint dir>` and the
       `gemma-4-e2b-wgpu-ja` / `gemma-4-e4b-wgpu-ja` browser models (1.2 GB /
       2.5 GB after vocabulary pruning).
+      The last state's K/V stays resident: a request over the same state
+      runs only its branches (E2B, 12 questions: 500-token state 3.0 → 1.7 s,
+      2,000 tokens 8.1 → 2.0 s native; browser ticket 1.0 → 0.77 s), and
+      every state seen is kept serialized (f16, sliding layers window-only:
+      19 MB per 2,000 tokens; RAM LRU, `--state-cache-dir` files natively,
+      RAM in the browser) so coming back to one is a ~50 ms restore.
 - [x] `grande jglue --shots N` (few-shot from the train split), `grande
       features` + `tools/train_head.py`: a pointer head on the frozen,
       quantized E2B / E4B read through the zero-shot chat prompt
       (`gemma_label_pointer`), trained on the engine's own hidden states.
-- [ ] IIA test, permutation flip rate on a JGLUE sample
-      and on E2B Q4_0; `grande --model <checkpoint dir>` and the
-      `gemma-4-e2b-wgpu-ja` browser model (1.2 GB after vocabulary pruning).
 - [x] `--orders N`: every Choice / Noul asked under N option orders in the
       same pass, logits averaged (position bias out); `order_spread` in the
       diagnostics. Permutation flip rate on JGLUE below.
@@ -243,6 +246,18 @@ milliseconds. The `X-Grande-State` response header says which path a
 request took: `resident`, `ram`, `disk` or `decoded`. `grande bench`
 reports the restore (`restored_ms`, `restored_from`) next to cold and warm.
 
+`serve` takes a GGUF (llama.cpp) or a wgpu checkpoint directory. Requests
+that arrive while the engine is busy are queued and then handed to it
+together (`--max-batch`, default 32): each keeps its own response and its
+own error, and `X-Grande-Batch` says how many shared the pass. On the wgpu
+engine a batch is literally one forward pass over every request's state and
+branches, isolated from each other exactly as branches are; on llama.cpp
+the requests run one after the other unless `--llama-batch` is given (one
+`llama_decode` with a run of sequence ids per request — measured slower on
+Metal, where every ubatch attends over the whole unified cache).
+`tools/http_bench.py` sweeps concurrency against any `/v1/systemone`
+server with a fresh state per request and checks the answers agree.
+
 ## Layout
 
 ```
@@ -343,6 +358,29 @@ average removes. The extra branches cost their tokens: on the wgpu engine
 (native, E2B pruned) the 5-question ticket goes from 315 to 542 tokens and
 0.80 to 1.36 s at 3 orders; on llama.cpp the JGLUE runs above took
 2–2.5× per record.
+
+`--recheck τ` gates those extra branches on need (the "auto" policy of
+DiffusionGemma-as-Jev: a second read only when the first is uncertain).
+Every question is asked once in the first pass; the ones whose confidence
+(1 − H/ln k) comes back below τ are re-asked under the other N−1 orders in
+a second pass, and their logits are averaged as usual. `rechecked` in the
+diagnostics (`X-Grande-Rechecked`) names them. JNLI valid, first 300, E2B
+Q4_0 pruned, label readout:
+
+| | records re-asked | branches | acc | ECE raw | ECE with T (odd half) | ms / record |
+|---|---|---|---|---|---|---|
+| 1 order | – | 300 | 0.537 | 0.312 | 0.056 | 666 |
+| 3 orders | all | 900 | **0.570** | **0.234** | 0.112 | 1,305 |
+| 3 orders, `--recheck 0.5` | 89 (30%) | **478** | 0.567 | 0.265 | 0.055 | **732** |
+| 3 orders, `--recheck 0.7` | 215 (72%) | 730 | 0.570 | 0.241 | 0.064 | 1,274 |
+
+At τ 0.5 the gate keeps nine tenths of the accuracy gain for half the
+branches (and a second pass only on the records that need it); the raw
+calibration gain shrinks because the overconfident answers are exactly the
+ones not averaged, and a fitted temperature makes that moot. Confidence
+is a weak signal on JNLI (records below 0.5 are right 44% of the time,
+above 58%), so τ trades cost for accuracy smoothly rather than finding a
+knee.
 
 A Choice with more options than the label readout can letter (52) no
 longer errors: the options are asked in groups of at most 52 in the first

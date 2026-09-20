@@ -60,7 +60,14 @@ fn plan_of(
     let renderer: Renderer = js(serde_json::from_str(layout), "layout")?;
     let cap = (label_cap > 0).then_some(label_cap as usize);
     let plan = js(
-        Plan::new(&renderer, &req, &IndexMap::new(), cap, orders as usize),
+        Plan::new(
+            &renderer,
+            &req,
+            &IndexMap::new(),
+            cap,
+            orders as usize,
+            None,
+        ),
         "plan",
     )?;
     Ok((req, renderer, plan))
@@ -165,7 +172,7 @@ pub fn plan_second(
         temperature,
         "rows",
     )?;
-    let (branches, finalists) = plan.second(&renderer, &req, &first);
+    let (branches, finalists, _rechecked) = plan.second(&renderer, &req, &first);
     js(
         serde_json::to_string(&serde_json::json!({
             "branches": branches,
@@ -205,7 +212,7 @@ pub fn answer(
         temperature,
         "rows",
     )?;
-    let (branches, finalists) = plan.second(&renderer, &req, &first);
+    let (branches, finalists, _rechecked) = plan.second(&renderer, &req, &first);
     let second = match (&rows2, branches.is_empty()) {
         (_, true) => Vec::new(),
         (Some(r), false) => distributions(
@@ -300,6 +307,24 @@ impl WgpuEngine {
             "{{\"d\":{},\"vocab\":{},\"bos\":{},\"per_layer_dim\":{},\"layers\":{}}}",
             c.d, c.vocab, c.bos, c.per_layer_dim, c.layers
         )
+    }
+
+    /// How the last `evaluate` obtained its prefix: `"resident"` (same
+    /// prefix as the previous request, only the branches ran) or `"decoded"`.
+    pub fn prefix_source(&self) -> Option<String> {
+        self.inner.prefix_source().map(|s| s.as_str().to_string())
+    }
+
+    /// Forget the resident prefix (the next request decodes it again).
+    pub fn evict_resident(&self) {
+        self.inner.evict_resident();
+    }
+
+    /// Keep the K/V of every state seen (f16, sliding layers window-only)
+    /// in a RAM LRU of `bytes`, so coming back to a state is a restore
+    /// (`prefix_source` "ram") instead of a decode. 0 turns it off.
+    pub fn set_state_cache_bytes(&mut self, bytes: u32) {
+        self.inner.set_state_cache(bytes as usize, None, "wgpu");
     }
 
     /// Run a two-token request so the first real one does not pay for the

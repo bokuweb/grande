@@ -64,6 +64,11 @@ enum Cmd {
         /// pass and average the logits (position-bias removal). 1 = off.
         #[arg(long, default_value_t = 1)]
         orders: usize,
+        /// With --orders N: ask each question once first and re-ask only
+        /// those whose confidence is below this under the other N-1 orders
+        /// (a second pass). Confident answers cost one branch.
+        #[arg(long)]
+        recheck: Option<f64>,
         #[arg(long, default_value_t = 8192)]
         n_ctx: u32,
         #[arg(long, default_value_t = 999)]
@@ -119,6 +124,11 @@ enum Cmd {
         /// pass and average the logits (position-bias removal). 1 = off.
         #[arg(long, default_value_t = 1)]
         orders: usize,
+        /// With --orders N: ask each question once first and re-ask only
+        /// those whose confidence is below this under the other N-1 orders
+        /// (a second pass). Confident answers cost one branch.
+        #[arg(long)]
+        recheck: Option<f64>,
     },
     /// Prefill throughput: a synthetic state of about N tokens and Q
     /// questions, packed, repeated a few times.
@@ -144,6 +154,19 @@ enum Cmd {
         /// Pointer head weights (safetensors); switches to the packed layout.
         #[arg(long)]
         head: Option<PathBuf>,
+        /// Also run this many requests over this many different states, one
+        /// after the other and then all in one `answer_many` call (what the
+        /// server does with concurrent requests), and compare.
+        #[arg(long, default_value_t = 0)]
+        batch: usize,
+        /// RAM for the state cache (MB); 0 turns it off, so a pass is
+        /// measured without the state readback that follows it.
+        #[arg(long, default_value_t = 512)]
+        state_cache_mb: usize,
+        /// llama.cpp: decode the batched requests in one `llama_decode`
+        /// (measured slower on Metal; the wgpu engine always batches).
+        #[arg(long)]
+        llama_batch: bool,
     },
     /// Mechanism tests (kev's): isolation, packed vs separate, boundary
     /// forgery. Prints one line per test with a pass/fail verdict.
@@ -203,6 +226,11 @@ enum Cmd {
         /// pass and average the logits (position-bias removal). 1 = off.
         #[arg(long, default_value_t = 1)]
         orders: usize,
+        /// With --orders N: ask each question once first and re-ask only
+        /// those whose confidence is below this under the other N-1 orders
+        /// (a second pass). Confident answers cost one branch.
+        #[arg(long)]
+        recheck: Option<f64>,
         #[arg(long, default_value_t = 8192)]
         n_ctx: u32,
         /// RAM for serialized states of recently seen documents (MB). A
@@ -213,6 +241,22 @@ enum Cmd {
         /// restart.
         #[arg(long)]
         state_cache_dir: Option<PathBuf>,
+        /// Requests that may share one pass: everything queued while the
+        /// engine was busy, up to this many, goes to it together (the
+        /// backend's token / sequence limits still split it). 1 = one
+        /// request at a time.
+        #[arg(long, default_value_t = 32)]
+        max_batch: usize,
+        /// Sequences the llama.cpp context can hold at once (a request takes
+        /// 1 + its branches; a batch of requests takes their sum). Ignored
+        /// by the wgpu engine.
+        #[arg(long, default_value_t = 256)]
+        n_seq_max: u32,
+        /// llama.cpp: decode queued requests in one `llama_decode` instead
+        /// of one after the other (measured slower on Metal; the wgpu
+        /// engine always shares the pass).
+        #[arg(long)]
+        llama_batch: bool,
     },
     /// Dump the packed layout of a request as JSON: prefix token ids, and
     /// per branch the token ids, wanted positions and option keys. Used to
@@ -247,6 +291,11 @@ enum Cmd {
         /// pass and average the logits (position-bias removal). 1 = off.
         #[arg(long, default_value_t = 1)]
         orders: usize,
+        /// With --orders N: ask each question once first and re-ask only
+        /// those whose confidence is below this under the other N-1 orders
+        /// (a second pass). Confident answers cost one branch.
+        #[arg(long)]
+        recheck: Option<f64>,
     },
     /// Print a GGUF metadata value (e.g. tokenizer.chat_template).
     Meta {
@@ -302,10 +351,12 @@ enum Cmd {
 
 /// Open the model at `path`: a GGUF file runs on llama.cpp, a directory with
 /// `config.json` + `model.safetensors` + `tokenizer.json` on the wgpu engine.
-fn load_backend(path: &Path, opts: Options) -> Result<Box<dyn Backend>> {
+fn load_backend(path: &Path, opts: Options) -> Result<Box<dyn Backend + Send>> {
     if path.is_dir() {
         let n_ctx = opts.n_ctx as usize;
-        Ok(Box::new(grande_wgpu::WgpuBackend::load(path, n_ctx, 256)?))
+        let mut b = grande_wgpu::WgpuBackend::load(path, n_ctx, 256)?;
+        b.set_state_cache(path, opts.state_cache_bytes, opts.state_cache_dir.clone());
+        Ok(Box::new(b))
     } else {
         Ok(Box::new(LlamaEngine::load(path, opts)?))
     }
@@ -389,6 +440,7 @@ fn main() -> Result<()> {
             shots_seed,
             baseline,
             orders,
+            recheck,
         } => {
             use grande_eval::jglue::{self, Task};
             use grande_eval::report::{summarize, Row};
@@ -455,14 +507,21 @@ fn main() -> Result<()> {
             let mut engine = Engine::new(backend, renderer, readout, name.clone());
             engine.baseline = baseline;
             engine.orders = orders;
+            engine.recheck = recheck;
             let mut rows = Vec::with_capacity(items.len());
             let mut file = std::io::BufWriter::new(std::fs::File::create(&rows_path)?);
             use std::io::Write;
             let t0 = Instant::now();
+            // Gated re-read: how many records fell below the threshold and
+            // how many branches the run spent in total.
+            let mut rechecked = 0usize;
+            let mut branches = 0usize;
             for (i, item) in items.iter().enumerate() {
                 let t = Instant::now();
                 let (dists, diag) =
                     engine.distributions(&item.request, &Default::default(), Mode::Packed)?;
+                rechecked += usize::from(!diag.rechecked.is_empty());
+                branches += diag.branch_tokens.len();
                 let (_, d) = &dists[0];
                 let pred = grande_core::math::argmax(&d.probs);
                 let mut permuted_preds = Vec::new();
@@ -517,7 +576,8 @@ fn main() -> Result<()> {
             let full = serde_json::json!({
                 "model": name, "task": task, "data": data, "revision": jglue::REVISION,
                 "n": rows.len(), "layout": layout, "head": head, "shots": shots, "permute": permute,
-                "orders": orders, "baseline": engine.baseline, "summary": summary,
+                "orders": orders, "recheck": recheck, "rechecked": rechecked, "branches": branches,
+                "baseline": engine.baseline, "summary": summary,
             });
             std::fs::write(
                 out.join("summary.json"),
@@ -535,6 +595,9 @@ fn main() -> Result<()> {
             flash,
             state_cache_dir,
             head,
+            batch,
+            state_cache_mb,
+            llama_batch,
         } => {
             let backend = load_backend(
                 &model,
@@ -542,7 +605,8 @@ fn main() -> Result<()> {
                     n_ctx,
                     n_batch: n_ctx,
                     n_ubatch,
-                    n_seq_max: (questions + 1).max(2) as u32,
+                    batch_requests: llama_batch,
+                    n_seq_max: ((questions + 1) * batch.max(1)).max(2) as u32,
                     flash: match flash.as_str() {
                         "on" => Some(true),
                         "off" => Some(false),
@@ -553,7 +617,7 @@ fn main() -> Result<()> {
                     state_cache_bytes: if state_cache_dir.is_some() {
                         0
                     } else {
-                        512 << 20
+                        state_cache_mb << 20
                     },
                     state_cache_dir,
                     embeddings: head.is_some(),
@@ -642,16 +706,64 @@ fn main() -> Result<()> {
             // A restored state must answer exactly like the decoded one.
             let restored_delta = last.as_ref().map(|l| answer_delta(l, &resp)).unwrap_or(0.0);
             eprintln!("restored ({source}): {restored_ms} ms, max |Δp| vs decoded {restored_delta:.2e} (round-to-round {round_delta:.2e})");
-            println!(
-                "{}",
-                serde_json::json!({
-                    "tokens": tokens, "branch_tokens": branch_tokens, "questions": questions,
-                    "cold_ms": cold_ms, "cold_tok_per_s": (tokens as f64 / (cold_ms.max(1) as f64 / 1000.0)).round(),
-                    "warm_ms": if warm_ms == u128::MAX { serde_json::Value::Null } else { serde_json::json!(warm_ms) },
-                    "warm_tok_per_s": if warm_ms == u128::MAX { serde_json::Value::Null } else { serde_json::json!((branch_tokens as f64 / (warm_ms as f64 / 1000.0)).round()) },
-                    "restored_ms": restored_ms, "restored_from": source, "restored_max_dp": restored_delta, "round_max_dp": round_delta,
-                })
-            );
+            let mut report = serde_json::json!({
+                "tokens": tokens, "branch_tokens": branch_tokens, "questions": questions,
+                "cold_ms": cold_ms, "cold_tok_per_s": (tokens as f64 / (cold_ms.max(1) as f64 / 1000.0)).round(),
+                "warm_ms": if warm_ms == u128::MAX { serde_json::Value::Null } else { serde_json::json!(warm_ms) },
+                "warm_tok_per_s": if warm_ms == u128::MAX { serde_json::Value::Null } else { serde_json::json!((branch_tokens as f64 / (warm_ms as f64 / 1000.0)).round()) },
+                "restored_ms": restored_ms, "restored_from": source, "restored_max_dp": restored_delta, "round_max_dp": round_delta,
+            });
+            if batch > 1 {
+                // Concurrent requests over different documents: `batch` of
+                // them one after the other (each decodes its state), then
+                // another `batch` of fresh ones in a single `answer_many`,
+                // which is what the server hands the engine when requests
+                // queue up. Fresh states both times so neither run is served
+                // from the state cache; then every batched request is
+                // re-asked alone (a restore) to check the answers agree.
+                let fresh = |i: usize| -> Request {
+                    let mut r = req.clone();
+                    r.state = serde_json::json!(format!("案件番号 {i:04}\n{state}"));
+                    r
+                };
+                let seq_reqs: Vec<Request> = (0..batch).map(fresh).collect();
+                let t = Instant::now();
+                for r in &seq_reqs {
+                    engine.answer(r, Mode::Packed)?;
+                }
+                let seq_ms = t.elapsed().as_millis();
+                let batch_reqs: Vec<Request> = (batch..2 * batch).map(fresh).collect();
+                let refs: Vec<&Request> = batch_reqs.iter().collect();
+                let t = Instant::now();
+                let batched = engine.answer_many(&refs, Mode::Packed);
+                let batch_ms = t.elapsed().as_millis();
+                let mut passes = 0usize;
+                let mut widest = 0usize;
+                let mut batch_delta = 0f64;
+                for (r, res) in batch_reqs.iter().zip(batched) {
+                    let (resp, diag) = res?;
+                    passes = passes.max(diag.passes);
+                    widest = widest.max(diag.batch);
+                    let (alone, _) = engine.answer(r, Mode::Packed)?;
+                    batch_delta = batch_delta.max(answer_delta(&alone, &resp));
+                }
+                let decisions = (batch * questions) as f64;
+                eprintln!(
+                    "batch {batch}: one by one {seq_ms} ms ({:.0} ms / request, {:.1} decisions/s); together {batch_ms} ms ({:.0} ms / request, {:.1} decisions/s, widest pass {widest} requests, {passes} pass{}); max |Δp| batched vs alone {batch_delta:.2e}",
+                    seq_ms as f64 / batch as f64,
+                    decisions / (seq_ms.max(1) as f64 / 1000.0),
+                    batch_ms as f64 / batch as f64,
+                    decisions / (batch_ms.max(1) as f64 / 1000.0),
+                    if passes == 1 { "" } else { "es" },
+                );
+                report["batch"] = serde_json::json!({
+                    "requests": batch, "sequential_ms": seq_ms, "batched_ms": batch_ms,
+                    "sequential_decisions_per_s": decisions / (seq_ms.max(1) as f64 / 1000.0),
+                    "batched_decisions_per_s": decisions / (batch_ms.max(1) as f64 / 1000.0),
+                    "widest_pass": widest, "passes": passes, "batched_max_dp": batch_delta,
+                });
+            }
+            println!("{report}");
         }
         Cmd::Iia {
             model,
@@ -905,16 +1017,24 @@ fn main() -> Result<()> {
             temperature,
             baseline,
             orders,
+            recheck,
             n_ctx,
             state_cache_mb,
             state_cache_dir,
             head,
+            max_batch,
+            n_seq_max,
+            llama_batch,
         } => {
-            let backend = LlamaEngine::load(
+            // A GGUF serves on llama.cpp, a checkpoint directory on the wgpu
+            // engine (`n_ctx` is then its token capacity per pass).
+            let backend = load_backend(
                 &model,
                 Options {
                     n_ctx,
                     n_batch: n_ctx,
+                    n_seq_max,
+                    batch_requests: llama_batch,
                     state_cache_bytes: state_cache_mb << 20,
                     state_cache_dir,
                     embeddings: head.is_some(),
@@ -926,20 +1046,21 @@ fn main() -> Result<()> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("model")
                 .to_lowercase();
-            let (renderer, readout) = readout_for(&backend, head.as_ref())?;
+            let (renderer, readout) = readout_for(&*backend, head.as_ref())?;
             let mut engine = Engine::new(backend, renderer, readout, name.clone());
             engine.temperature = temperature;
             engine.baseline = baseline;
             engine.orders = orders;
+            engine.recheck = recheck;
             let state = std::sync::Arc::new(grande_server::AppState {
-                engine: std::sync::Mutex::new(engine),
+                engine: grande_server::EngineHandle::spawn(engine, max_batch),
                 api_key,
                 model_id: name.clone(),
             });
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async move {
                 let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
-                eprintln!("grande: http://{host}:{port}/v1/systemone  backend {name}  temperature {temperature}");
+                eprintln!("grande: http://{host}:{port}/v1/systemone  backend {name}  temperature {temperature}  max batch {max_batch}");
                 axum::serve(listener, grande_server::router(state)).await?;
                 Ok::<(), anyhow::Error>(())
             })?;
@@ -1000,6 +1121,7 @@ fn main() -> Result<()> {
             limit,
             n_ctx,
             orders,
+            recheck,
         } => {
             use grande_eval::report::{metrics, Row};
             use std::collections::BTreeMap;
@@ -1029,6 +1151,7 @@ fn main() -> Result<()> {
             let (renderer, readout) = readout_for(&backend, head.as_ref())?;
             let mut engine = Engine::new(backend, renderer, readout, "suite");
             engine.orders = orders;
+            engine.recheck = recheck;
             let mut by_task: BTreeMap<String, Vec<Row>> = BTreeMap::new();
             let mut skipped: BTreeMap<String, usize> = BTreeMap::new();
             let mut file = std::io::BufWriter::new(std::fs::File::create(&rows_path)?);
@@ -1337,6 +1460,7 @@ fn main() -> Result<()> {
             temperature,
             baseline,
             orders,
+            recheck,
             n_ctx,
             n_gpu_layers,
             swa_full,
@@ -1366,6 +1490,7 @@ fn main() -> Result<()> {
             engine.temperature = temperature;
             engine.baseline = baseline;
             engine.orders = orders;
+            engine.recheck = recheck;
 
             match mode {
                 ModeArg::Packed | ModeArg::Separate => {

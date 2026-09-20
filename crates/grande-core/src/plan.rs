@@ -16,6 +16,12 @@
 //!   under `cap` together — are asked once more against each other in a
 //!   second pass. The answer is the second pass's distribution with the
 //!   eliminated options at zero.
+//! - **Gated re-read.** With `recheck` set, the first pass asks each
+//!   question once, and only the questions whose answer came back with a
+//!   confidence below the threshold are re-asked under the remaining
+//!   orders in the second pass (the policy of DiffusionGemma-as-Jev: a
+//!   second sample only when the first read is uncertain). A confident
+//!   answer costs one branch; an uncertain one gets the full averaging.
 
 use indexmap::IndexMap;
 
@@ -41,6 +47,9 @@ pub struct Plan {
     pub grouped: Vec<usize>,
     cap: Option<usize>,
     orders: usize,
+    /// Re-ask a question under the other orders only when its first read's
+    /// confidence is below this.
+    recheck: Option<f64>,
 }
 
 /// Distributions per question after folding, plus what was averaged out.
@@ -54,17 +63,26 @@ pub struct Folded {
 
 impl Plan {
     /// `cap` is the label readout's option limit (`None` for the pointer
-    /// readout); `orders` how many option orders to average (1 = off).
+    /// readout); `orders` how many option orders to average (1 = off);
+    /// `recheck` gates the extra orders on the first read's confidence
+    /// ([`crate::math::confidence`]) being below the value.
     pub fn new(
         renderer: &Renderer,
         req: &Request,
         orders: &IndexMap<String, Vec<usize>>,
         cap: Option<usize>,
         n_orders: usize,
+        recheck: Option<f64>,
     ) -> Result<Plan> {
         req.validate()?;
         let rendered = renderer.render_with(req, orders);
         let n_orders = n_orders.max(1);
+        // Gated: one order in the first pass, the rest on demand.
+        let first_orders = if recheck.is_some() && n_orders > 1 {
+            1
+        } else {
+            n_orders
+        };
         let mut first = Vec::new();
         let mut grouped = Vec::new();
         for (qi, (id, q)) in req.questions.iter().enumerate() {
@@ -85,7 +103,7 @@ impl Plan {
                     ));
                 }
                 _ => {
-                    for o in option_orders(k, orders_for(primary.kind, n_orders)) {
+                    for o in option_orders(k, orders_for(primary.kind, first_orders)) {
                         let order: Vec<usize> = o.iter().map(|&s| primary.order[s]).collect();
                         first.push(renderer.branch(id, q, Some(&order)));
                     }
@@ -98,6 +116,7 @@ impl Plan {
             grouped,
             cap,
             orders: n_orders,
+            recheck,
         })
     }
 
@@ -111,15 +130,51 @@ impl Plan {
 
     /// The second pass, given one distribution per `first` branch: the
     /// finalist branches of every grouped Choice (empty when nothing was
-    /// grouped) and, per such question, the finalists' keys.
+    /// grouped) and, per such question, the finalists' keys; plus, with
+    /// `recheck`, the remaining orders of every question whose first read
+    /// was not confident enough, and those questions' ids.
     pub fn second(
         &self,
         renderer: &Renderer,
         req: &Request,
         first: &[Distribution],
-    ) -> (Vec<RenderedBranch>, IndexMap<String, Vec<String>>) {
+    ) -> (
+        Vec<RenderedBranch>,
+        IndexMap<String, Vec<String>>,
+        Vec<String>,
+    ) {
         let mut branches = Vec::new();
         let mut finalists_of = IndexMap::new();
+        let mut rechecked = Vec::new();
+        if let Some(threshold) = self.recheck {
+            if self.orders > 1 {
+                for (qi, (id, q)) in req.questions.iter().enumerate() {
+                    if self.grouped.contains(&qi) {
+                        continue;
+                    }
+                    let primary = &self.rendered.branches[qi];
+                    let k = primary.order.len();
+                    if orders_for(primary.kind, self.orders) < 2 {
+                        continue;
+                    }
+                    let (_, d) = self
+                        .first
+                        .iter()
+                        .zip(first)
+                        .find(|(b, _)| b.id == *id)
+                        .expect("every question has a first branch");
+                    if crate::math::confidence(&d.probs) >= threshold {
+                        continue;
+                    }
+                    rechecked.push(id.clone());
+                    // The first pass asked the natural order; add the rest.
+                    for o in option_orders(k, self.orders).into_iter().skip(1) {
+                        let order: Vec<usize> = o.iter().map(|&s| primary.order[s]).collect();
+                        branches.push(renderer.branch(id, q, Some(&order)));
+                    }
+                }
+            }
+        }
         for &qi in &self.grouped {
             let (id, q) = req.questions.get_index(qi).expect("question");
             let primary = &self.rendered.branches[qi];
@@ -156,7 +211,7 @@ impl Plan {
                 branches.push(renderer.branch(id, q, Some(&order)));
             }
         }
-        (branches, finalists_of)
+        (branches, finalists_of, rechecked)
     }
 
     /// Fold every question's branches into one distribution in its primary

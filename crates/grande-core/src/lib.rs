@@ -16,7 +16,9 @@ pub mod readout;
 pub mod render;
 
 pub use api::{Answer, Question, Request, Response, Usage};
-pub use backend::{Backend, BranchOutput, BranchTokens, PrefixSource, Token, Want};
+pub use backend::{
+    Backend, BranchOutput, BranchTokens, Group, GroupOutput, Limits, PrefixSource, Token, Want,
+};
 pub use engine::{Diagnostics, Engine, Mode};
 pub use plan::{Folded, Plan};
 pub use readout::Readout;
@@ -25,7 +27,7 @@ pub use render::{Rendered, RenderedBranch, Renderer, Segment};
 use thiserror::Error;
 
 /// Errors surfaced to callers of the core.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum Error {
     /// A request failed validation. `path` mirrors the TypeSafe `detail[].loc`.
     #[error("invalid request at {path}: {message}")]

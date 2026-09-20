@@ -271,6 +271,9 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
         gpu = await grande.WgpuEngine.load(config, weights, 4096, 256);
       }
       await gpu.warmup();
+      // States seen before come back from a RAM copy of their K/V (19 MB per
+      // 2,000 tokens of E2B) instead of being decoded again.
+      gpu.set_state_cache_bytes(256 << 20);
     } else if (spec.local) {
       // Same-origin model directory. transformers.js only probes local files when
       // localModelPath is NOT an absolute URL (its metadata check skips http(s)
@@ -550,7 +553,11 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     if (spec.kind === "pointer" || spec.kind === "wgpu") {
       for (const b of rendered.branches) if (spec.readout === "label" && b.keys.length > labelIds.length) throw new Error(`a question has ${b.keys.length} options; this tokenizer supports ${labelIds.length} single-token labels`);
       const { rows, tokens, prefixTokens } = spec.kind !== "wgpu" ? await pointerBatched(rendered) : spec.readout === "label" ? await labelWgpu(rendered) : await pointerWgpu(rendered);
-      return { rows, tokens, forwards: 1, state_tokens: prefixTokens, mode: spec.kind === "wgpu" ? "packed" : "batched" };
+      // The wgpu engine keeps the last state's K/V resident: a request over
+      // the same state runs only its branches (prefix_source "resident").
+      const src = spec.kind === "wgpu" ? gpu.prefix_source() : undefined;
+      const warm = src === undefined ? {} : { warm: src !== "decoded", state_source: src };
+      return { rows, tokens, forwards: 1, state_tokens: prefixTokens, mode: spec.kind === "wgpu" ? "packed" : "batched", ...warm };
     }
     const prefix = segmentsToText(rendered.prefix, bos);
     const branchTexts = rendered.branches.map((b) => segmentsToText(b.segments, bos));
@@ -620,7 +627,7 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     const questions = Object.keys(request.questions).length;
     return { ...out.response, usage: { ...out.response.usage, state_tokens: stateTokens, questions, branches: r.rows.length + (r2?.rows.length ?? 0), orders, mode: r.mode, ms,
         forwards, passes: 1 + (r2 ? 1 : 0),
-        ...(r.warm === undefined ? {} : { state_resident: r.warm }), ...(base ? { calibrated: "contextual", baseline_forwards: base.forwards + (base2?.forwards ?? 0) } : {}) },
+        ...(r.warm === undefined ? {} : { state_resident: r.warm }), ...(r.state_source ? { state_source: r.state_source } : {}), ...(base ? { calibrated: "contextual", baseline_forwards: base.forwards + (base2?.forwards ?? 0) } : {}) },
       diagnostics: { ...out.diagnostics, rows: r.rows, ...(r2 ? { rows2: r2.rows } : {}), ...(base ? { baseline: base.rows } : {}) } };
   }
 
