@@ -1,12 +1,14 @@
 //! Browser surface of `grande-core`. The inference engine lives in JS
-//! (transformers.js on WebGPU); this module owns everything that must be
-//! identical to the native runtime: validation, the rendered layout, label
-//! assignment, softmax / temperature / confidence, and the response shape.
+//! (the wgpu engine below, or transformers.js on WebGPU); this module owns
+//! everything that must be identical to the native runtime: validation,
+//! the rendered layout and the branch plan (option orders, two-stage
+//! Choice), label assignment, softmax / temperature / confidence, and the
+//! response shape.
 
 use grande_core::calibration::CONTENT_FREE;
 use grande_core::engine::to_answer;
 use grande_core::readout::{Distribution, LABELS};
-use grande_core::{Renderer, Request, Response, Usage};
+use grande_core::{Plan, Renderer, Request, Response, Usage};
 use indexmap::IndexMap;
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
@@ -44,45 +46,62 @@ pub fn content_free_state() -> String {
     CONTENT_FREE.to_string()
 }
 
-fn parse_rows(rows: &str, req: &Request, what: &str) -> Result<Vec<Row>, JsError> {
-    let rows: Vec<Row> =
-        serde_json::from_str(rows).map_err(|e| JsError::new(&format!("{what}: {e}")))?;
-    if rows.len() != req.questions.len() {
-        return Err(JsError::new(&format!(
-            "{} {what} for {} questions",
-            rows.len(),
-            req.questions.len()
-        )));
-    }
-    Ok(rows)
+fn js<T, E: std::fmt::Display>(r: Result<T, E>, what: &str) -> Result<T, JsError> {
+    r.map_err(|e| JsError::new(&format!("{what}: {e}")))
 }
 
-/// Assemble the TypeSafe-shaped response. `rows` is a JSON array with one
-/// entry per branch (request order): the option logits the backend read at
-/// the branch's answer position, plus an optional candidate-mass diagnostic.
-/// `baseline_rows`, same shape, are the logits of the same branches over the
-/// content-free state; when given, each answer is contextually calibrated
-/// (its logits minus the baseline's) before the softmax.
-#[wasm_bindgen]
-pub fn answer(
+fn plan_of(
     request: &str,
+    layout: &str,
+    orders: u32,
+    label_cap: u32,
+) -> Result<(Request, Renderer, Plan), JsError> {
+    let req: Request = js(serde_json::from_str(request), "request")?;
+    let renderer: Renderer = js(serde_json::from_str(layout), "layout")?;
+    let cap = (label_cap > 0).then_some(label_cap as usize);
+    let plan = js(
+        Plan::new(&renderer, &req, &IndexMap::new(), cap, orders as usize),
+        "plan",
+    )?;
+    Ok((req, renderer, plan))
+}
+
+/// One distribution per branch from the rows a backend read for them
+/// (`[{"logits": [...], "candidate_mass": m}]`, one per branch, option
+/// logits in the branch's slot order), contextually calibrated against
+/// `baseline` (same shape, the same branches over the content-free state)
+/// when given.
+fn distributions(
+    branches: &[grande_core::RenderedBranch],
     rows: &str,
+    baseline: Option<&str>,
     temperature: f32,
-    model: &str,
-    input_tokens: u32,
-    baseline_rows: Option<String>,
-) -> Result<String, JsError> {
-    let req: Request =
-        serde_json::from_str(request).map_err(|e| JsError::new(&format!("request: {e}")))?;
-    let rows = parse_rows(rows, &req, "rows")?;
-    let baseline = match &baseline_rows {
-        Some(b) => Some(parse_rows(b, &req, "baseline rows")?),
+    what: &str,
+) -> Result<Vec<Distribution>, JsError> {
+    let rows: Vec<Row> = js(serde_json::from_str(rows), what)?;
+    if rows.len() != branches.len() {
+        return Err(JsError::new(&format!(
+            "{} {what} for {} branches",
+            rows.len(),
+            branches.len()
+        )));
+    }
+    let baseline: Option<Vec<Row>> = match baseline {
+        Some(b) => {
+            let b: Vec<Row> = js(serde_json::from_str(b), "baseline rows")?;
+            if b.len() != branches.len() {
+                return Err(JsError::new(&format!(
+                    "{} baseline rows for {} branches",
+                    b.len(),
+                    branches.len()
+                )));
+            }
+            Some(b)
+        }
         None => None,
     };
-    // Any layout gives the same keys/order for the default (unpermuted) render.
-    let rendered = Renderer::gemma_pointer().render(&req);
-    let mut answers = IndexMap::new();
-    for (i, (branch, row)) in rendered.branches.iter().zip(rows).enumerate() {
+    let mut out = Vec::with_capacity(rows.len());
+    for (i, (branch, row)) in branches.iter().zip(rows).enumerate() {
         if row.logits.len() != branch.keys.len() {
             return Err(JsError::new(&format!(
                 "branch {}: {} logits for {} options",
@@ -103,9 +122,118 @@ pub fn answer(
             }
             dist.calibrate(b[i].logits.clone(), temperature);
         }
+        out.push(dist);
+    }
+    Ok(out)
+}
+
+/// The first pass of a request: `{"prefix": [segments], "branches":
+/// [RenderedBranch]}`. With `orders` > 1 every Choice / Noul appears under
+/// that many option orders; a Choice with more options than `label_cap`
+/// (0 = no cap, pointer readout) appears as groups whose finalists
+/// `plan_second` asks for. Same code as the native engine.
+#[wasm_bindgen]
+pub fn plan(request: &str, layout: &str, orders: u32, label_cap: u32) -> Result<String, JsError> {
+    let (_, _, plan) = plan_of(request, layout, orders, label_cap)?;
+    js(
+        serde_json::to_string(&serde_json::json!({
+            "prefix": plan.rendered.prefix,
+            "branches": plan.first,
+        })),
+        "plan",
+    )
+}
+
+/// The second pass, given the first pass's rows: `{"branches": [...],
+/// "finalists": {qid: [keys]}}`; `branches` is empty when no Choice was
+/// grouped. `rows` / `baseline_rows` are the first pass's, as for `answer`.
+#[wasm_bindgen]
+pub fn plan_second(
+    request: &str,
+    layout: &str,
+    orders: u32,
+    label_cap: u32,
+    rows: &str,
+    temperature: f32,
+    baseline_rows: Option<String>,
+) -> Result<String, JsError> {
+    let (req, renderer, plan) = plan_of(request, layout, orders, label_cap)?;
+    let first = distributions(
+        &plan.first,
+        rows,
+        baseline_rows.as_deref(),
+        temperature,
+        "rows",
+    )?;
+    let (branches, finalists) = plan.second(&renderer, &req, &first);
+    js(
+        serde_json::to_string(&serde_json::json!({
+            "branches": branches,
+            "finalists": finalists,
+        })),
+        "plan",
+    )
+}
+
+/// Assemble the TypeSafe-shaped response from the rows of both passes:
+/// `{"response": Response, "diagnostics": {"candidate_mass": {qid: m},
+/// "order_spread": {qid: max |Δp| between orders}, "two_stage": {qid:
+/// [finalist keys]}}}`. `rows` has one entry per `plan` branch, `rows2` one
+/// per `plan_second` branch (omit when it returned none); the
+/// `baseline_rows*` are the same branches over the content-free state and
+/// turn on contextual calibration.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn answer(
+    request: &str,
+    layout: &str,
+    orders: u32,
+    label_cap: u32,
+    rows: &str,
+    rows2: Option<String>,
+    temperature: f32,
+    model: &str,
+    input_tokens: u32,
+    baseline_rows: Option<String>,
+    baseline_rows2: Option<String>,
+) -> Result<String, JsError> {
+    let (req, renderer, plan) = plan_of(request, layout, orders, label_cap)?;
+    let first = distributions(
+        &plan.first,
+        rows,
+        baseline_rows.as_deref(),
+        temperature,
+        "rows",
+    )?;
+    let (branches, finalists) = plan.second(&renderer, &req, &first);
+    let second = match (&rows2, branches.is_empty()) {
+        (_, true) => Vec::new(),
+        (Some(r), false) => distributions(
+            &branches,
+            r,
+            baseline_rows2.as_deref(),
+            temperature,
+            "rows2",
+        )?,
+        (None, false) => {
+            return Err(JsError::new(&format!(
+                "{} second-pass branches need rows2",
+                branches.len()
+            )))
+        }
+    };
+    let folded = plan.fold(
+        first,
+        branches.into_iter().zip(second).collect(),
+        temperature,
+    );
+    let mut answers = IndexMap::new();
+    let mut candidate_mass = IndexMap::new();
+    for (branch, dist) in &folded.results {
+        candidate_mass.insert(branch.id.clone(), dist.candidate_mass);
         answers.insert(
             branch.id.clone(),
-            to_answer(&req.questions[&branch.id], branch, &dist),
+            to_answer(&req.questions[&branch.id], branch, dist),
         );
     }
     let resp = Response {
@@ -116,7 +244,17 @@ pub fn answer(
             output_tokens: 0,
         },
     };
-    serde_json::to_string(&resp).map_err(|e| JsError::new(&e.to_string()))
+    js(
+        serde_json::to_string(&serde_json::json!({
+            "response": resp,
+            "diagnostics": {
+                "candidate_mass": candidate_mass,
+                "order_spread": folded.order_spread,
+                "two_stage": finalists,
+            },
+        })),
+        "response",
+    )
 }
 
 /// The wgpu engine on WebGPU: the whole request (state prefix + isolated

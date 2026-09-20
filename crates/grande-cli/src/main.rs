@@ -153,6 +153,31 @@ enum Cmd {
         #[arg(long)]
         head: Option<PathBuf>,
     },
+    /// IIA test (kev's): append one irrelevant option to a Choice and
+    /// measure how much the log-odds between its top-2 original options
+    /// move. Runs over a JGLUE task or a kev-style suite; prints JSON.
+    Iia {
+        #[arg(long)]
+        model: PathBuf,
+        /// JGLUE task (its valid split from .cache/jglue or `--data`).
+        #[arg(long, value_enum)]
+        task: Option<TaskArg>,
+        #[arg(long)]
+        data: Option<PathBuf>,
+        /// A kev-style suite JSONL instead of a JGLUE task (English
+        /// distractors, clean variant only).
+        #[arg(long)]
+        suite: Option<PathBuf>,
+        #[arg(long, default_value_t = 250)]
+        limit: usize,
+        #[arg(long)]
+        head: Option<PathBuf>,
+        /// Option orders to average (see `probe --orders`).
+        #[arg(long, default_value_t = 1)]
+        orders: usize,
+        #[arg(long, default_value_t = 4096)]
+        n_ctx: u32,
+    },
     /// Serve the TypeSafe-compatible API.
     Serve {
         #[arg(long)]
@@ -626,6 +651,157 @@ fn main() -> Result<()> {
                     "warm_tok_per_s": if warm_ms == u128::MAX { serde_json::Value::Null } else { serde_json::json!((branch_tokens as f64 / (warm_ms as f64 / 1000.0)).round()) },
                     "restored_ms": restored_ms, "restored_from": source, "restored_max_dp": restored_delta, "round_max_dp": round_delta,
                 })
+            );
+        }
+        Cmd::Iia {
+            model,
+            task,
+            data,
+            suite,
+            limit,
+            head,
+            orders,
+            n_ctx,
+        } => {
+            use grande_core::Question;
+            use serde_json::json;
+            // (key, description) pairs the state says nothing about; kev's
+            // list, and a Japanese one for JGLUE.
+            const EN: [(&str, &str); 4] = [
+                ("weather", "Bad weather caused it"),
+                ("purple", "The colour purple"),
+                ("pancakes", "A recipe for pancakes"),
+                ("taxes", "Unrelated: quarterly tax filing"),
+            ];
+            const JA: [(&str, &str); 4] = [
+                ("天気", "悪天候が原因だった"),
+                ("紫", "紫という色"),
+                ("パンケーキ", "パンケーキのレシピ"),
+                ("税金", "無関係：四半期の税務申告"),
+            ];
+            // (request with one Choice, its id) per item.
+            let mut items: Vec<(Request, String)> = Vec::new();
+            let distractors = if let Some(path) = suite {
+                for rec in grande_eval::suite::load(&path)? {
+                    if rec.variant != "clean" {
+                        continue;
+                    }
+                    for (id, q) in &rec.request.questions {
+                        if let Question::Choice { criteria, .. } = q {
+                            if (3..=10).contains(&criteria.len()) {
+                                let mut questions = indexmap::IndexMap::new();
+                                questions.insert(id.clone(), q.clone());
+                                items.push((
+                                    Request {
+                                        model: rec.request.model.clone(),
+                                        state: rec.request.state.clone(),
+                                        questions,
+                                    },
+                                    id.clone(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                EN
+            } else {
+                use grande_eval::jglue::{self, Task};
+                let task = match task {
+                    Some(TaskArg::Jnli) => Task::Jnli,
+                    Some(TaskArg::Jcqa) => Task::Jcqa,
+                    Some(TaskArg::Jsts) => anyhow::bail!("JSTS has no Choice"),
+                    None => anyhow::bail!("pass --task or --suite"),
+                };
+                let data = data.unwrap_or_else(|| {
+                    PathBuf::from(".cache/jglue").join(format!("{}-valid.jsonl", task.name()))
+                });
+                for item in jglue::load(task, &data)? {
+                    items.push((item.request, "answer".to_string()));
+                }
+                JA
+            };
+            items.truncate(limit);
+            let backend = load_backend(
+                &model,
+                Options {
+                    n_ctx,
+                    n_batch: n_ctx,
+                    embeddings: head.is_some(),
+                    ..Default::default()
+                },
+            )?;
+            let (renderer, readout) = readout_for(&*backend, head.as_ref())?;
+            let mut engine = Engine::new(backend, renderer, readout, "iia");
+            engine.orders = orders;
+            let no_orders = Default::default();
+            let mut shifts: Vec<f64> = Vec::new();
+            let mut flips = 0usize;
+            let mut p_distractor: Vec<f64> = Vec::new();
+            let t0 = Instant::now();
+            for (i, (req, qid)) in items.iter().enumerate() {
+                let (d0, _) = engine.distributions(req, &no_orders, Mode::Packed)?;
+                let p0 = &d0[0].1.probs;
+                // Top-2 original options by probability.
+                let mut idx: Vec<usize> = (0..p0.len()).collect();
+                idx.sort_by(|&a, &b| p0[b].total_cmp(&p0[a]));
+                let (a, b) = (idx[0], idx[1]);
+                let Question::Choice {
+                    instructions,
+                    criteria,
+                } = &req.questions[qid]
+                else {
+                    unreachable!()
+                };
+                let (dk, dd) = distractors[i % distractors.len()];
+                // Index-keyed options (JCQA) get the next index as the key.
+                let key = if criteria.keys().all(|k| k.parse::<usize>().is_ok()) {
+                    criteria.len().to_string()
+                } else {
+                    dk.to_string()
+                };
+                if criteria.contains_key(&key) {
+                    continue;
+                }
+                let mut with = criteria.clone();
+                with.insert(key, Some(json!(dd)));
+                let mut req1 = req.clone();
+                req1.questions.insert(
+                    qid.clone(),
+                    Question::Choice {
+                        instructions: instructions.clone(),
+                        criteria: with,
+                    },
+                );
+                let (d1, _) = engine.distributions(&req1, &no_orders, Mode::Packed)?;
+                let p1 = &d1[0].1.probs;
+                let lo = |p: &[f64], a: usize, b: usize| (p[a].max(1e-6) / p[b].max(1e-6)).ln();
+                shifts.push(lo(p1, a, b) - lo(p0, a, b));
+                flips += usize::from(grande_core::math::argmax(p1) != a);
+                p_distractor.push(p1[p1.len() - 1]);
+                if (i + 1) % 50 == 0 {
+                    eprintln!(
+                        "{}/{}  {:.0} s",
+                        i + 1,
+                        items.len(),
+                        t0.elapsed().as_secs_f32()
+                    );
+                }
+            }
+            let n = shifts.len();
+            let mut abs: Vec<f64> = shifts.iter().map(|s| s.abs()).collect();
+            abs.sort_by(f64::total_cmp);
+            let p90 = abs.get((n as f64 * 0.9) as usize).copied().unwrap_or(0.0);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "n": n,
+                    "orders": orders,
+                    "mean_abs_logodds_shift": abs.iter().sum::<f64>() / n.max(1) as f64,
+                    "mean_shift": shifts.iter().sum::<f64>() / n.max(1) as f64,
+                    "p90_abs_shift": p90,
+                    "argmax_flip_rate": flips as f64 / n.max(1) as f64,
+                    "mean_p_distractor": p_distractor.iter().sum::<f64>() / n.max(1) as f64,
+                }))?
             );
         }
         Cmd::Mechanism { model, head } => {

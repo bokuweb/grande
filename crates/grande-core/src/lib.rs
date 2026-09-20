@@ -11,12 +11,14 @@ pub mod backend;
 pub mod calibration;
 pub mod engine;
 pub mod math;
+pub mod plan;
 pub mod readout;
 pub mod render;
 
 pub use api::{Answer, Question, Request, Response, Usage};
 pub use backend::{Backend, BranchOutput, BranchTokens, PrefixSource, Token, Want};
 pub use engine::{Diagnostics, Engine, Mode};
+pub use plan::{Folded, Plan};
 pub use readout::Readout;
 pub use render::{Rendered, RenderedBranch, Renderer, Segment};
 

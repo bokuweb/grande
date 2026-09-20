@@ -202,7 +202,7 @@ async function run() {
   $("usage").innerHTML = `<span class="chip">Running…</span>`;
   try {
     const request = { state: parseState($("state").value), questions: JSON.parse($("questions").value) };
-    const resp = await engine.answer(request, { temperature: Number($("temp").value), mode, calibrate: $("calibrate").checked });
+    const resp = await engine.answer(request, { temperature: Number($("temp").value), mode, calibrate: $("calibrate").checked, orders: Number($("orders").value) });
     renderResults(request, resp);
   } catch (e) {
     $("usage").innerHTML = `<span class="err">${esc(e.message)}</span>`;
@@ -223,11 +223,16 @@ function renderResults(request, resp) {
   const state = u.state_resident === undefined ? `state ${u.state_tokens}` : u.state_resident ? `state ${u.state_tokens} resident` : `state ${u.state_tokens} cold`;
   const chips = [`${u.ms.toFixed(0)} ms`, u.mode, `${u.forwards} forward${u.forwards === 1 ? "" : "s"}`, `${u.input_tokens} tokens (${state})`, `${u.questions} question${u.questions === 1 ? "" : "s"}`];
   if (u.calibrated) chips.push(u.baseline_forwards ? `calibrated (baseline ${u.baseline_forwards} forward${u.baseline_forwards === 1 ? "" : "s"})` : "calibrated (baseline cached)");
+  if (u.orders > 1) chips.push(`${u.orders} orders, ${u.branches} branches`);
+  const twoStage = Object.keys(resp.diagnostics.two_stage ?? {});
+  if (twoStage.length) chips.push(`two-stage: ${twoStage.join(", ")}`);
   $("usage").innerHTML = chips.map((c) => `<span class="chip">${esc(c)}</span>`).join("");
   const cards = [];
   for (const [id, a] of Object.entries(resp.answers)) {
     const q = request.questions[id];
     const mass = resp.diagnostics.candidate_mass[id];
+    const spread = resp.diagnostics.order_spread?.[id];
+    const finalists = resp.diagnostics.two_stage?.[id];
     let opts = "", summary = "";
     if (a.type === "noul") {
       opts = bar("true", a.noul, a.noul >= 0.5) + bar("false", 1 - a.noul, a.noul < 0.5);
@@ -244,7 +249,7 @@ function renderResults(request, resp) {
       <div class="q-head"><span class="q-id">${esc(id)}</span><span class="badge">${a.type}</span></div>
       ${q.instructions ? `<div class="q-inst">${esc(q.instructions)}</div>` : ""}
       <div class="opts">${opts}</div>
-      <div class="q-foot"><span>${summary}</span>${mass == null ? "" : `<span class="${mass < 0.9 ? "warn" : ""}" title="Probability mass on the candidate labels">mass ${mass.toFixed(3)}</span>`}</div>
+      <div class="q-foot"><span>${summary}</span><span>${finalists ? `<span title="Asked in groups, then these ${finalists.length} finalists together">2-stage ${finalists.length}</span> ` : ""}${spread == null ? "" : `<span class="${spread > 0.1 ? "warn" : ""}" title="Largest change of any option's probability between two option orders (averaged out)">spread ${spread.toFixed(3)}</span> `}${mass == null ? "" : `<span class="${mass < 0.9 ? "warn" : ""}" title="Probability mass on the candidate labels">mass ${mass.toFixed(3)}</span>`}</span></div>
     </div>`);
   }
   $("results").innerHTML = cards.join("");
