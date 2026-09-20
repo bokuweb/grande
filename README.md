@@ -368,6 +368,12 @@ table says:
 So without training: E4B, `--shots 6` on NLI-shaped questions, zero-shot
 elsewhere, `--orders` when the question is a fixed letter choice.
 
+For scale: chance is 0.33 on JNLI and 0.20 on JCQA; encoders fine-tuned on
+the JGLUE train splits reach about 0.90 on JNLI and 0.80–0.90 on JCQA, and
+the JGLUE paper's human estimate is about 0.93 / 0.98. E4B zero-shot on
+JCQA is past the fine-tuned encoders; JNLI with few-shot is still some 15
+points under them, which is what the trained head below is for.
+
 ### Frozen backbone, trained head
 
 The zero-shot label readout is the weak part on JNLI (E4B barely beats
