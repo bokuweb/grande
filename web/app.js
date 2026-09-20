@@ -234,6 +234,7 @@ function renderResults(request, resp) {
     const mass = resp.diagnostics.candidate_mass[id];
     const spread = resp.diagnostics.order_spread?.[id];
     const finalists = resp.diagnostics.two_stage?.[id];
+    const act = resp.diagnostics.act_probability?.[id];
     let opts = "", summary = "";
     if (a.type === "noul") {
       opts = bar("true", a.noul, a.noul >= 0.5) + bar("false", 1 - a.noul, a.noul < 0.5);
@@ -250,7 +251,7 @@ function renderResults(request, resp) {
       <div class="q-head"><span class="q-id">${esc(id)}</span><span class="badge">${a.type}</span></div>
       ${q.instructions ? `<div class="q-inst">${esc(q.instructions)}</div>` : ""}
       <div class="opts">${opts}</div>
-      <div class="q-foot"><span>${summary}</span><span>${finalists ? `<span title="Asked in groups, then these ${finalists.length} finalists together">2-stage ${finalists.length}</span> ` : ""}${spread == null ? "" : `<span class="${spread > 0.1 ? "warn" : ""}" title="Largest change of any option's probability between two option orders (averaged out)">spread ${spread.toFixed(3)}</span> `}${mass == null ? "" : `<span class="${mass < 0.9 ? "warn" : ""}" title="Probability mass on the candidate labels">mass ${mass.toFixed(3)}</span>`}</span></div>
+      <div class="q-foot"><span>${summary}</span><span>${finalists ? `<span title="Asked in groups, then these ${finalists.length} finalists together">2-stage ${finalists.length}</span> ` : ""}${spread == null ? "" : `<span class="${spread > 0.1 ? "warn" : ""}" title="Largest change of any option's probability between two option orders (averaged out)">spread ${spread.toFixed(3)}</span> `}${mass == null ? "" : `<span class="${mass < 0.9 ? "warn" : ""}" title="Probability mass on the candidate labels">mass ${mass.toFixed(3)}</span>`}${act == null ? "" : `<span class="${act < 0.5 ? "warn" : ""}" title="Laya's action head: probability of acting on this answer (the rest is the escalate mass)">act ${act.toFixed(2)}</span>`}</span></div>
     </div>`);
   }
   $("results").innerHTML = cards.join("");

@@ -11,6 +11,7 @@ grande-core = { path = "../grande-core" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+indexmap.workspace = true
 wgpu = { version = "29", default-features = false, features = ["std", "wgsl"] }
 bytemuck = { version = "1", features = ["derive"] }
 half = "2"
@@ -22,7 +23,9 @@ pollster = { version = "1", optional = true }
 pollster = "1"
 
 [features]
-default = ["native"]
+default = ["native", "laya"]
+# Laya (ModernBERT / mmBERT encoder + decision head) on the same kernels: laya.rs.
+laya = []
 # Backend impl with the HF tokenizer and a blocking evaluate.
 native = ["dep:tokenizers", "dep:pollster", "wgpu/metal", "wgpu/vulkan"]
 web = ["wgpu/webgpu"]

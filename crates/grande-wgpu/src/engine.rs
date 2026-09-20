@@ -37,11 +37,11 @@ impl Group<'_> {
     }
 }
 
-const PARAM_SLOT: u64 = 256;
+pub(crate) const PARAM_SLOT: u64 = 256;
 
 /// Workgroup memory the attention kernel declares at a head_dim (see
 /// attention.wgsl): Q tile, K/V tile, scores, positions.
-fn attn_workgroup_bytes(hd: usize) -> u32 {
+pub(crate) fn attn_workgroup_bytes(hd: usize) -> u32 {
     let (rows, kb) = attn_tile(hd);
     (rows * hd / 2 * 4 + kb * hd / 2 * 4 + 2 * rows * kb * 4 + kb * 8 + rows * 8 + 4) as u32
 }
@@ -52,7 +52,7 @@ fn attn_workgroup_bytes(hd: usize) -> u32 {
 /// best on an M4 at both head dims (E2B ticket, attention 35 layers): 16 x 16
 /// 67 ms, 32 x 8 101 ms, 8 x 16 68 ms, 16 x 8 64 ms at HD 256; 8 x 16 64 ms
 /// vs 16 x 8 46 ms at HD 512. Workgroup memory is 13 KB / 25 KB.
-fn attn_tile(hd: usize) -> (usize, usize) {
+pub(crate) fn attn_tile(hd: usize) -> (usize, usize) {
     let _ = hd;
     (16, 8)
 }
@@ -143,20 +143,23 @@ struct PlGateParams {
     layer: u32,
 }
 
-struct Kernel {
-    pipeline: wgpu::ComputePipeline,
-    layout: wgpu::BindGroupLayout,
+pub(crate) struct Kernel {
+    pub(crate) pipeline: wgpu::ComputePipeline,
+    pub(crate) layout: wgpu::BindGroupLayout,
 }
 
 /// Compiled kernel variants, keyed by (kernel, head_dim, quant). Built on
 /// demand while wiring the layers.
-struct Kernels {
-    device: wgpu::Device,
-    map: HashMap<(&'static str, usize, u32), Kernel>,
+pub(crate) struct Kernels {
+    pub(crate) device: wgpu::Device,
+    pub(crate) map: HashMap<(&'static str, usize, u32), Kernel>,
 }
 
+/// Bit of a `MatmulGated` variant key selecting the exact (erf) GELU.
+pub(crate) const GELU_ERF: u32 = 1 << 4;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum K {
+pub(crate) enum K {
     Embed,
     Norm,
     Matmul,
@@ -166,10 +169,20 @@ enum K {
     Attention,
     PlCombine,
     PlGate,
+    /// ModernBERT / Laya (laya.rs): LayerNorm, the elementwise bias /
+    /// activation / residual tail, in-place RoPE and bidirectional attention.
+    #[cfg_attr(not(feature = "laya"), allow(dead_code))]
+    LayerNorm,
+    #[cfg_attr(not(feature = "laya"), allow(dead_code))]
+    BiasAct,
+    #[cfg_attr(not(feature = "laya"), allow(dead_code))]
+    RopeBi,
+    #[cfg_attr(not(feature = "laya"), allow(dead_code))]
+    AttentionBi,
 }
 
 impl K {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             K::Embed => "embed",
             K::Norm => "rmsnorm",
@@ -180,6 +193,10 @@ impl K {
             K::Attention => "attention",
             K::PlCombine => "pl_combine",
             K::PlGate => "pl_gate",
+            K::LayerNorm => "layernorm",
+            K::BiasAct => "bias_act",
+            K::RopeBi => "rope_bi",
+            K::AttentionBi => "attention_bi",
         }
     }
 
@@ -194,6 +211,10 @@ impl K {
             K::Attention => include_str!("shaders/attention.wgsl"),
             K::PlCombine => include_str!("shaders/pl_combine.wgsl"),
             K::PlGate => include_str!("shaders/pl_gate.wgsl"),
+            K::LayerNorm => include_str!("shaders/layernorm.wgsl"),
+            K::BiasAct => include_str!("shaders/bias_act.wgsl"),
+            K::RopeBi => include_str!("shaders/rope_bi.wgsl"),
+            K::AttentionBi => include_str!("shaders/attention_bi.wgsl"),
         }
     }
 
@@ -211,15 +232,19 @@ impl K {
             K::Attention => vec![ro, ro, ro, rw],
             K::PlCombine => vec![ro, ro, ro, rw],
             K::PlGate => vec![ro, rw],
+            K::LayerNorm => vec![ro, ro, ro, rw],
+            K::BiasAct => vec![ro, ro, rw],
+            K::RopeBi => vec![ro, rw],
+            K::AttentionBi => vec![ro, ro, rw],
         }
     }
 
-    fn reads_weights(self) -> bool {
+    pub(crate) fn reads_weights(self) -> bool {
         matches!(self, K::Embed | K::Matmul | K::MatmulGated | K::Logits)
     }
 
-    fn uses_head_dim(self) -> bool {
-        matches!(self, K::Qk | K::Attention)
+    pub(crate) fn uses_head_dim(self) -> bool {
+        matches!(self, K::Qk | K::Attention | K::RopeBi | K::AttentionBi)
     }
 }
 
@@ -227,9 +252,16 @@ impl Kernels {
     /// `hd` is substituted into qk_prep / attention, `quant` is the pipeline
     /// constant of the weight-reading kernels; both are normalized to 0 for
     /// kernels that do not use them so variants are shared.
-    fn get(&mut self, k: K, hd: usize, quant: u32) -> &Kernel {
+    pub(crate) fn get(&mut self, k: K, hd: usize, quant: u32) -> &Kernel {
         let hd = if k.uses_head_dim() { hd } else { 0 };
         let quant = if k.reads_weights() { quant } else { 0 };
+        // The gated kernel's activation rides in the key above the dtype.
+        let (quant, erf) = if k == K::MatmulGated {
+            (quant & 0xf, (quant & GELU_ERF) != 0)
+        } else {
+            (quant, false)
+        };
+        let quant = quant | if erf { GELU_ERF } else { 0 };
         let key = (k.name(), hd, quant);
         if !self.map.contains_key(&key) {
             let mut src = String::new();
@@ -245,7 +277,7 @@ impl Kernels {
                 &k.source()
                     .replace(
                         "const HD: u32 = 256u;",
-                        &format!("const HD: u32 = {}u;", hd.max(256)),
+                        &format!("const HD: u32 = {}u;", if hd == 0 { 256 } else { hd }),
                     )
                     .replace(
                         "const ROWS: u32 = 16u;",
@@ -312,11 +344,14 @@ impl Kernels {
                     bind_group_layouts: &[Some(&layout)],
                     immediate_size: 0,
                 });
-            let constants: Vec<(&str, f64)> = if k.reads_weights() {
-                vec![("QUANT", quant as f64)]
+            let mut constants: Vec<(&str, f64)> = if k.reads_weights() {
+                vec![("QUANT", (quant & 0xf) as f64)]
             } else {
                 Vec::new()
             };
+            if k == K::MatmulGated {
+                constants.push(("GELU_ERF", erf as u32 as f64));
+            }
             let pipeline = self
                 .device
                 .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -337,16 +372,16 @@ impl Kernels {
 }
 
 /// An uploaded weight: payload plus (for quantized types) block scales.
-struct GpuTensor {
-    dtype: Dtype,
-    data: wgpu::Buffer,
-    scales: Option<wgpu::Buffer>,
+pub(crate) struct GpuTensor {
+    pub(crate) dtype: Dtype,
+    pub(crate) data: wgpu::Buffer,
+    pub(crate) scales: Option<wgpu::Buffer>,
 }
 
 /// A kernel variant bound to its buffers.
-struct Step {
-    kernel: (&'static str, usize, u32),
-    bind: wgpu::BindGroup,
+pub(crate) struct Step {
+    pub(crate) kernel: (&'static str, usize, u32),
+    pub(crate) bind: wgpu::BindGroup,
 }
 
 struct LayerBinds {
@@ -571,29 +606,106 @@ fn state_key(model_id: &str, prefix: &[u32]) -> u64 {
     h
 }
 
-struct Profiler {
-    queries: wgpu::QuerySet,
-    resolve: wgpu::Buffer,
-    readback: wgpu::Buffer,
-    capacity: u32,
-    period_ns: f32,
+pub(crate) struct Profiler {
+    pub(crate) queries: wgpu::QuerySet,
+    pub(crate) resolve: wgpu::Buffer,
+    pub(crate) readback: wgpu::Buffer,
+    pub(crate) capacity: u32,
+    pub(crate) period_ns: f32,
+}
+
+impl Profiler {
+    /// Timestamp queries for up to `capacity / 2` dispatches.
+    pub(crate) fn new(device: &wgpu::Device, queue: &wgpu::Queue, capacity: u32) -> Self {
+        Profiler {
+            queries: device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: capacity,
+            }),
+            resolve: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ts-resolve"),
+                size: capacity as u64 * 8,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            readback: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ts-readback"),
+                size: capacity as u64 * 8,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            capacity,
+            period_ns: queue.get_timestamp_period(),
+        }
+    }
+}
+
+/// Print GPU time per kernel name for the `timed` dispatches of `plan`
+/// (any past the plan's end are the logits pass).
+pub(crate) async fn report_profile(
+    device: &wgpu::Device,
+    prof: &Profiler,
+    plan: &[Dispatch<'_>],
+    timed: usize,
+) -> Result<()> {
+    let n = timed as u64 * 2;
+    let slice = prof.readback.slice(..n * 8);
+    let (tx, rx) = futures_channel::oneshot::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        tx.send(r).ok();
+    });
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|e| anyhow!("device poll: {e:?}"))?;
+    rx.await
+        .context("map callback dropped")?
+        .map_err(|e| anyhow!("{e:?}"))?;
+    let ts: Vec<u64> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
+    prof.readback.unmap();
+    let mut by_name: Vec<(&str, f64, usize)> = Vec::new();
+    let mut total = 0.0;
+    let names = plan
+        .iter()
+        .map(|d| d.name)
+        .chain(std::iter::repeat("logits"));
+    for (i, name) in names.take(timed).enumerate() {
+        let ms = (ts[2 * i + 1].saturating_sub(ts[2 * i])) as f64 * prof.period_ns as f64 / 1e6;
+        total += ms;
+        match by_name.iter_mut().find(|(n, _, _)| *n == name) {
+            Some(e) => {
+                e.1 += ms;
+                e.2 += 1;
+            }
+            None => by_name.push((name, ms, 1)),
+        }
+    }
+    by_name.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    eprintln!("gpu profile: {total:.2} ms over {timed} dispatches");
+    for (name, ms, count) in by_name {
+        eprintln!(
+            "  {name:<14} {ms:8.2} ms  ({count} x {:.3} ms)",
+            ms / count as f64
+        );
+    }
+    Ok(())
 }
 
 /// One kernel launch as recorded for a request.
-struct Dispatch<'a> {
-    name: &'static str,
-    step: &'a Step,
-    offset: u32,
-    wg: (u32, u32),
+pub(crate) struct Dispatch<'a> {
+    pub(crate) name: &'static str,
+    pub(crate) step: &'a Step,
+    pub(crate) offset: u32,
+    pub(crate) wg: (u32, u32),
 }
 
 /// Collects per-dispatch parameter blocks into one uniform buffer image.
-struct Params {
-    bytes: Vec<u8>,
+pub(crate) struct Params {
+    pub(crate) bytes: Vec<u8>,
 }
 
 impl Params {
-    fn push<T: Pod>(&mut self, v: T) -> u32 {
+    pub(crate) fn push<T: Pod>(&mut self, v: T) -> u32 {
         let off = self.bytes.len();
         self.bytes.extend_from_slice(bytemuck::bytes_of(&v));
         self.bytes.resize(off + PARAM_SLOT as usize, 0);
@@ -601,7 +713,7 @@ impl Params {
     }
 }
 
-fn storage(read_only: bool) -> wgpu::BindingType {
+pub(crate) fn storage(read_only: bool) -> wgpu::BindingType {
     wgpu::BindingType::Buffer {
         ty: wgpu::BufferBindingType::Storage { read_only },
         has_dynamic_offset: false,
@@ -609,7 +721,7 @@ fn storage(read_only: bool) -> wgpu::BindingType {
     }
 }
 
-fn div_ceil(a: usize, b: usize) -> u32 {
+pub(crate) fn div_ceil(a: usize, b: usize) -> u32 {
     a.div_ceil(b) as u32
 }
 
@@ -625,74 +737,83 @@ pub struct EngineBuilder {
     profile: bool,
 }
 
+/// Open the default adapter and a device whose limits fit a checkpoint:
+/// `need` bytes for the largest storage binding (the embedding table),
+/// `attn_mem` bytes of workgroup memory for the attention tile. Returns
+/// whether GPU timestamp profiling is on (GRANDE_WGPU_PROFILE, native only).
+pub(crate) async fn open_device(
+    need: u64,
+    attn_mem: u32,
+) -> Result<(wgpu::Device, wgpu::Queue, bool)> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY | wgpu::Backends::BROWSER_WEBGPU,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| anyhow!("no GPU adapter: {e}"))?;
+    let info = adapter.get_info();
+    eprintln!(
+        "grande-wgpu: {} ({:?}, {:?})",
+        info.name, info.backend, info.device_type
+    );
+    let mut limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
+    limits.max_storage_buffer_binding_size = adapter
+        .limits()
+        .max_storage_buffer_binding_size
+        .max(limits.max_storage_buffer_binding_size);
+    limits.max_buffer_size = adapter.limits().max_buffer_size.max(limits.max_buffer_size);
+    // matmul_gated binds six storage buffers (x, two weights with scales,
+    // y); WebGPU guarantees eight, the downlevel default is four.
+    let sb = adapter.limits().max_storage_buffers_per_shader_stage;
+    if sb < 6 {
+        bail!("adapter allows {sb} storage buffers per stage; the kernels need 6");
+    }
+    limits.max_storage_buffers_per_shader_stage = sb.min(8);
+    let wg_mem = adapter.limits().max_compute_workgroup_storage_size;
+    if wg_mem < attn_mem {
+        bail!("attention needs {attn_mem} bytes of workgroup memory; adapter allows {wg_mem}");
+    }
+    limits.max_compute_workgroup_storage_size = wg_mem;
+    if limits.max_storage_buffer_binding_size < need {
+        bail!(
+            "embedding table needs a {need}-byte storage binding; adapter allows {}",
+            limits.max_storage_buffer_binding_size
+        );
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let profile = std::env::var("GRANDE_WGPU_PROFILE").is_ok()
+        && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+    #[cfg(target_arch = "wasm32")]
+    let profile = false;
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("grande"),
+            required_features: if profile {
+                wgpu::Features::TIMESTAMP_QUERY
+            } else {
+                wgpu::Features::empty()
+            },
+            required_limits: limits,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| anyhow!("request_device: {e}"))?;
+    Ok((device, queue, profile))
+}
+
 impl EngineBuilder {
     /// Open the default adapter with limits sized for this checkpoint.
     pub async fn new(config: Config) -> Result<Self> {
         config.validate()?;
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY | wgpu::Backends::BROWSER_WEBGPU,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| anyhow!("no GPU adapter: {e}"))?;
-        let info = adapter.get_info();
-        eprintln!(
-            "grande-wgpu: {} ({:?}, {:?})",
-            info.name, info.backend, info.device_type
-        );
-        let mut limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
         // The embedding table is the largest single binding (f16: vocab x d x 2).
         let need = (config.vocab * config.d * 2) as u64;
-        limits.max_storage_buffer_binding_size = adapter
-            .limits()
-            .max_storage_buffer_binding_size
-            .max(limits.max_storage_buffer_binding_size);
-        limits.max_buffer_size = adapter.limits().max_buffer_size.max(limits.max_buffer_size);
-        // matmul_gated binds six storage buffers (x, two weights with scales,
-        // y); WebGPU guarantees eight, the downlevel default is four.
-        let sb = adapter.limits().max_storage_buffers_per_shader_stage;
-        if sb < 6 {
-            bail!("adapter allows {sb} storage buffers per stage; the kernels need 6");
-        }
-        limits.max_storage_buffers_per_shader_stage = sb.min(8);
-        let wg_mem = adapter.limits().max_compute_workgroup_storage_size;
-        let attn_mem = attn_workgroup_bytes(config.max_head_dim());
-        if wg_mem < attn_mem {
-            bail!(
-                "attention at head_dim {} needs {attn_mem} bytes of workgroup memory; adapter allows {wg_mem}",
-                config.max_head_dim()
-            );
-        }
-        limits.max_compute_workgroup_storage_size = wg_mem;
-        if limits.max_storage_buffer_binding_size < need {
-            bail!(
-                "embedding table needs a {need}-byte storage binding; adapter allows {}",
-                limits.max_storage_buffer_binding_size
-            );
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        let profile = std::env::var("GRANDE_WGPU_PROFILE").is_ok()
-            && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-        #[cfg(target_arch = "wasm32")]
-        let profile = false;
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("grande"),
-                required_features: if profile {
-                    wgpu::Features::TIMESTAMP_QUERY
-                } else {
-                    wgpu::Features::empty()
-                },
-                required_limits: limits,
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| anyhow!("request_device: {e}"))?;
+        let (device, queue, profile) =
+            open_device(need, attn_workgroup_bytes(config.max_head_dim())).await?;
         let expected = config
             .tensors()
             .into_iter()
@@ -1117,30 +1238,7 @@ impl EngineBuilder {
             });
         }
 
-        let profile = profile.then(|| {
-            let capacity = 2 * param_slots as u32;
-            Profiler {
-                queries: device.create_query_set(&wgpu::QuerySetDescriptor {
-                    label: Some("timestamps"),
-                    ty: wgpu::QueryType::Timestamp,
-                    count: capacity,
-                }),
-                resolve: device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("ts-resolve"),
-                    size: capacity as u64 * 8,
-                    usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-                    mapped_at_creation: false,
-                }),
-                readback: device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("ts-readback"),
-                    size: capacity as u64 * 8,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }),
-                capacity,
-                period_ns: queue.get_timestamp_period(),
-            }
-        });
+        let profile = profile.then(|| Profiler::new(&device, &queue, 2 * param_slots as u32));
         let embed_dtype = embed_t.dtype;
         let mut keep = vec![x, qkv, attn, a, act, dummy];
         keep.extend(pli);
@@ -2020,45 +2118,6 @@ impl Engine {
         plan: &[Dispatch<'_>],
         timed: usize,
     ) -> Result<()> {
-        let n = timed as u64 * 2;
-        let slice = prof.readback.slice(..n * 8);
-        let (tx, rx) = futures_channel::oneshot::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            tx.send(r).ok();
-        });
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| anyhow!("device poll: {e:?}"))?;
-        rx.await
-            .context("map callback dropped")?
-            .map_err(|e| anyhow!("{e:?}"))?;
-        let ts: Vec<u64> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
-        prof.readback.unmap();
-        let mut by_name: Vec<(&str, f64, usize)> = Vec::new();
-        let mut total = 0.0;
-        let names = plan
-            .iter()
-            .map(|d| d.name)
-            .chain(std::iter::repeat("logits"));
-        for (i, name) in names.take(timed).enumerate() {
-            let ms = (ts[2 * i + 1].saturating_sub(ts[2 * i])) as f64 * prof.period_ns as f64 / 1e6;
-            total += ms;
-            match by_name.iter_mut().find(|(n, _, _)| *n == name) {
-                Some(e) => {
-                    e.1 += ms;
-                    e.2 += 1;
-                }
-                None => by_name.push((name, ms, 1)),
-            }
-        }
-        by_name.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        eprintln!("gpu profile: {total:.2} ms over {timed} dispatches");
-        for (name, ms, count) in by_name {
-            eprintln!(
-                "  {name:<14} {ms:8.2} ms  ({count} x {:.3} ms)",
-                ms / count as f64
-            );
-        }
-        Ok(())
+        report_profile(&self.device, prof, plan, timed).await
     }
 }

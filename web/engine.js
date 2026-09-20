@@ -36,9 +36,18 @@ const GEMMA4 = { layout: "label", turn_start: "<|turn>", turn_end: "<turn|>", us
 // `"gemma4"`, incl. the pruned bokuweb/gemma-4-E2B-it-ONNX-ja), the trained
 // 270M pointer model (`"pointer"`, `"wgpu"` + `readout: "pointer"`) — so an
 // entry can be added back; see git history for their specs.
+//
+// `laya-multilingual-wgpu` is Convai's Laya (mmBERT-base encoder + decision
+// head, 322M, docs/laya.md) on the same engine: one bidirectional sequence
+// per question, all questions in one pass, ~20 ms a question. Q8 weights,
+// vocabulary pruned to 56k tokens (tools/export_laya.py), 180 MB. Fast and
+// strong on reading questions (JNLI), weak where knowledge is needed; its
+// action head's `act_probability` (1 − the escalate mass) says when to hand
+// a question to E2B / E4B.
 export const MODELS = {
   "gemma-4-e2b-wgpu-ja": { id: "gemma-4-e2b-wgpu-ja", local: true, hub: "bokuweb/gemma-4-E2B-it-grande-wgpu-ja", kind: "wgpu", readout: "label", manifest: true, dtype: "q4", layout: GEMMA4, size: "1.2 GB", note: "E2B, wgpu engine: one pass, 25k-token vocabulary" },
   "gemma-4-e4b-wgpu-ja": { id: "gemma-4-e4b-wgpu-ja", local: true, hub: "bokuweb/gemma-4-E4B-it-grande-wgpu-ja", kind: "wgpu", readout: "label", manifest: true, dtype: "q4", layout: GEMMA4, size: "2.5 GB", note: "E4B, wgpu engine: one pass, 25k-token vocabulary" },
+  "laya-multilingual-wgpu": { id: "laya-multilingual-wgpu", local: true, hub: "bokuweb/laya-multilingual-grande-wgpu", kind: "laya", manifest: true, dtype: "q8", size: "180 MB", note: "Laya: mmBERT encoder + decision head, ~20 ms a question, 56k-token vocabulary" },
 };
 
 const ZWNJ = "‌";
@@ -161,6 +170,91 @@ async function loadManifest(base, config, onProgress) {
   return { gpu: loader.finish(4096, 256), plTable };
 }
 
+// An exported Laya directory (tools/export_laya.py): the same manifest
+// layout into `LayaLoader`. `specials` maps the special tokens' text to
+// their ids in the page's tokenizer.
+async function loadLayaManifest(base, config, specials, onProgress) {
+  const manifest = await (await fetch(`${base}manifest.json`)).json();
+  const loader = await grande.LayaLoader.open(config, JSON.stringify(specials));
+  let done = 0;
+  for (const file of manifest.files) {
+    const buf = new Uint8Array(await (await cachedFetch(`${base}${file.path}`, onProgress)).arrayBuffer());
+    for (const t of file.tensors) {
+      loader.push(t.name, t.dtype, Uint32Array.from(t.shape), buf.subarray(t.offset, t.offset + t.nbytes),
+        t.scales_nbytes ? buf.subarray(t.scales_offset, t.scales_offset + t.scales_nbytes) : new Uint8Array(0));
+    }
+    onProgress?.({ status: "upload", file: file.path, loaded: ++done, total: manifest.files.length });
+  }
+  onProgress?.({ status: "ready" });
+  return loader.finish(4096, 1024);
+}
+
+// Where a model directory's files are: same-origin ./models/<id>/ when
+// present, else its Hugging Face repo. The tokenizer is loaded from the
+// same place through transformers.js.
+async function resolveBase(transformers, spec, onProgress) {
+  const { AutoTokenizer } = transformers;
+  let base = new URL(`./models/${spec.id}/`, location.href).href;
+  let here = true;
+  if (spec.hub) {
+    const probe = await fetch(`${base}config.json`, { method: "HEAD", cache: "no-store" }).catch(() => null);
+    if (!probe?.ok) {
+      base = `https://huggingface.co/${spec.hub}/resolve/main/`;
+      here = false;
+      const hub = await fetch(`${base}config.json`, { method: "HEAD", cache: "no-store" }).catch(() => null);
+      if (!hub?.ok) throw new Error(`${spec.id}: not in ./models/ and https://huggingface.co/${spec.hub} is not published (see web/README.md)`);
+    }
+  }
+  let tok;
+  if (here) {
+    transformers.env.allowLocalModels = true;
+    transformers.env.localModelPath = "./models/";
+    transformers.env.allowRemoteModels = false;
+    tok = await AutoTokenizer.from_pretrained(spec.id, { progress_callback: onProgress });
+    transformers.env.allowRemoteModels = true;
+  } else {
+    tok = await AutoTokenizer.from_pretrained(spec.hub, { progress_callback: onProgress });
+  }
+  return { base, tok };
+}
+
+// Laya: the whole request goes to the wasm engine, which builds Laya's
+// sequences (calling back into the page's tokenizer), runs one pass and
+// assembles the response. `temperature` multiplies the checkpoint's own
+// calibration temperatures; `mode`, `calibrate` and `orders` do not apply.
+async function loadLaya({ transformers, spec, onProgress }) {
+  const { base, tok } = await resolveBase(transformers, spec, onProgress);
+  const configText = await (await fetch(`${base}config.json`)).text();
+  const tokens = JSON.parse(configText).laya_tokens;
+  const encode = (text) => tok.encode(text, { add_special_tokens: false });
+  const specials = {};
+  for (const t of Object.values(tokens)) {
+    const ids = encode(t);
+    if (ids.length !== 1) throw new Error(`${spec.id}: ${t} is not one token in this tokenizer`);
+    specials[t] = ids[0];
+  }
+  const laya = await loadLayaManifest(base, configText, specials, onProgress);
+  await laya.warmup();
+  const tokenize = (text) => Uint32Array.from(encode(text));
+  let queue = Promise.resolve();
+  const enqueue = (job) => { const p = queue.then(job, job); queue = p.catch(() => {}); return p; };
+  async function answerNow(request, { temperature = 1.0 } = {}) {
+    const t0 = performance.now();
+    const out = JSON.parse(await laya.answer(JSON.stringify(request), tokenize, temperature));
+    const ms = performance.now() - t0;
+    const d = out.diagnostics;
+    const questions = Object.keys(request.questions).length;
+    return { ...out.response,
+      usage: { ...out.response.usage, state_tokens: d.state_tokens, questions, branches: d.branch_tokens.length, orders: 1, mode: "packed", ms, forwards: 1, passes: 1 },
+      diagnostics: { candidate_mass: {}, act_probability: d.act_probability, branch_tokens: d.branch_tokens } };
+  }
+  return {
+    model: spec.id, spec, tokenizer: tok, net: null, device: "webgpu", labels: [],
+    answer: (request, opts) => enqueue(() => answerNow(request, opts)),
+    render: (request) => ({ prefix: [], branches: [] }),
+  };
+}
+
 // f16 <-> f32 without Float16Array (Chrome < 135, Firefox < 129).
 function f16ToF32(h) {
   const s = (h & 0x8000) ? -1 : 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
@@ -233,6 +327,15 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
   transformers.env.useCustomCache = true;
   transformers.env.customCache = idbCache;
   navigator.storage?.persist?.().catch(() => {});
+  if (spec.kind === "laya") {
+    const env0 = { remoteHost: transformers.env.remoteHost, remotePathTemplate: transformers.env.remotePathTemplate };
+    if (modelBase && !spec.local) Object.assign(transformers.env, { remoteHost: modelBase, remotePathTemplate: "{model}/" });
+    try {
+      return await loadLaya({ transformers, spec, onProgress });
+    } finally {
+      Object.assign(transformers.env, env0);
+    }
+  }
   const { AutoTokenizer, AutoModelForCausalLM, AutoProcessor, Gemma4ForCausalLM, Tensor, DynamicCache } = transformers;
 
   const env = transformers.env;

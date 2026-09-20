@@ -1026,6 +1026,24 @@ fn main() -> Result<()> {
             n_seq_max,
             llama_batch,
         } => {
+            // A Laya checkpoint (encoder + decision head) has its own runtime.
+            if grande_wgpu::LayaBackend::is_laya_dir(&model) {
+                let mut laya = grande_wgpu::LayaBackend::load(&model, n_ctx as usize, 1024)?;
+                laya.temperature = temperature;
+                let name = laya.model.clone();
+                let state = std::sync::Arc::new(grande_server::AppState {
+                    engine: grande_server::EngineHandle::spawn(laya, max_batch),
+                    api_key,
+                    model_id: name.clone(),
+                });
+                let rt = tokio::runtime::Runtime::new()?;
+                return rt.block_on(async move {
+                    let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
+                    eprintln!("grande: http://{host}:{port}/v1/systemone  backend {name} (laya)  temperature x{temperature}");
+                    axum::serve(listener, grande_server::router(state)).await?;
+                    Ok::<(), anyhow::Error>(())
+                });
+            }
             // A GGUF serves on llama.cpp, a checkpoint directory on the wgpu
             // engine (`n_ctx` is then its token capacity per pass).
             let backend = load_backend(
@@ -1468,6 +1486,24 @@ fn main() -> Result<()> {
             let req: Request = serde_json::from_slice(&std::fs::read(&request)?)
                 .with_context(|| format!("parsing {}", request.display()))?;
             let t0 = Instant::now();
+            if grande_wgpu::LayaBackend::is_laya_dir(&model) {
+                use grande_core::Decider;
+                let mut laya = grande_wgpu::LayaBackend::load(&model, n_ctx as usize, 1024)?;
+                laya.temperature = temperature;
+                eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f32());
+                let t = Instant::now();
+                let (resp, diag) = laya.answer(&req, Mode::Packed)?;
+                let ms = t.elapsed().as_millis();
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+                eprintln!(
+                    "laya: {} ms, state {} tok, sequences {:?} tok",
+                    ms, diag.prefix_tokens, diag.branch_tokens
+                );
+                for (id, p) in &diag.act_probability {
+                    eprintln!("  act_probability {id}: {p:.4}");
+                }
+                return Ok(());
+            }
             let backend = load_backend(
                 &model,
                 Options {

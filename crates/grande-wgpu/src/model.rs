@@ -321,7 +321,7 @@ pub struct TensorSpec {
 }
 
 impl TensorSpec {
-    fn new(name: &str, shape: Vec<usize>) -> Self {
+    pub fn new(name: &str, shape: Vec<usize>) -> Self {
         TensorSpec {
             name: name.to_string(),
             shape,

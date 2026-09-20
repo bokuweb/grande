@@ -1,0 +1,12 @@
+grande
+Copyright 2026 bokuweb
+
+Licensed under the Apache License, Version 2.0.
+
+This product includes an independent implementation of the Laya decision
+model architecture and prompt format (crates/grande-wgpu/src/laya.rs,
+crates/grande-wgpu/src/laya/prompt.rs, tools/export_laya.py, tools/laya_serve.py):
+    Laya — Copyright Convai Innovations, Apache License 2.0
+    https://github.com/NandhaKishorM/laya
+Model weights (convaiinnovations/laya, laya-multilingual) are distributed
+by their authors under their own terms and are not part of this repository.
