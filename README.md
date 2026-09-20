@@ -47,6 +47,8 @@ on an M4.
       q8, pruned embedding rows, id map), served from a GitHub release.
 - [x] `grande suite` (kev-style frozen suites), `tools/http_eval.py`
       (any `/v1/systemone` server), `tools/prune_vocab.py`.
+- [x] JevBench public items through the published harness against
+      `grande serve` (`tools/jevbench_compare.py`, [docs/jevbench.md](docs/jevbench.md)).
 - [x] unified KV cache; resident prefix across requests over the same state.
 - [x] state cache: the KV of every state seen is kept serialized (RAM LRU,
       `--state-cache-dir` for disk), so coming back to a document is a 2–10 ms
@@ -167,6 +169,14 @@ compares, so drift is caught before a model is trained on the wrong bytes.
 ## Comparison with kev, reflex, Jev
 
 See [docs/comparison.md](docs/comparison.md). Short version, same M4:
+
+- [JevBench](https://benchmarkheaven.com/jev-models) public items (231, same
+  harness, one question per request): zero-shot Gemma 4 E4B Q4_0 easy 100 /
+  standard 94.4 / hard 51.4 — #10 of the 21 published systems on those
+  items, just above the LoRA-trained E2B of system-one-open and below
+  zero-shot Qwen3.5-4B; the vocab-pruned E2B is #17 (standard 73.6, the
+  Japanese pruning costs ~5 points on English). Estimated official score
+  ≈ 64–68. Details and the hard-tier breakdown: [docs/jevbench.md](docs/jevbench.md).
 
 - Japanese (JGLUE): grande E2B zero-shot JNLI 0.614 / JCQA 0.853; kev-0.5b
   0.450 / 0.577; a 270M grande head trained on 12k records **0.710 / 0.710**
