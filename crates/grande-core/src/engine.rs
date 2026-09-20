@@ -7,7 +7,8 @@ use serde::Serialize;
 
 use crate::api::{Answer, Question, Request, Response, Usage};
 use crate::backend::{Backend, BranchTokens, PrefixSource, Token, Want};
-use crate::math::{argmax, confidence, expected_index, option_orders, softmax};
+use crate::math::{argmax, confidence, expected_index};
+use crate::plan::Plan;
 use crate::readout::{Distribution, Readout};
 use crate::render::{Kind, Mark, Rendered, RenderedBranch, Renderer, Segment};
 use crate::Result;
@@ -50,10 +51,7 @@ pub enum Mode {
     Separate,
 }
 
-/// Logit given to an option that did not reach the second stage of a
-/// two-stage Choice: zero probability at any temperature, still finite so
-/// rows serialize and a refit sees a number.
-pub const EXCLUDED_LOGIT: f32 = -1.0e4;
+pub use crate::plan::EXCLUDED_LOGIT;
 
 pub struct Engine<B: Backend> {
     pub backend: B,
@@ -82,13 +80,6 @@ pub struct Engine<B: Backend> {
 pub struct Packed {
     pub prefix: Vec<Token>,
     pub branches: Vec<BranchTokens>,
-}
-
-/// One evaluated branch: which option (original index) sat in each slot,
-/// and what the readout made of it.
-struct Scored {
-    order: Vec<usize>,
-    dist: Distribution,
 }
 
 impl<B: Backend> Engine<B> {
@@ -259,181 +250,38 @@ impl<B: Backend> Engine<B> {
 
     /// Distributions for every question, in request order. Each question's
     /// distribution is over the options in the order `orders[qid]` gives
-    /// (request order by default), whatever branches were evaluated to get
-    /// it: several option orders when [`Engine::orders`] > 1, and a group
-    /// pass plus a finalist pass when a Choice has more options than the
-    /// label readout can letter.
+    /// (request order by default), whatever branches the [`Plan`] evaluated
+    /// to get it: several option orders when [`Engine::orders`] > 1, and a
+    /// group pass plus a finalist pass when a Choice has more options than
+    /// the label readout can letter.
     pub fn distributions(
         &mut self,
         req: &Request,
         orders: &IndexMap<String, Vec<usize>>,
         mode: Mode,
     ) -> Result<(Vec<(RenderedBranch, Distribution)>, Diagnostics)> {
-        req.validate()?;
-        let rendered = self.renderer.render_with(req, orders);
-        let (prefix, _) = self.tokenize_segments(&rendered.prefix)?;
+        let cap = match self.readout {
+            Readout::Label => Some(crate::readout::LABELS.len()),
+            Readout::Pointer(_) => None,
+        };
+        let plan = Plan::new(&self.renderer, req, orders, cap, self.orders)?;
+        let (prefix, _) = self.tokenize_segments(&plan.rendered.prefix)?;
         let mut diag = Diagnostics {
             prefix_tokens: prefix.len(),
             orders: self.orders.max(1),
             ..Default::default()
         };
-        let cap = match self.readout {
-            Readout::Label => Some(crate::readout::LABELS.len()),
-            Readout::Pointer(_) => None,
-        };
-        let orders_wanted = self.orders.max(1);
-        let n_orders = move |kind: Kind| match kind {
-            Kind::Choice | Kind::Noul => orders_wanted,
-            // Levels are ordered; the model must see them in order.
-            Kind::Score => 1,
-        };
-
-        // Pass 1: every question under its orders, except Choices over the
-        // label cap, which go in as groups of at most `cap` options.
-        let mut first: Vec<RenderedBranch> = Vec::new();
-        let mut grouped: Vec<usize> = Vec::new();
-        for (qi, (id, q)) in req.questions.iter().enumerate() {
-            let primary = &rendered.branches[qi];
-            let k = primary.order.len();
-            match cap {
-                Some(cap) if k > cap && primary.kind == Kind::Choice => {
-                    let groups = k.div_ceil(cap);
-                    for chunk in primary.order.chunks(k.div_ceil(groups)) {
-                        first.push(self.renderer.branch(id, q, Some(chunk)));
-                    }
-                    grouped.push(qi);
-                }
-                Some(cap) if k > cap => {
-                    return Err(crate::Error::invalid(
-                        format!("questions.{id}.criteria"),
-                        format!("label readout supports at most {cap} levels"),
-                    ));
-                }
-                _ => {
-                    for o in option_orders(k, n_orders(primary.kind)) {
-                        let order: Vec<usize> = o.iter().map(|&s| primary.order[s]).collect();
-                        first.push(self.renderer.branch(id, q, Some(&order)));
-                    }
-                }
-            }
-        }
-        let mut scored: Vec<Vec<Scored>> =
-            (0..rendered.branches.len()).map(|_| Vec::new()).collect();
-        let index_of = |id: &str| req.questions.get_index_of(id).expect("rendered id");
-        for (b, d) in self.score_branches(req, &prefix, first, mode, &mut diag)? {
-            scored[index_of(&b.id)].push(Scored {
-                order: b.order,
-                dist: d,
-            });
-        }
-
-        // Pass 2: the finalists of every grouped Choice — the top options of
-        // each group, as many as fit under the cap together — asked once
-        // more, against each other, under the configured orders.
-        if !grouped.is_empty() {
-            let mut second: Vec<RenderedBranch> = Vec::new();
-            for &qi in &grouped {
-                let (id, q) = req.questions.get_index(qi).expect("question");
-                let groups = std::mem::take(&mut scored[qi]);
-                let per_group = cap.expect("label readout") / groups.len();
-                let mut finalists: Vec<usize> = Vec::new();
-                for g in &groups {
-                    let mut ranked: Vec<(usize, f64)> = g
-                        .order
-                        .iter()
-                        .copied()
-                        .zip(g.dist.probs.iter().copied())
-                        .collect();
-                    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
-                    finalists.extend(ranked.iter().take(per_group).map(|x| x.0));
-                }
-                // Keep the caller's relative order among the finalists.
-                let primary = &rendered.branches[qi];
-                let slot_of =
-                    |o: usize| primary.order.iter().position(|&x| x == o).expect("option");
-                finalists.sort_by_key(|&o| slot_of(o));
-                diag.two_stage.insert(
-                    id.clone(),
-                    finalists
-                        .iter()
-                        .map(|&o| primary.keys[slot_of(o)].clone())
-                        .collect(),
-                );
-                for o in option_orders(finalists.len(), n_orders(primary.kind)) {
-                    let order: Vec<usize> = o.iter().map(|&s| finalists[s]).collect();
-                    second.push(self.renderer.branch(id, q, Some(&order)));
-                }
-            }
-            for (b, d) in self.score_branches(req, &prefix, second, mode, &mut diag)? {
-                scored[index_of(&b.id)].push(Scored {
-                    order: b.order,
-                    dist: d,
-                });
-            }
-        }
-
-        // Fold every question's branches into one distribution in the
-        // primary branch's slot order: mean logit per option over the orders
-        // it was asked in, options that were never asked at EXCLUDED_LOGIT.
-        let mut result = Vec::with_capacity(rendered.branches.len());
-        for (qi, primary) in rendered.branches.into_iter().enumerate() {
-            let k = primary.order.len();
-            let runs = &scored[qi];
-            let mut sum = vec![0.0f64; k];
-            let mut base_sum = vec![0.0f64; k];
-            let mut count = vec![0usize; k];
-            let mut per_run_probs: Vec<Vec<f64>> = Vec::with_capacity(runs.len());
-            let mut has_baseline = !runs.is_empty();
-            let mut candidate_mass: Option<f64> = None;
-            for r in runs {
-                let mut p = vec![0.0; k];
-                for (slot, &orig) in r.order.iter().enumerate() {
-                    sum[orig] += f64::from(r.dist.logits[slot]);
-                    count[orig] += 1;
-                    p[orig] = r.dist.probs[slot];
-                    match &r.dist.baseline {
-                        Some(b) => base_sum[orig] += f64::from(b[slot]),
-                        None => has_baseline = false,
-                    }
-                }
-                per_run_probs.push(p);
-                if let Some(m) = r.dist.candidate_mass {
-                    candidate_mass = Some(candidate_mass.map_or(m, |c: f64| c.min(m)));
-                }
-            }
-            let mean = |s: &[f64], orig: usize| -> f32 {
-                if count[orig] == 0 {
-                    EXCLUDED_LOGIT
-                } else {
-                    (s[orig] / count[orig] as f64) as f32
-                }
-            };
-            let logits: Vec<f32> = primary.order.iter().map(|&o| mean(&sum, o)).collect();
-            let baseline =
-                has_baseline.then(|| primary.order.iter().map(|&o| mean(&base_sum, o)).collect());
-            if per_run_probs.len() > 1 {
-                let mut spread = 0.0f64;
-                for (a, pa) in per_run_probs.iter().enumerate() {
-                    for pb in &per_run_probs[a + 1..] {
-                        for (x, y) in pa.iter().zip(pb) {
-                            spread = spread.max((x - y).abs());
-                        }
-                    }
-                }
-                diag.order_spread.insert(primary.id.clone(), spread);
-            }
-            let probs = softmax(&logits, self.temperature);
-            result.push((
-                primary,
-                Distribution {
-                    logits,
-                    baseline,
-                    probs,
-                    candidate_mass,
-                },
-            ));
-        }
-        Ok((result, diag))
+        let first: Vec<Distribution> = self
+            .score_branches(req, &prefix, plan.first.clone(), mode, &mut diag)?
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect();
+        let (second, finalists) = plan.second(&self.renderer, req, &first);
+        diag.two_stage = finalists;
+        let second = self.score_branches(req, &prefix, second, mode, &mut diag)?;
+        let folded = plan.fold(first, second, self.temperature);
+        diag.order_spread = folded.order_spread;
+        Ok((folded.results, diag))
     }
 
     /// Full TypeSafe-shaped response.
