@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use grande_core::{Backend, Engine, Mode, Readout, Renderer, Request};
 use grande_llama::{LlamaEngine, Options};
@@ -101,6 +101,15 @@ enum Cmd {
         /// scaffolding (fewer branch tokens).
         #[arg(long)]
         terse: bool,
+        /// Few-shot: put this many labelled train-split examples (balanced
+        /// over labels, fixed seed) in front of every state under an `例` key.
+        #[arg(long, default_value_t = 0)]
+        shots: usize,
+        /// Train-split JSONL for --shots; defaults to .cache/jglue/<task>-train.jsonl.
+        #[arg(long)]
+        train: Option<PathBuf>,
+        #[arg(long, default_value_t = 0)]
+        shots_seed: u64,
         /// Contextual calibration: also ask every question over this
         /// content-free state and subtract the model's prior over the
         /// options (Zhao et al. 2021). Pass without a value for "N/A".
@@ -232,6 +241,38 @@ enum Cmd {
         model: PathBuf,
         text: String,
     },
+    /// Hidden states for training a pointer head on this engine's own
+    /// numbers: every JGLUE record of a split is rendered in the label layout
+    /// with pointer marks (the zero-shot chat prompt; each option line's last
+    /// token and the model-turn position are read), under a few shuffled
+    /// option orders, and the rows go to a safetensors file
+    /// (`decide [N, d]`, `opts [N, K, d]`, `n_opts`, `gold`, `item`).
+    Features {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, value_enum)]
+        task: TaskArg,
+        /// JSONL (JGLUE v1.3); defaults to the train split in .cache/jglue.
+        #[arg(long)]
+        data: Option<PathBuf>,
+        #[arg(long, default_value_t = 0)]
+        skip: usize,
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Shuffled option orders per record (the first is the natural order).
+        #[arg(long, default_value_t = 2)]
+        orders: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// Pointer layout: `label` (chat prompt, default) or `delimiter`
+        /// (the reserved-token layout the LoRA trainer uses).
+        #[arg(long, default_value = "label")]
+        layout: String,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 2048)]
+        n_ctx: u32,
+    },
 }
 
 /// Open the model at `path`: a GGUF file runs on llama.cpp, a directory with
@@ -250,24 +291,32 @@ fn load_backend(path: &Path, opts: Options) -> Result<Box<dyn Backend>> {
 fn readout_for(backend: &dyn Backend, head: Option<&PathBuf>) -> Result<(Renderer, Readout)> {
     match head {
         Some(p) => {
-            let h = grande_core::readout::safetensors::load(&std::fs::read(p)?)?;
+            let (h, layout) =
+                grande_core::readout::safetensors::load_with_layout(&std::fs::read(p)?)?;
             anyhow::ensure!(
                 h.d == backend.n_embd(),
                 "head d={} but model n_embd={}",
                 h.d,
                 backend.n_embd()
             );
-            Ok((Renderer::gemma_pointer(), Readout::Pointer(h)))
-        }
-        None => {
-            // Gemma 4 uses <|turn>; Gemma 3 checkpoints use <start_of_turn>.
-            let renderer = if backend.special("<|turn>").is_ok() {
-                Renderer::gemma_label()
-            } else {
-                Renderer::gemma3_label()
+            // The head's metadata says which layout produced its training
+            // rows; a head without it is a LoRA-era delimiter-layout head.
+            let renderer = match layout.as_deref() {
+                Some("gemma_label_pointer") => label_renderer(backend).pointer(true),
+                _ => Renderer::gemma_pointer(),
             };
-            Ok((renderer, Readout::Label))
+            Ok((renderer, Readout::Pointer(h)))
         }
+        None => Ok((label_renderer(backend), Readout::Label)),
+    }
+}
+
+/// Gemma 4 uses <|turn>; Gemma 3 checkpoints use <start_of_turn>.
+fn label_renderer(backend: &dyn Backend) -> Renderer {
+    if backend.special("<|turn>").is_ok() {
+        Renderer::gemma_label()
+    } else {
+        Renderer::gemma3_label()
     }
 }
 
@@ -310,6 +359,9 @@ fn main() -> Result<()> {
             permute,
             head,
             terse,
+            shots,
+            train,
+            shots_seed,
             baseline,
             orders,
         } => {
@@ -343,6 +395,14 @@ fn main() -> Result<()> {
             if let Some(n) = limit {
                 items.truncate(n);
             }
+            if shots > 0 {
+                let train = train.unwrap_or_else(|| {
+                    PathBuf::from(format!(".cache/jglue/{}-train.jsonl", task.name()))
+                });
+                let block = jglue::shots(task, &train, shots, shots_seed)?;
+                eprintln!("few-shot block ({shots} examples):\n{block}\n");
+                jglue::with_shots(&mut items, &block);
+            }
             std::fs::create_dir_all(&out)?;
             let rows_path = out.join("rows.jsonl");
             anyhow::ensure!(
@@ -366,13 +426,7 @@ fn main() -> Result<()> {
                 .to_lowercase();
             let (renderer, readout) = readout_for(&*backend, head.as_ref())?;
             let renderer = renderer.terse(terse);
-            let layout = if head.is_some() {
-                "gemma_pointer"
-            } else if terse {
-                "gemma_label_terse"
-            } else {
-                "gemma_label"
-            };
+            let layout = renderer.layout_name();
             let mut engine = Engine::new(backend, renderer, readout, name.clone());
             engine.baseline = baseline;
             engine.orders = orders;
@@ -437,7 +491,8 @@ fn main() -> Result<()> {
             let summary = summarize(&rows);
             let full = serde_json::json!({
                 "model": name, "task": task, "data": data, "revision": jglue::REVISION,
-                "n": rows.len(), "layout": layout, "head": head, "summary": summary,
+                "n": rows.len(), "layout": layout, "head": head, "shots": shots, "permute": permute,
+                "orders": orders, "baseline": engine.baseline, "summary": summary,
             });
             std::fs::write(
                 out.join("summary.json"),
@@ -910,6 +965,177 @@ fn main() -> Result<()> {
             for id in ids {
                 println!("{id:>7}  {:?}", engine.piece(grande_core::Token(id)));
             }
+        }
+        Cmd::Features {
+            model,
+            task,
+            data,
+            skip,
+            limit,
+            orders,
+            seed,
+            layout,
+            out,
+            n_ctx,
+        } => {
+            use grande_eval::jglue::{self, Task};
+            let task = match task {
+                TaskArg::Jnli => Task::Jnli,
+                TaskArg::Jcqa => Task::Jcqa,
+                TaskArg::Jsts => Task::Jsts,
+            };
+            let data = data.unwrap_or_else(|| {
+                PathBuf::from(format!(".cache/jglue/{}-train.jsonl", task.name()))
+            });
+            let mut items = jglue::load(task, &data)?;
+            items.drain(..skip.min(items.len()));
+            if let Some(n) = limit {
+                items.truncate(n);
+            }
+            let backend = load_backend(
+                &model,
+                Options {
+                    n_ctx,
+                    n_batch: n_ctx,
+                    embeddings: true,
+                    ..Default::default()
+                },
+            )?;
+            let renderer = match layout.as_str() {
+                "label" => label_renderer(&*backend).pointer(true),
+                "delimiter" => Renderer::gemma_pointer(),
+                other => anyhow::bail!("--layout {other}: expected label or delimiter"),
+            };
+            let layout_name = renderer.layout_name();
+            let d = backend.n_embd();
+            let mut engine = Engine::new(backend, renderer, Readout::Label, "features");
+            let k_max = items
+                .iter()
+                .map(|it| match it.request.questions.values().next() {
+                    Some(grande_core::Question::Choice { criteria, .. }) => criteria.len(),
+                    Some(grande_core::Question::Score { criteria, .. }) => criteria.len(),
+                    _ => 2,
+                })
+                .max()
+                .unwrap_or(0);
+            let mut rng = seed ^ 0x2545_f491_4f6c_dd1d;
+            let mut next = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            let n_rows = items.len() * orders;
+            eprintln!(
+                "{} records x {orders} orders, d={d}, K={k_max}, layout {layout_name}",
+                items.len()
+            );
+            let mut decide: Vec<u16> = Vec::with_capacity(n_rows * d);
+            let mut opts: Vec<u16> = Vec::with_capacity(n_rows * k_max * d);
+            let mut n_opts: Vec<i32> = Vec::with_capacity(n_rows);
+            let mut gold: Vec<i32> = Vec::with_capacity(n_rows);
+            let mut item_ix: Vec<i32> = Vec::with_capacity(n_rows);
+            let f16 = |x: f32| half::f16::from_f32(x).to_bits();
+            let t0 = Instant::now();
+            for (i, item) in items.iter().enumerate() {
+                let k = match item.request.questions.values().next() {
+                    Some(grande_core::Question::Choice { criteria, .. }) => criteria.len(),
+                    Some(grande_core::Question::Score { criteria, .. }) => criteria.len(),
+                    _ => 2,
+                };
+                for o in 0..orders {
+                    let mut order: Vec<usize> = (0..k).collect();
+                    if o > 0 {
+                        for j in (1..k).rev() {
+                            let r = (next() % (j as u64 + 1)) as usize;
+                            order.swap(j, r);
+                        }
+                    }
+                    let mut om = indexmap::IndexMap::new();
+                    om.insert("answer".to_string(), order.clone());
+                    let rows = engine.hidden_rows(&item.request, &om)?;
+                    let (branch, out) = &rows[0];
+                    let mut dec: Option<&[f32]> = None;
+                    let mut op: Vec<&[f32]> = Vec::with_capacity(k);
+                    for ((_, mark), row) in branch.marks.iter().zip(&out.rows) {
+                        match mark {
+                            grande_core::render::Mark::OptEnd(_) => op.push(row),
+                            grande_core::render::Mark::Decide => dec = Some(row),
+                            grande_core::render::Mark::Last => {}
+                        }
+                    }
+                    let dec = dec.ok_or_else(|| anyhow!("no decide row"))?;
+                    anyhow::ensure!(op.len() == k, "expected {k} option rows, got {}", op.len());
+                    decide.extend(dec.iter().map(|&x| f16(x)));
+                    for row in &op {
+                        opts.extend(row.iter().map(|&x| f16(x)));
+                    }
+                    opts.extend(std::iter::repeat_n(0u16, (k_max - k) * d));
+                    n_opts.push(k as i32);
+                    gold.push(order.iter().position(|&x| x == item.gold).unwrap() as i32);
+                    item_ix.push((skip + i) as i32);
+                }
+                if (i + 1) % 100 == 0 {
+                    eprintln!(
+                        "{}/{}  {:.0} s",
+                        i + 1,
+                        items.len(),
+                        t0.elapsed().as_secs_f32()
+                    );
+                }
+            }
+            let n = n_opts.len();
+            let mut tensors: Vec<(&str, &str, Vec<usize>, Vec<u8>)> = Vec::new();
+            let le16 = |v: &[u16]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+            let le32 = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+            tensors.push(("decide", "F16", vec![n, d], le16(&decide)));
+            tensors.push(("opts", "F16", vec![n, k_max, d], le16(&opts)));
+            tensors.push(("n_opts", "I32", vec![n], le32(&n_opts)));
+            tensors.push(("gold", "I32", vec![n], le32(&gold)));
+            tensors.push(("item", "I32", vec![n], le32(&item_ix)));
+            // safetensors metadata values must be strings.
+            let meta: serde_json::Map<String, serde_json::Value> = [
+                ("layout", layout_name.to_string()),
+                ("model", model.display().to_string()),
+                ("task", task.name().to_string()),
+                ("data", data.display().to_string()),
+                ("orders", orders.to_string()),
+                ("skip", skip.to_string()),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v)))
+            .collect();
+            let mut header = serde_json::Map::new();
+            header.insert("__metadata__".into(), meta.into());
+            let mut body: Vec<u8> = Vec::new();
+            for (name, dtype, shape, bytes) in &tensors {
+                let start = body.len();
+                body.extend_from_slice(bytes);
+                header.insert(
+                    (*name).into(),
+                    serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [start, body.len()]}),
+                );
+            }
+            let mut hb = serde_json::to_vec(&serde_json::Value::Object(header))?;
+            while hb.len() % 8 != 0 {
+                hb.push(b' ');
+            }
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&out)?);
+            use std::io::Write;
+            f.write_all(&(hb.len() as u64).to_le_bytes())?;
+            f.write_all(&hb)?;
+            f.write_all(&body)?;
+            f.flush()?;
+            eprintln!(
+                "wrote {} rows ({} MB) to {} in {:.0} s",
+                n,
+                (16 + hb.len() + body.len()) / (1 << 20),
+                out.display(),
+                t0.elapsed().as_secs_f32()
+            );
         }
         Cmd::Tokens { model, text } => {
             let engine = LlamaEngine::load(

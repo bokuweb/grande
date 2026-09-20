@@ -163,3 +163,111 @@ fn item(task: Task, row: &Value) -> Result<Item> {
         gold,
     })
 }
+
+/// Few-shot examples for a task: `n` records from `train` (fixed seed,
+/// labels balanced by round robin) rendered as a block of text that goes
+/// under an `例` key in front of every state. Labels are written as the
+/// option key plus its Japanese name so the model can map them to the
+/// lettered options; JCQA shows the answer string.
+pub fn shots(task: Task, train: &Path, n: usize, seed: u64) -> Result<String> {
+    let text =
+        std::fs::read_to_string(train).with_context(|| format!("reading {}", train.display()))?;
+    let rows: Vec<Value> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<std::result::Result<_, _>>()?;
+    // Deterministic shuffle (splitmix64) so runs with the same seed compare.
+    let mut idx: Vec<usize> = (0..rows.len()).collect();
+    let mut x = seed.wrapping_add(0x9e3779b97f4a7c15);
+    for i in (1..idx.len()).rev() {
+        x = x.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^= z >> 31;
+        idx.swap(i, (z % (i as u64 + 1)) as usize);
+    }
+    let classes = match task {
+        Task::Jnli => 3,
+        Task::Jcqa => 5,
+        Task::Jsts => 6,
+    };
+    let mut picked: Vec<&Value> = Vec::new();
+    let mut want = 0usize;
+    while picked.len() < n {
+        let before = picked.len();
+        for &i in &idx {
+            let row = &rows[i];
+            let class = match task {
+                Task::Jnli => JNLI_LABELS
+                    .iter()
+                    .position(|l| Some(*l) == row["label"].as_str())
+                    .unwrap_or(0),
+                Task::Jcqa => row["label"].as_u64().unwrap_or(0) as usize,
+                Task::Jsts => row["label"].as_f64().unwrap_or(0.0).round() as usize,
+            };
+            if class == want % classes && !picked.iter().any(|p| std::ptr::eq(*p, row)) {
+                picked.push(row);
+                want += 1;
+                break;
+            }
+        }
+        if picked.len() == before {
+            want += 1; // class exhausted
+            if want > n * classes {
+                break;
+            }
+        }
+    }
+    let s = |row: &Value, k: &str| row[k].as_str().unwrap_or("").to_string();
+    let blocks: Vec<String> = picked
+        .iter()
+        .map(|row| match task {
+            Task::Jnli => {
+                let label = s(row, "label");
+                let ja = match label.as_str() {
+                    "entailment" => "含意",
+                    "contradiction" => "矛盾",
+                    _ => "中立",
+                };
+                format!(
+                    "前提: {}\n仮説: {}\n判定: {label}（{ja}）",
+                    s(row, "sentence1"),
+                    s(row, "sentence2")
+                )
+            }
+            Task::Jcqa => {
+                let gold = row["label"].as_u64().unwrap_or(0) as usize;
+                let choices: Vec<String> = (0..5).map(|i| s(row, &format!("choice{i}"))).collect();
+                format!(
+                    "質問: {}\n選択肢: {}\n答え: {}",
+                    s(row, "question"),
+                    choices.join(" / "),
+                    choices[gold]
+                )
+            }
+            Task::Jsts => format!(
+                "文1: {}\n文2: {}\n類似度: {}",
+                s(row, "sentence1"),
+                s(row, "sentence2"),
+                row["label"].as_f64().unwrap_or(0.0).round() as usize
+            ),
+        })
+        .collect();
+    Ok(blocks.join("\n\n"))
+}
+
+/// Put the few-shot block in front of every item's state (as `例`).
+pub fn with_shots(items: &mut [Item], block: &str) {
+    for item in items {
+        let mut m = serde_json::Map::new();
+        m.insert("例".to_string(), json!(block));
+        if let Value::Object(old) = &item.request.state {
+            for (k, v) in old {
+                m.insert(k.clone(), v.clone());
+            }
+        }
+        item.request.state = Value::Object(m);
+    }
+}

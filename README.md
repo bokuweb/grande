@@ -59,6 +59,10 @@ on an M4.
       and on E2B / E4B Q4_0; `grande --model <checkpoint dir>` and the
       `gemma-4-e2b-wgpu-ja` / `gemma-4-e4b-wgpu-ja` browser models (1.2 GB /
       2.5 GB after vocabulary pruning).
+- [x] `grande jglue --shots N` (few-shot from the train split), `grande
+      features` + `tools/train_head.py`: a pointer head on the frozen,
+      quantized E2B / E4B read through the zero-shot chat prompt
+      (`gemma_label_pointer`), trained on the engine's own hidden states.
 - [ ] IIA test, permutation flip rate on a JGLUE sample
       and on E2B Q4_0; `grande --model <checkpoint dir>` and the
       `gemma-4-e2b-wgpu-ja` browser model (1.2 GB after vocabulary pruning).
@@ -328,6 +332,65 @@ probabilities are the second pass's, with the eliminated options at 0.
 the group stage loses the gold intent in 6 of 80 records, the rest are
 second-stage misses (see [docs/comparison.md](docs/comparison.md)). The
 pointer readout has no cap and never needs this.
+
+## Raising E2B / E4B accuracy
+
+What moves the zero-shot numbers, measured on the same first 400 records of
+JGLUE valid (E2B Q4_0, label readout, no temperature: JNLI 0.575, JCQA
+0.855). `grande jglue --limit 400 [--orders N] [--shots N]`:
+
+| | JNLI acc | JNLI ECE | JCQA acc | JCQA ECE | ms / record |
+|---|---|---|---|---|---|
+| E2B Q4_0 | 0.575 | 0.279 | 0.855 | 0.046 | 750 |
+| E2B Q4_0, `--orders 3` / `5` | 0.598 | 0.239 | 0.873 | 0.021 | 1,990 / 890 |
+| E2B Q4_0, `--shots 3` / `6` / `12` | 0.562 / 0.570 / 0.583 | 0.339 / 0.302 / 0.249 | 0.830 (3) | 0.060 | 860–1,400 |
+| E2B Q8_0 | 0.585 | 0.414 | | | 370 |
+| E4B Q4_0 | 0.595 | 0.366 | **0.932** | **0.017** | 735 / 466 |
+| E4B Q4_0, `--shots 3` / **`6`** / `12` | 0.723 / **0.775** / 0.715 | 0.077 / **0.055** / 0.136 | 0.887 (6) | 0.038 | 1,360 / 1,770 / 2,920 |
+| E4B Q4_0, `--shots 6 --orders 3` | 0.693 | 0.155 | | | 2,710 |
+
+`--shots N` puts N labelled train-split records (balanced over labels,
+fixed seed; `--shots-seed` picks another draw) in front of every state
+under an `例` key, as a resident prefix would in production. What the
+table says:
+
+- Quantization and order averaging are worth a point or two on JNLI;
+  order averaging is the cheap win on JCQA (+1.8, ECE halves).
+- **E2B cannot use few-shot examples**: 3, 6 or 12 of them leave JNLI at
+  the zero-shot level and cost 2.5 points on JCQA. **E4B can**: 6 examples
+  take JNLI from 0.595 to 0.775 and the raw ECE from 0.37 to 0.055 — the
+  instruct model stops being overconfident without a fitted temperature.
+  Another draw of 6 gives 0.752; 12 is worse (0.715) and 3 is 0.723.
+- Few-shot is for the skill task only: on JCQA (knowledge) it costs E4B
+  4.5 points, and combining it with order averaging loses 8 points on JNLI.
+- JCQA is decided by the backbone: E4B zero-shot 0.932 against E2B 0.855.
+
+So without training: E4B, `--shots 6` on NLI-shaped questions, zero-shot
+elsewhere, `--orders` when the question is a fixed letter choice.
+
+### Frozen backbone, trained head
+
+The zero-shot label readout is the weak part on JNLI (E4B barely beats
+E2B), and a trained readout is what lifted the 270M to 0.71. The same can
+be done on E2B / E4B without touching the weights: `Renderer::Label` with
+`pointer` on renders the **same chat prompt** as the zero-shot layout but
+marks the last token of every option line (`OptEnd`) and the model-turn
+position (`Decide`), so a pointer head reads the served, quantized model's
+own hidden states. No LoRA, no re-export, no `<unused*>` delimiters the
+base model never saw; the head is two `d → 256` affine maps in
+`head.safetensors` and `--head` picks the layout from its metadata.
+
+```bash
+# hidden states of the train split, 2 shuffled option orders per record (F16 safetensors, ~0.5 GB / 6k)
+./target/release/grande features --model models/gemma-4-E2B-it-Q4_0.gguf --task jnli --limit 6000 --out runs/feat/e2b-jnli.safetensors
+./target/release/grande features --model models/gemma-4-E2B-it-Q4_0.gguf --task jcqa --limit 4000 --out runs/feat/e2b-jcqa.safetensors
+# the head trains in seconds on the cached rows (last 10% of records held out for model selection)
+python tools/train_head.py --features runs/feat/e2b-jnli.safetensors runs/feat/e2b-jcqa.safetensors --out runs/head-e2b
+./target/release/grande jglue --model models/gemma-4-E2B-it-Q4_0.gguf --head runs/head-e2b/head.safetensors --task jnli --out runs/eval-head-jnli
+```
+
+Extraction runs at ~0.7 s per record on the M4 (the second order reuses
+the resident state). Results: see below once the E2B run lands.
 
 ## Notes
 

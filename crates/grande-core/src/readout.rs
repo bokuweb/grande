@@ -299,6 +299,13 @@ pub mod safetensors {
     }
 
     pub fn load(bytes: &[u8]) -> Result<PointerHead> {
+        load_with_layout(bytes).map(|(h, _)| h)
+    }
+
+    /// The head plus the `layout` entry of the file's `__metadata__`, when
+    /// the trainer recorded which layout produced the hidden states
+    /// (`gemma_label_pointer` or `gemma_pointer`).
+    pub fn load_with_layout(bytes: &[u8]) -> Result<(PointerHead, Option<String>)> {
         if bytes.len() < 8 {
             return Err(bad("too short"));
         }
@@ -318,14 +325,22 @@ pub mod safetensors {
         if b_q.len() != dp || b_k.len() != dp {
             return Err(bad("bias shape"));
         }
-        Ok(PointerHead {
-            d,
-            dp,
-            w_q,
-            b_q,
-            w_k,
-            b_k,
-        })
+        let layout = header
+            .get("__metadata__")
+            .and_then(|m| m.get("layout"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Ok((
+            PointerHead {
+                d,
+                dp,
+                w_q,
+                b_q,
+                w_k,
+                b_k,
+            },
+            layout,
+        ))
     }
 
     #[cfg(test)]

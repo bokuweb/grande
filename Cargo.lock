@@ -736,6 +736,7 @@ dependencies = [
  "grande-llama",
  "grande-server",
  "grande-wgpu",
+ "half",
  "indexmap",
  "serde_json",
  "tokio",

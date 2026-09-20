@@ -18,6 +18,7 @@ grande-server = { path = "../grande-server" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 axum = "0.8"
 anyhow.workspace = true
+half = "2"
 clap.workspace = true
 serde_json.workspace = true
 indexmap.workspace = true
