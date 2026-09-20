@@ -60,7 +60,14 @@ fn plan_of(
     let renderer: Renderer = js(serde_json::from_str(layout), "layout")?;
     let cap = (label_cap > 0).then_some(label_cap as usize);
     let plan = js(
-        Plan::new(&renderer, &req, &IndexMap::new(), cap, orders as usize),
+        Plan::new(
+            &renderer,
+            &req,
+            &IndexMap::new(),
+            cap,
+            orders as usize,
+            None,
+        ),
         "plan",
     )?;
     Ok((req, renderer, plan))
@@ -165,7 +172,7 @@ pub fn plan_second(
         temperature,
         "rows",
     )?;
-    let (branches, finalists) = plan.second(&renderer, &req, &first);
+    let (branches, finalists, _rechecked) = plan.second(&renderer, &req, &first);
     js(
         serde_json::to_string(&serde_json::json!({
             "branches": branches,
@@ -205,7 +212,7 @@ pub fn answer(
         temperature,
         "rows",
     )?;
-    let (branches, finalists) = plan.second(&renderer, &req, &first);
+    let (branches, finalists, _rechecked) = plan.second(&renderer, &req, &first);
     let second = match (&rows2, branches.is_empty()) {
         (_, true) => Vec::new(),
         (Some(r), false) => distributions(

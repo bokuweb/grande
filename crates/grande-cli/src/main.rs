@@ -64,6 +64,11 @@ enum Cmd {
         /// pass and average the logits (position-bias removal). 1 = off.
         #[arg(long, default_value_t = 1)]
         orders: usize,
+        /// With --orders N: ask each question once first and re-ask only
+        /// those whose confidence is below this under the other N-1 orders
+        /// (a second pass). Confident answers cost one branch.
+        #[arg(long)]
+        recheck: Option<f64>,
         #[arg(long, default_value_t = 8192)]
         n_ctx: u32,
         #[arg(long, default_value_t = 999)]
@@ -119,6 +124,11 @@ enum Cmd {
         /// pass and average the logits (position-bias removal). 1 = off.
         #[arg(long, default_value_t = 1)]
         orders: usize,
+        /// With --orders N: ask each question once first and re-ask only
+        /// those whose confidence is below this under the other N-1 orders
+        /// (a second pass). Confident answers cost one branch.
+        #[arg(long)]
+        recheck: Option<f64>,
     },
     /// Prefill throughput: a synthetic state of about N tokens and Q
     /// questions, packed, repeated a few times.
@@ -216,6 +226,11 @@ enum Cmd {
         /// pass and average the logits (position-bias removal). 1 = off.
         #[arg(long, default_value_t = 1)]
         orders: usize,
+        /// With --orders N: ask each question once first and re-ask only
+        /// those whose confidence is below this under the other N-1 orders
+        /// (a second pass). Confident answers cost one branch.
+        #[arg(long)]
+        recheck: Option<f64>,
         #[arg(long, default_value_t = 8192)]
         n_ctx: u32,
         /// RAM for serialized states of recently seen documents (MB). A
@@ -276,6 +291,11 @@ enum Cmd {
         /// pass and average the logits (position-bias removal). 1 = off.
         #[arg(long, default_value_t = 1)]
         orders: usize,
+        /// With --orders N: ask each question once first and re-ask only
+        /// those whose confidence is below this under the other N-1 orders
+        /// (a second pass). Confident answers cost one branch.
+        #[arg(long)]
+        recheck: Option<f64>,
     },
     /// Print a GGUF metadata value (e.g. tokenizer.chat_template).
     Meta {
@@ -420,6 +440,7 @@ fn main() -> Result<()> {
             shots_seed,
             baseline,
             orders,
+            recheck,
         } => {
             use grande_eval::jglue::{self, Task};
             use grande_eval::report::{summarize, Row};
@@ -486,14 +507,21 @@ fn main() -> Result<()> {
             let mut engine = Engine::new(backend, renderer, readout, name.clone());
             engine.baseline = baseline;
             engine.orders = orders;
+            engine.recheck = recheck;
             let mut rows = Vec::with_capacity(items.len());
             let mut file = std::io::BufWriter::new(std::fs::File::create(&rows_path)?);
             use std::io::Write;
             let t0 = Instant::now();
+            // Gated re-read: how many records fell below the threshold and
+            // how many branches the run spent in total.
+            let mut rechecked = 0usize;
+            let mut branches = 0usize;
             for (i, item) in items.iter().enumerate() {
                 let t = Instant::now();
                 let (dists, diag) =
                     engine.distributions(&item.request, &Default::default(), Mode::Packed)?;
+                rechecked += usize::from(!diag.rechecked.is_empty());
+                branches += diag.branch_tokens.len();
                 let (_, d) = &dists[0];
                 let pred = grande_core::math::argmax(&d.probs);
                 let mut permuted_preds = Vec::new();
@@ -548,7 +576,8 @@ fn main() -> Result<()> {
             let full = serde_json::json!({
                 "model": name, "task": task, "data": data, "revision": jglue::REVISION,
                 "n": rows.len(), "layout": layout, "head": head, "shots": shots, "permute": permute,
-                "orders": orders, "baseline": engine.baseline, "summary": summary,
+                "orders": orders, "recheck": recheck, "rechecked": rechecked, "branches": branches,
+                "baseline": engine.baseline, "summary": summary,
             });
             std::fs::write(
                 out.join("summary.json"),
@@ -988,6 +1017,7 @@ fn main() -> Result<()> {
             temperature,
             baseline,
             orders,
+            recheck,
             n_ctx,
             state_cache_mb,
             state_cache_dir,
@@ -1021,6 +1051,7 @@ fn main() -> Result<()> {
             engine.temperature = temperature;
             engine.baseline = baseline;
             engine.orders = orders;
+            engine.recheck = recheck;
             let state = std::sync::Arc::new(grande_server::AppState {
                 engine: grande_server::EngineHandle::spawn(engine, max_batch),
                 api_key,
@@ -1090,6 +1121,7 @@ fn main() -> Result<()> {
             limit,
             n_ctx,
             orders,
+            recheck,
         } => {
             use grande_eval::report::{metrics, Row};
             use std::collections::BTreeMap;
@@ -1119,6 +1151,7 @@ fn main() -> Result<()> {
             let (renderer, readout) = readout_for(&backend, head.as_ref())?;
             let mut engine = Engine::new(backend, renderer, readout, "suite");
             engine.orders = orders;
+            engine.recheck = recheck;
             let mut by_task: BTreeMap<String, Vec<Row>> = BTreeMap::new();
             let mut skipped: BTreeMap<String, usize> = BTreeMap::new();
             let mut file = std::io::BufWriter::new(std::fs::File::create(&rows_path)?);
@@ -1427,6 +1460,7 @@ fn main() -> Result<()> {
             temperature,
             baseline,
             orders,
+            recheck,
             n_ctx,
             n_gpu_layers,
             swa_full,
@@ -1456,6 +1490,7 @@ fn main() -> Result<()> {
             engine.temperature = temperature;
             engine.baseline = baseline;
             engine.orders = orders;
+            engine.recheck = recheck;
 
             match mode {
                 ModeArg::Packed | ModeArg::Separate => {

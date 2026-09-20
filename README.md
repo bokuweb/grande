@@ -359,6 +359,29 @@ average removes. The extra branches cost their tokens: on the wgpu engine
 0.80 to 1.36 s at 3 orders; on llama.cpp the JGLUE runs above took
 2–2.5× per record.
 
+`--recheck τ` gates those extra branches on need (the "auto" policy of
+DiffusionGemma-as-Jev: a second read only when the first is uncertain).
+Every question is asked once in the first pass; the ones whose confidence
+(1 − H/ln k) comes back below τ are re-asked under the other N−1 orders in
+a second pass, and their logits are averaged as usual. `rechecked` in the
+diagnostics (`X-Grande-Rechecked`) names them. JNLI valid, first 300, E2B
+Q4_0 pruned, label readout:
+
+| | records re-asked | branches | acc | ECE raw | ECE with T (odd half) | ms / record |
+|---|---|---|---|---|---|---|
+| 1 order | – | 300 | 0.537 | 0.312 | 0.056 | 666 |
+| 3 orders | all | 900 | **0.570** | **0.234** | 0.112 | 1,305 |
+| 3 orders, `--recheck 0.5` | 89 (30%) | **478** | 0.567 | 0.265 | 0.055 | **732** |
+| 3 orders, `--recheck 0.7` | 215 (72%) | 730 | 0.570 | 0.241 | 0.064 | 1,274 |
+
+At τ 0.5 the gate keeps nine tenths of the accuracy gain for half the
+branches (and a second pass only on the records that need it); the raw
+calibration gain shrinks because the overconfident answers are exactly the
+ones not averaged, and a fitted temperature makes that moot. Confidence
+is a weak signal on JNLI (records below 0.5 are right 44% of the time,
+above 58%), so τ trades cost for accuracy smoothly rather than finding a
+knee.
+
 A Choice with more options than the label readout can letter (52) no
 longer errors: the options are asked in groups of at most 52 in the first
 pass, the top options of every group (as many as fit under 52 together)

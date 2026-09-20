@@ -42,6 +42,9 @@ pub struct Diagnostics {
     /// Requests that shared a backend pass with this one (1 = alone); see
     /// [`Engine::distributions_many`].
     pub batch: usize,
+    /// Gated re-read ([`Engine::recheck`]): the questions whose first read
+    /// fell below the threshold and were re-asked under the other orders.
+    pub rechecked: Vec<String>,
 }
 
 /// How branches are evaluated.
@@ -79,6 +82,12 @@ pub struct Engine<B: Backend> {
     /// letter A, the lean to the first-listed option — at the cost of extra
     /// branch tokens; the state is read once regardless. 1 = off.
     pub orders: usize,
+    /// Gate the extra `orders` on need: ask each question once, and only
+    /// re-ask (under the remaining orders, in a second pass) the ones whose
+    /// confidence ([`crate::math::confidence`]) came back below this. What
+    /// DiffusionGemma-as-Jev calls its auto policy. None = every question
+    /// gets every order in the first pass.
+    pub recheck: Option<f64>,
     baseline_cache: HashMap<String, Vec<f32>>,
 }
 
@@ -99,6 +108,7 @@ impl<B: Backend> Engine<B> {
             model: model.into(),
             baseline: None,
             orders: 1,
+            recheck: None,
             baseline_cache: HashMap::new(),
         }
     }
@@ -433,8 +443,8 @@ impl<B: Backend> Engine<B> {
         let mut failed: Vec<(usize, crate::Error)> = Vec::new();
         let mut jobs: Vec<Option<Job<'_>>> = Vec::with_capacity(reqs.len());
         for (i, (req, orders)) in reqs.iter().enumerate() {
-            let planned =
-                Plan::new(&self.renderer, req, orders, cap, self.orders).and_then(|plan| {
+            let planned = Plan::new(&self.renderer, req, orders, cap, self.orders, self.recheck)
+                .and_then(|plan| {
                     let (prefix, _) = self.tokenize_segments(&plan.rendered.prefix)?;
                     Ok((plan, prefix))
                 });
@@ -473,8 +483,9 @@ impl<B: Backend> Engine<B> {
                 continue;
             };
             let first: Vec<Distribution> = dists.into_iter().map(|(_, d)| d).collect();
-            let (second, finalists) = job.plan.second(&self.renderer, job.req, &first);
+            let (second, finalists, rechecked) = job.plan.second(&self.renderer, job.req, &first);
             job.diag.two_stage = finalists;
+            job.diag.rechecked = rechecked;
             first_dists[i] = Some(first);
             work.push((i, second));
         }
@@ -875,6 +886,97 @@ mod tests {
                 })
                 .collect())
         }
+    }
+
+    /// Position bias only: label A gets +1 unless an option is "gold", which
+    /// gets +6 wherever it sits.
+    struct Pulled;
+
+    impl Backend for Pulled {
+        fn tokenize(&self, text: &str) -> Result<Vec<Token>> {
+            Lettered.tokenize(text)
+        }
+        fn special(&self, n: &str) -> Result<Token> {
+            Lettered.special(n)
+        }
+        fn bos(&self) -> Token {
+            Lettered.bos()
+        }
+        fn n_embd(&self) -> usize {
+            1
+        }
+        fn n_vocab(&self) -> usize {
+            Lettered.n_vocab()
+        }
+        fn evaluate(
+            &mut self,
+            _: &[Token],
+            branches: &[BranchTokens],
+            _: Want,
+        ) -> Result<Vec<BranchOutput>> {
+            Ok(branches
+                .iter()
+                .map(|b| {
+                    let mut row = vec![0.0; self.n_vocab()];
+                    row[1] = 1.0;
+                    let mut label = None;
+                    for t in &b.tokens {
+                        if (1..=52).contains(&t.0) {
+                            label = Some(t.0 as usize);
+                        } else if t.0 == GOLD {
+                            if let Some(l) = label {
+                                row[l] += 6.0;
+                            }
+                        }
+                    }
+                    BranchOutput { rows: vec![row] }
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn recheck_re_asks_only_the_uncertain_question() {
+        let req: Request = serde_json::from_value(serde_json::json!({
+            "state": "s",
+            "questions": {
+                "sure": {"type": "choice", "instructions": "which", "criteria": {"x": null, "gold": null, "y": null}},
+                "unsure": {"type": "choice", "instructions": "which", "criteria": {"p": null, "q": null, "r": null}}
+            }
+        }))
+        .unwrap();
+        let mut engine = Engine::new(Pulled, Renderer::gemma_label(), Readout::Label, "t");
+        engine.orders = 3;
+        // Ungated: both questions get all three orders in one pass.
+        let (_, diag) = engine.answer(&req, Mode::Packed).unwrap();
+        assert_eq!(diag.passes, 1);
+        assert_eq!(diag.branch_tokens.len(), 6);
+        assert!(diag.rechecked.is_empty());
+
+        engine.recheck = Some(0.5);
+        let (resp, diag) = engine.answer(&req, Mode::Packed).unwrap();
+        assert_eq!(diag.rechecked, vec!["unsure".to_string()]);
+        // First pass 2 branches, second pass the two other orders of "unsure".
+        assert_eq!(diag.passes, 2);
+        assert_eq!(diag.branch_tokens.len(), 4);
+        let Answer::Choice { choice, .. } = &resp.answers["sure"] else {
+            panic!()
+        };
+        assert_eq!(choice, "gold");
+        // Averaged over the three rotations, the pull of A cancels: uniform.
+        let Answer::Choice { probabilities, .. } = &resp.answers["unsure"] else {
+            panic!()
+        };
+        for p in probabilities.values() {
+            assert!((p - 1.0 / 3.0).abs() < 1e-6, "{probabilities:?}");
+        }
+        assert!(diag.order_spread["unsure"] > 0.3);
+
+        // A threshold nothing falls under: one pass, one branch each.
+        engine.recheck = Some(0.0);
+        let (_, diag) = engine.answer(&req, Mode::Packed).unwrap();
+        assert_eq!(diag.passes, 1);
+        assert_eq!(diag.branch_tokens.len(), 2);
     }
 
     #[test]

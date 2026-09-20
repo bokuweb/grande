@@ -252,6 +252,9 @@ fn diag_headers(diag: &grande_core::Diagnostics, model: &str, ms: u128) -> Heade
         );
     }
     put(&mut h, "x-grande-batch", diag.batch.max(1).to_string());
+    if !diag.rechecked.is_empty() {
+        put(&mut h, "x-grande-rechecked", diag.rechecked.join(","));
+    }
     put(&mut h, "x-grande-latency-ms", ms.to_string());
     if let Some(m) = diag.candidate_mass.values().cloned().reduce(f64::min) {
         put(&mut h, "x-grande-candidate-mass-min", format!("{m:.4}"));
