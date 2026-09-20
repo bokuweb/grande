@@ -8,7 +8,10 @@
 //! then this question" and the attention kernel's visibility rule (prefix or
 //! own sequence, causal, window) is the block-causal mask kev describes.
 //! There is no KV cache to manage and no batching constraint to work around:
-//! the mask is the isolation.
+//! the mask is the isolation. Several requests over different states share a
+//! pass the same way (`Engine::evaluate_groups`): the high bits of the
+//! sequence id number the request, and a query sees its own request's
+//! prefix and branch only.
 //!
 //! Grouped-query attention: `kv_heads` K/V heads (one on the 270M and E2B,
 //! two on E4B), each shared by `heads / kv_heads` query heads. Gemma 3 (the
@@ -24,7 +27,7 @@
 pub mod engine;
 pub mod model;
 
-pub use engine::{Engine, EngineBuilder, SavedState};
+pub use engine::{Engine, EngineBuilder, Group, SavedState, SEQ_GROUP_SHIFT};
 pub use model::{Config, Dtype, QTensor, Weights};
 
 #[cfg(feature = "native")]

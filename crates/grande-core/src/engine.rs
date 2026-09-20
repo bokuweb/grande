@@ -6,7 +6,7 @@ use indexmap::IndexMap;
 use serde::Serialize;
 
 use crate::api::{Answer, Question, Request, Response, Usage};
-use crate::backend::{Backend, BranchOutput, BranchTokens, PrefixSource, Token, Want};
+use crate::backend::{Backend, BranchOutput, BranchTokens, Group, PrefixSource, Token, Want};
 use crate::math::{argmax, confidence, expected_index};
 use crate::plan::Plan;
 use crate::readout::{Distribution, Readout};
@@ -39,6 +39,9 @@ pub struct Diagnostics {
     /// Choices with more options than the label readout can letter: the
     /// finalist keys that went into the second stage.
     pub two_stage: IndexMap<String, Vec<String>>,
+    /// Requests that shared a backend pass with this one (1 = alone); see
+    /// [`Engine::distributions_many`].
+    pub batch: usize,
 }
 
 /// How branches are evaluated.
@@ -52,6 +55,10 @@ pub enum Mode {
 }
 
 pub use crate::plan::EXCLUDED_LOGIT;
+
+/// What [`Engine::distributions`] returns: one distribution per question
+/// (with its rendered branch) plus the request's diagnostics.
+pub type Distributions = (Vec<(RenderedBranch, Distribution)>, Diagnostics);
 
 pub struct Engine<B: Backend> {
     pub backend: B,
@@ -194,74 +201,200 @@ impl<B: Backend> Engine<B> {
         Ok(rendered.branches.into_iter().zip(outs).collect())
     }
 
-    /// Evaluate `branches` over the prefix (one pass, or one per branch)
-    /// and read every one out. The baseline pass, when configured, goes
-    /// first so the live state is what stays resident in the backend.
-    fn score_branches(
+    /// Score one set of branches per job: pack, baseline, one backend pass
+    /// for as many jobs as the backend's limits allow, read out. Jobs whose
+    /// branches fail to pack or whose pass fails are moved to `failed` and
+    /// dropped from `jobs`; the rest come back as `(job, distributions)`.
+    /// `Mode::Separate` evaluates one branch per pass and never batches.
+    fn score_many<'r>(
         &mut self,
-        req: &Request,
-        prefix: &[Token],
-        branches: Vec<RenderedBranch>,
+        work: Vec<(usize, Vec<RenderedBranch>)>,
+        jobs: &mut [Option<Job<'r>>],
         mode: Mode,
-        diag: &mut Diagnostics,
-    ) -> Result<Vec<(RenderedBranch, Distribution)>> {
-        if branches.is_empty() {
-            return Ok(Vec::new());
+        failed: &mut Vec<(usize, crate::Error)>,
+    ) -> Vec<(usize, Vec<(RenderedBranch, Distribution)>)> {
+        struct Item {
+            job: usize,
+            branches: Vec<RenderedBranch>,
+            packed: Vec<BranchTokens>,
+            label_ids: Vec<Token>,
+            baseline: Option<Vec<Vec<f32>>>,
+            outputs: Option<Vec<BranchOutput>>,
         }
-        let packed = self.pack_branches(&branches)?;
-        let max_k = branches.iter().map(|b| b.keys.len()).max().unwrap_or(0);
-        let label_ids = match self.readout {
-            Readout::Label => Readout::label_ids(&self.backend, max_k)?,
-            Readout::Pointer(_) => Vec::new(),
-        };
         let want: Want = self.readout.want();
-        diag.branch_tokens
-            .extend(packed.iter().map(|b| b.tokens.len()));
-        let baseline = match self.baseline.clone() {
-            Some(cf) => {
-                let (b, evaluated) =
-                    self.baseline_logits(req, &branches, &packed, &label_ids, &cf)?;
-                diag.passes += usize::from(evaluated);
-                Some(b)
-            }
-            None => None,
+        let mut done: Vec<(usize, Vec<(RenderedBranch, Distribution)>)> = Vec::new();
+        let mut items: Vec<Item> = Vec::with_capacity(work.len());
+        let fail = |jobs: &mut [Option<Job<'r>>], failed: &mut Vec<_>, i: usize, e| {
+            jobs[i] = None;
+            failed.push((i, e));
         };
-        let outputs = match mode {
-            Mode::Packed => {
-                diag.passes += 1;
-                self.backend.evaluate(prefix, &packed, want)?
+        for (i, branches) in work {
+            let Some(job) = jobs[i].as_mut() else {
+                continue;
+            };
+            if branches.is_empty() {
+                done.push((i, Vec::new()));
+                continue;
             }
-            Mode::Separate => {
-                let mut outs = Vec::with_capacity(packed.len());
-                for b in &packed {
-                    outs.extend(
-                        self.backend
-                            .evaluate(prefix, std::slice::from_ref(b), want)?,
-                    );
-                }
-                diag.passes += packed.len();
-                outs
+            let prepared = (|| {
+                let packed = self.pack_branches(&branches)?;
+                let max_k = branches.iter().map(|b| b.keys.len()).max().unwrap_or(0);
+                let label_ids = match self.readout {
+                    Readout::Label => Readout::label_ids(&self.backend, max_k)?,
+                    Readout::Pointer(_) => Vec::new(),
+                };
+                job.diag
+                    .branch_tokens
+                    .extend(packed.iter().map(|b| b.tokens.len()));
+                let baseline = match self.baseline.clone() {
+                    Some(cf) => {
+                        let (b, evaluated) =
+                            self.baseline_logits(job.req, &branches, &packed, &label_ids, &cf)?;
+                        job.diag.passes += usize::from(evaluated);
+                        Some(b)
+                    }
+                    None => None,
+                };
+                Ok((packed, label_ids, baseline))
+            })();
+            match prepared {
+                Ok((packed, label_ids, baseline)) => items.push(Item {
+                    job: i,
+                    branches,
+                    packed,
+                    label_ids,
+                    baseline,
+                    outputs: None,
+                }),
+                Err(e) => fail(jobs, failed, i, e),
             }
-        };
-        diag.prefix_source = self.backend.prefix_source();
-        let mut result = Vec::with_capacity(outputs.len());
-        for (i, (branch, out)) in branches.into_iter().zip(outputs).enumerate() {
-            let mut dist =
-                self.readout
-                    .distribution(&branch, &out, &label_ids, self.temperature)?;
-            if let Some(m) = dist.candidate_mass {
-                let e = diag.candidate_mass.entry(branch.id.clone()).or_insert(m);
-                *e = e.min(m);
-            }
-            if let Some(b) = &baseline {
-                dist.calibrate(b[i].clone(), self.temperature);
-                diag.baseline
-                    .entry(branch.id.clone())
-                    .or_insert_with(|| b[i].clone());
-            }
-            result.push((branch, dist));
         }
-        Ok(result)
+        match mode {
+            Mode::Separate => {
+                for it in &mut items {
+                    let job = jobs[it.job].as_mut().expect("live job");
+                    let mut outs = Vec::with_capacity(it.packed.len());
+                    let mut err = None;
+                    for b in &it.packed {
+                        match self
+                            .backend
+                            .evaluate(&job.prefix, std::slice::from_ref(b), want)
+                        {
+                            Ok(o) => outs.extend(o),
+                            Err(e) => {
+                                err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    job.diag.passes += it.packed.len();
+                    job.diag.prefix_source = self.backend.prefix_source();
+                    match err {
+                        None => it.outputs = Some(outs),
+                        Some(e) => fail(jobs, failed, it.job, e),
+                    }
+                }
+            }
+            Mode::Packed => {
+                // Greedy chunks under the backend's limits; a lone item that
+                // exceeds them still gets its own call (and its own error).
+                let limits = self.backend.limits();
+                let mut chunks: Vec<Vec<usize>> = Vec::new();
+                let (mut toks, mut seqs, mut rows) = (0usize, 0usize, 0usize);
+                for (k, it) in items.iter().enumerate() {
+                    let job = jobs[it.job].as_ref().expect("live job");
+                    let g = Group {
+                        prefix: &job.prefix,
+                        branches: &it.packed,
+                    };
+                    let (t, q, r) = (g.tokens(), g.sequences(), g.rows());
+                    let fits = toks + t <= limits.tokens
+                        && seqs + q <= limits.sequences
+                        && rows + r <= limits.rows;
+                    match chunks.last_mut() {
+                        Some(c) if fits => {
+                            c.push(k);
+                            toks += t;
+                            seqs += q;
+                            rows += r;
+                        }
+                        _ => {
+                            chunks.push(vec![k]);
+                            toks = t;
+                            seqs = q;
+                            rows = r;
+                        }
+                    }
+                }
+                for chunk in chunks {
+                    let groups: Vec<Group<'_>> = chunk
+                        .iter()
+                        .map(|&k| Group {
+                            prefix: &jobs[items[k].job].as_ref().expect("live job").prefix,
+                            branches: &items[k].packed,
+                        })
+                        .collect();
+                    match self.backend.evaluate_many(&groups, want) {
+                        Ok(outs) => {
+                            for (&k, out) in chunk.iter().zip(outs) {
+                                let job = jobs[items[k].job].as_mut().expect("live job");
+                                job.diag.passes += 1;
+                                job.diag.batch = job.diag.batch.max(chunk.len());
+                                job.diag.prefix_source = out.prefix_source;
+                                items[k].outputs = Some(out.branches);
+                            }
+                        }
+                        Err(e) => {
+                            for &k in &chunk {
+                                fail(jobs, failed, items[k].job, e.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for it in items {
+            let Some(outputs) = it.outputs else { continue };
+            let Some(job) = jobs[it.job].as_mut() else {
+                continue;
+            };
+            let mut result = Vec::with_capacity(outputs.len());
+            let mut err = None;
+            for (i, (branch, out)) in it.branches.into_iter().zip(outputs).enumerate() {
+                let mut dist =
+                    match self
+                        .readout
+                        .distribution(&branch, &out, &it.label_ids, self.temperature)
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    };
+                if let Some(m) = dist.candidate_mass {
+                    let e = job
+                        .diag
+                        .candidate_mass
+                        .entry(branch.id.clone())
+                        .or_insert(m);
+                    *e = e.min(m);
+                }
+                if let Some(b) = &it.baseline {
+                    dist.calibrate(b[i].clone(), self.temperature);
+                    job.diag
+                        .baseline
+                        .entry(branch.id.clone())
+                        .or_insert_with(|| b[i].clone());
+                }
+                result.push((branch, dist));
+            }
+            match err {
+                None => done.push((it.job, result)),
+                Some(e) => fail(jobs, failed, it.job, e),
+            }
+        }
+        done
     }
 
     /// Distributions for every question, in request order. Each question's
@@ -275,50 +408,145 @@ impl<B: Backend> Engine<B> {
         req: &Request,
         orders: &IndexMap<String, Vec<usize>>,
         mode: Mode,
-    ) -> Result<(Vec<(RenderedBranch, Distribution)>, Diagnostics)> {
+    ) -> Result<Distributions> {
+        self.distributions_many(&[(req, orders)], mode)
+            .pop()
+            .expect("one result per request")
+    }
+
+    /// [`Engine::distributions`] for several requests at once: every
+    /// request's first-stage branches go to the backend together (as few
+    /// [`Backend::evaluate_many`] calls as its [`Limits`] allow), then every
+    /// second stage. Requests stay independent: one that fails validation,
+    /// packing or its pass gets its own error and the others go on. One
+    /// result per request, in order. `diag.batch` says how many requests
+    /// shared a pass with it.
+    pub fn distributions_many(
+        &mut self,
+        reqs: &[(&Request, &IndexMap<String, Vec<usize>>)],
+        mode: Mode,
+    ) -> Vec<Result<Distributions>> {
         let cap = match self.readout {
             Readout::Label => Some(crate::readout::LABELS.len()),
             Readout::Pointer(_) => None,
         };
-        let plan = Plan::new(&self.renderer, req, orders, cap, self.orders)?;
-        let (prefix, _) = self.tokenize_segments(&plan.rendered.prefix)?;
-        let mut diag = Diagnostics {
-            prefix_tokens: prefix.len(),
-            orders: self.orders.max(1),
-            ..Default::default()
-        };
-        let first: Vec<Distribution> = self
-            .score_branches(req, &prefix, plan.first.clone(), mode, &mut diag)?
-            .into_iter()
-            .map(|(_, d)| d)
+        let mut failed: Vec<(usize, crate::Error)> = Vec::new();
+        let mut jobs: Vec<Option<Job<'_>>> = Vec::with_capacity(reqs.len());
+        for (i, (req, orders)) in reqs.iter().enumerate() {
+            let planned =
+                Plan::new(&self.renderer, req, orders, cap, self.orders).and_then(|plan| {
+                    let (prefix, _) = self.tokenize_segments(&plan.rendered.prefix)?;
+                    Ok((plan, prefix))
+                });
+            match planned {
+                Ok((plan, prefix)) => {
+                    let diag = Diagnostics {
+                        prefix_tokens: prefix.len(),
+                        orders: self.orders.max(1),
+                        batch: 1,
+                        ..Default::default()
+                    };
+                    jobs.push(Some(Job {
+                        req,
+                        plan,
+                        prefix,
+                        diag,
+                    }));
+                }
+                Err(e) => {
+                    jobs.push(None);
+                    failed.push((i, e));
+                }
+            }
+        }
+        let work: Vec<(usize, Vec<RenderedBranch>)> = jobs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, j)| j.as_ref().map(|j| (i, j.plan.first.clone())))
             .collect();
-        let (second, finalists) = plan.second(&self.renderer, req, &first);
-        diag.two_stage = finalists;
-        let second = self.score_branches(req, &prefix, second, mode, &mut diag)?;
-        let folded = plan.fold(first, second, self.temperature);
-        diag.order_spread = folded.order_spread;
-        Ok((folded.results, diag))
+        let firsts = self.score_many(work, &mut jobs, mode, &mut failed);
+        let mut first_dists: Vec<Option<Vec<Distribution>>> =
+            (0..reqs.len()).map(|_| None).collect();
+        let mut work = Vec::with_capacity(firsts.len());
+        for (i, dists) in firsts {
+            let Some(job) = jobs[i].as_mut() else {
+                continue;
+            };
+            let first: Vec<Distribution> = dists.into_iter().map(|(_, d)| d).collect();
+            let (second, finalists) = job.plan.second(&self.renderer, job.req, &first);
+            job.diag.two_stage = finalists;
+            first_dists[i] = Some(first);
+            work.push((i, second));
+        }
+        let seconds = self.score_many(work, &mut jobs, mode, &mut failed);
+        let mut out: Vec<Option<Result<Distributions>>> = (0..reqs.len()).map(|_| None).collect();
+        for (i, second) in seconds {
+            let Some(job) = jobs[i].take() else { continue };
+            let first = first_dists[i].take().expect("first stage scored");
+            let folded = job.plan.fold(first, second, self.temperature);
+            let mut diag = job.diag;
+            diag.order_spread = folded.order_spread;
+            out[i] = Some(Ok((folded.results, diag)));
+        }
+        for (i, e) in failed {
+            out[i] = Some(Err(e));
+        }
+        out.into_iter()
+            .map(|r| r.expect("every request resolved"))
+            .collect()
     }
 
     /// Full TypeSafe-shaped response.
     pub fn answer(&mut self, req: &Request, mode: Mode) -> Result<(Response, Diagnostics)> {
-        let (dists, diag) = self.distributions(req, &IndexMap::new(), mode)?;
-        let mut answers = IndexMap::with_capacity(dists.len());
-        for (branch, dist) in &dists {
-            let q = &req.questions[&branch.id];
-            answers.insert(branch.id.clone(), to_answer(q, branch, dist));
-        }
-        let input_tokens = diag.prefix_tokens + diag.branch_tokens.iter().sum::<usize>();
-        let response = Response {
-            model: self.model.clone(),
-            answers,
-            usage: Usage {
-                input_tokens: input_tokens as u64,
-                output_tokens: 0,
-            },
-        };
-        Ok((response, diag))
+        self.answer_many(&[req], mode)
+            .pop()
+            .expect("one result per request")
     }
+
+    /// [`Engine::answer`] for several requests in as few passes as the
+    /// backend allows (see [`Engine::distributions_many`]). One result per
+    /// request, in order.
+    pub fn answer_many(
+        &mut self,
+        reqs: &[&Request],
+        mode: Mode,
+    ) -> Vec<Result<(Response, Diagnostics)>> {
+        let none = IndexMap::new();
+        let pairs: Vec<(&Request, &IndexMap<String, Vec<usize>>)> =
+            reqs.iter().map(|r| (*r, &none)).collect();
+        self.distributions_many(&pairs, mode)
+            .into_iter()
+            .zip(reqs)
+            .map(|(r, req)| {
+                let (dists, diag) = r?;
+                let mut answers = IndexMap::with_capacity(dists.len());
+                for (branch, dist) in &dists {
+                    let q = &req.questions[&branch.id];
+                    answers.insert(branch.id.clone(), to_answer(q, branch, dist));
+                }
+                let input_tokens = diag.prefix_tokens + diag.branch_tokens.iter().sum::<usize>();
+                Ok((
+                    Response {
+                        model: self.model.clone(),
+                        answers,
+                        usage: Usage {
+                            input_tokens: input_tokens as u64,
+                            output_tokens: 0,
+                        },
+                    },
+                    diag,
+                ))
+            })
+            .collect()
+    }
+}
+
+/// One request between the passes of [`Engine::distributions_many`].
+struct Job<'r> {
+    req: &'r Request,
+    plan: Plan,
+    prefix: Vec<Token>,
+    diag: Diagnostics,
 }
 
 /// Map a distribution over rendered options back onto the question's own keys.
@@ -431,6 +659,107 @@ mod tests {
             "questions": {"q": {"type": "noul", "instructions": "is it so"}}
         }))
         .unwrap()
+    }
+
+    /// Counts groups per `evaluate_many` call and caps a call at two
+    /// sequences' worth of tokens, so three requests take two calls.
+    struct Counting {
+        calls: Cell<Vec<usize>>,
+    }
+
+    impl Backend for Counting {
+        fn tokenize(&self, text: &str) -> Result<Vec<Token>> {
+            Ok(text.split_whitespace().map(|_| Token(3)).collect())
+        }
+        fn special(&self, _: &str) -> Result<Token> {
+            Ok(Token(2))
+        }
+        fn bos(&self) -> Token {
+            Token(0)
+        }
+        fn n_embd(&self) -> usize {
+            1
+        }
+        fn n_vocab(&self) -> usize {
+            4
+        }
+        fn evaluate(
+            &mut self,
+            _: &[Token],
+            branches: &[BranchTokens],
+            _: Want,
+        ) -> Result<Vec<BranchOutput>> {
+            Ok(branches
+                .iter()
+                .map(|_| BranchOutput {
+                    rows: vec![vec![0.0, 3.0, 0.0, 0.0]],
+                })
+                .collect())
+        }
+        fn evaluate_many(
+            &mut self,
+            groups: &[Group<'_>],
+            want: Want,
+        ) -> Result<Vec<crate::backend::GroupOutput>> {
+            let mut c = self.calls.take();
+            c.push(groups.len());
+            self.calls.set(c);
+            let mut out = Vec::new();
+            for g in groups {
+                out.push(crate::backend::GroupOutput {
+                    branches: self.evaluate(g.prefix, g.branches, want)?,
+                    prefix_source: None,
+                });
+            }
+            Ok(out)
+        }
+        fn limits(&self) -> crate::backend::Limits {
+            crate::backend::Limits {
+                sequences: 4,
+                ..Default::default()
+            }
+        }
+    }
+
+    #[test]
+    fn many_requests_share_passes_and_fail_alone() {
+        let mut engine = Engine::new(
+            Counting {
+                calls: Cell::new(Vec::new()),
+            },
+            Renderer::gemma_label(),
+            Readout::Label,
+            "t",
+        );
+        let good = request("fine");
+        // A choice with no options fails validation on its own without
+        // touching the others.
+        let bad: Request = serde_json::from_value(serde_json::json!({
+            "state": "x",
+            "questions": {"q": {"type": "choice", "instructions": "pick", "criteria": {}}}
+        }))
+        .unwrap();
+        let empty: Request = serde_json::from_value(serde_json::json!({
+            "state": "x", "questions": {}
+        }))
+        .unwrap();
+        let results = engine.answer_many(&[&good, &bad, &good, &empty, &good], Mode::Packed);
+        assert!(results[0].is_ok());
+        assert!(
+            matches!(&results[1], Err(crate::Error::Invalid { .. })),
+            "{:?}",
+            results[1].as_ref().err()
+        );
+        assert!(results[2].is_ok());
+        assert!(results[3].is_err());
+        assert!(results[4].is_ok());
+        // Each good request is 2 sequences; the limit of 4 puts two in the
+        // first call and one in the second.
+        assert_eq!(engine.backend.calls.take(), vec![2, 1]);
+        let (_, d0) = results[0].as_ref().unwrap();
+        let (_, d4) = results[4].as_ref().unwrap();
+        assert_eq!(d0.batch, 2);
+        assert_eq!(d4.batch, 1);
     }
 
     #[test]

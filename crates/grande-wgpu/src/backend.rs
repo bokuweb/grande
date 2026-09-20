@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Context};
-use grande_core::{Backend, BranchOutput, BranchTokens, Error, PrefixSource, Token, Want};
+use grande_core::{
+    Backend, BranchOutput, BranchTokens, Error, GroupOutput, Limits, PrefixSource, Token, Want,
+};
 use tokenizers::Tokenizer;
 
 use crate::model::{Config, Manifest};
@@ -166,6 +168,34 @@ impl Backend for WgpuBackend {
     ) -> grande_core::Result<Vec<BranchOutput>> {
         let prefix: Vec<u32> = prefix.iter().map(|t| t.0 as u32).collect();
         pollster::block_on(self.engine.evaluate(&prefix, branches, want)).map_err(core_err)
+    }
+
+    fn evaluate_many(
+        &mut self,
+        groups: &[grande_core::Group<'_>],
+        want: Want,
+    ) -> grande_core::Result<Vec<GroupOutput>> {
+        let prefixes: Vec<Vec<u32>> = groups
+            .iter()
+            .map(|g| g.prefix.iter().map(|t| t.0 as u32).collect())
+            .collect();
+        let groups: Vec<crate::Group<'_>> = groups
+            .iter()
+            .zip(&prefixes)
+            .map(|(g, p)| crate::Group {
+                prefix: p,
+                branches: g.branches,
+            })
+            .collect();
+        pollster::block_on(self.engine.evaluate_groups(&groups, want)).map_err(core_err)
+    }
+
+    fn limits(&self) -> Limits {
+        Limits {
+            tokens: self.engine.capacity,
+            sequences: usize::MAX,
+            rows: self.engine.max_rows,
+        }
     }
 
     fn prefix_source(&self) -> Option<PrefixSource> {

@@ -2,7 +2,10 @@
 // branch tokens (seq 1..). A query sees a key iff the key is in the prefix or
 // in the query's own branch, is at or before the query's position, and (on
 // sliding-window layers) within the window. That is the isolation rule the
-// llama.cpp backend gets from its per-sequence KV cache.
+// llama.cpp backend gets from its per-sequence KV cache. When several
+// requests share a pass, each has its own prefix and branches under a group
+// number in the high bits of the sequence id (engine.rs SEQ_GROUP_SHIFT) and
+// sees nothing of the others.
 //
 // `kv_heads` KV heads, each shared by `heads / kv_heads` consecutive query
 // heads (one for E2B, two for E4B). Q is read from the layer's fused
@@ -50,10 +53,17 @@ var<workgroup> kpos: array<i32, KB>;
 var<workgroup> kseq: array<i32, KB>;
 var<workgroup> qpos: array<i32, ROWS>;
 var<workgroup> qseq: array<i32, ROWS>;
+var<workgroup> qlo: array<i32, ROWS>;
+var<workgroup> qhi: array<i32, ROWS>;
+var<workgroup> krange: vec2<u32>;
 var<workgroup> tile_any: bool;
 
+// Sequence ids: bits 0..12 number the branch within a request (0 = its
+// prefix), the bits above number the request within the pass. Same request,
+// then prefix or own branch.
 fn visible(qp: i32, qs_: i32, kp: i32, ks_: i32) -> bool {
-    return (ks_ == 0 || ks_ == qs_) && kp <= qp && (p.window == 0u || u32(qp - kp) < p.window);
+    let same_group = ((ks_ ^ qs_) >> 12u) == 0;
+    return same_group && ((ks_ & 0xfff) == 0 || ks_ == qs_) && kp <= qp && (p.window == 0u || u32(qp - kp) < p.window);
 }
 
 // Stage KB rows of K (half == 0) or V (half == 1) of KV head g, tile j0, as
@@ -100,27 +110,46 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     if (li < tb) {
         let tk = p.base + tok0 + li;
         if (tk < p.t) {
-            qpos[li] = tok_meta[2u * tk];
-            qseq[li] = tok_meta[2u * tk + 1u];
+            qpos[li] = tok_meta[4u * tk];
+            qseq[li] = tok_meta[4u * tk + 1u];
+            qlo[li] = tok_meta[4u * tk + 2u];
+            qhi[li] = tok_meta[4u * tk + 3u];
         } else {
             qpos[li] = -1;
             qseq[li] = -2;
+            qlo[li] = 0x7fffffff;
+            qhi[li] = 0;
         }
     }
+    workgroupBarrier();
+    // Keys this workgroup's tokens can see lie in cache rows [lo, hi): from
+    // the first row of their request to the last of these tokens. Tiles
+    // outside are never visited, so a pass holding several requests costs
+    // each of them its own length, not the whole cache.
+    if (li == 0u) {
+        var lo = 0x7fffffff;
+        var hi = 0;
+        for (var qi = 0u; qi < tb; qi++) {
+            lo = min(lo, qlo[qi]);
+            hi = max(hi, qhi[qi]);
+        }
+        krange = vec2<u32>(u32(max(lo, 0)), u32(max(hi, 0)));
+    }
+    let kr = workgroupUniformLoad(&krange);
 
     var m = NEG;
     var l = 0.0;
     var o: array<vec4<f32>, NV>;
     for (var i = 0u; i < NV; i++) { o[i] = vec4<f32>(0.0); }
 
-    let ntiles = (p.t + KB - 1u) / KB;
-    for (var tile = 0u; tile < ntiles; tile++) {
+    let ntiles = (min(kr.y, p.t) + KB - 1u) / KB;
+    for (var tile = kr.x / KB; tile < ntiles; tile++) {
         let j0 = tile * KB;
         if (li < KB) {
             let j = j0 + li;
             if (j < p.t) {
-                kpos[li] = tok_meta[2u * j];
-                kseq[li] = tok_meta[2u * j + 1u];
+                kpos[li] = tok_meta[4u * j];
+                kseq[li] = tok_meta[4u * j + 1u];
             } else {
                 kpos[li] = 0x7fffffff;
                 kseq[li] = -3;

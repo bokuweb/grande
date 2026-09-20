@@ -8,6 +8,11 @@
 //! block-causal mask kev uses in PyTorch. Positions restart at `prefix_len`
 //! per branch, so every branch is "state, then this question".
 //!
+//! Several requests share one `llama_decode` the same way (`evaluate_many`):
+//! each gets a run of sequence ids of its own, its prefix decoded into all
+//! of them, so a server can put concurrent requests over different states in
+//! one batch and nothing crosses between them.
+//!
 //! The prefix stays resident between requests. When a request arrives over a
 //! different state, the outgoing state's KV cells are kept as a serialized
 //! sequence state (RAM, and optionally a file), so coming back to a state is a
@@ -22,7 +27,10 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::{anyhow, Context};
-use grande_core::{Backend, BranchOutput, BranchTokens, Error, PrefixSource, Token, Want};
+use grande_core::{
+    Backend, BranchOutput, BranchTokens, Error, Group, GroupOutput, Limits, PrefixSource, Token,
+    Want,
+};
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -55,6 +63,12 @@ pub struct Options {
     /// Directory for the on-disk copy of every cached state, so a state
     /// survives a restart. None = RAM only.
     pub state_cache_dir: Option<PathBuf>,
+    /// Decode several requests (`evaluate_many` groups) in one
+    /// `llama_decode`. Off by default: on Metal every ubatch attends over
+    /// the whole unified cache, so a batch of requests costs more than the
+    /// requests one by one (270M, 16 x 3 questions: 1.7 → 2.6 s; E2B
+    /// even). Left in for other backends.
+    pub batch_requests: bool,
 }
 
 impl Default for Options {
@@ -71,6 +85,7 @@ impl Default for Options {
             embeddings: false,
             state_cache_bytes: 512 << 20,
             state_cache_dir: None,
+            batch_requests: false,
         }
     }
 }
@@ -267,21 +282,22 @@ impl LlamaEngine {
         Some(dir.join(format!("{:016x}.state", state_key(&self.model_id, prefix))))
     }
 
-    /// Serialize sequence 0 into the RAM cache and, if configured, a file.
-    fn remember(&mut self, prefix: &[Token]) -> anyhow::Result<()> {
+    /// Serialize the prefix held by sequence `seq` (0 for the resident one)
+    /// into the RAM cache and, if configured, a file.
+    fn remember(&mut self, prefix: &[Token], seq: i32) -> anyhow::Result<()> {
         if self.states.budget == 0 && self.opts.state_cache_dir.is_none() {
             return Ok(());
         }
         let t = Instant::now();
         let state = self
             .ctx
-            .state_seq_get(0, LlamaStateSeqFlags::empty())
+            .state_seq_get(seq, LlamaStateSeqFlags::empty())
             .map_err(|e| anyhow!("state_seq_get: {e:?}"))?;
         let bytes = state.byte_len();
         if let Some(path) = self.state_path(prefix) {
             let toks: Vec<LlamaToken> = prefix.iter().map(|t| LlamaToken(t.0)).collect();
             self.ctx
-                .state_seq_save_file(&path, 0, &toks)
+                .state_seq_save_file(&path, seq, &toks)
                 .map_err(|e| anyhow!("state_seq_save_file {}: {e:?}", path.display()))?;
         }
         self.states.put(prefix.to_vec(), state);
@@ -372,60 +388,72 @@ impl LlamaEngine {
         self.resident_prefix.as_deref() == Some(prefix)
     }
 
-    /// Decode the branches, and the prefix first when it is not resident, in
-    /// as few `llama_decode` calls as `n_batch` allows (one, normally).
+    /// Decode every group's branches, and its prefix first when it is not
+    /// resident, in as few `llama_decode` calls as `n_batch` allows (one,
+    /// normally). Group g's sequence ids start at `seq_base[g]`: its prefix
+    /// is `seq_base`, branch b is `seq_base + 1 + b`.
     ///
-    /// A prefix decoded here is added with every sequence id at once, so its
-    /// cells belong to sequence 0 and to every branch from the start and no
-    /// `seq_cp` is needed; a resident prefix is shared by `seq_cp` instead.
-    /// Either way a branch token attends to the prefix cells and to its own
-    /// sequence only.
-    fn decode_branches(
+    /// A prefix decoded here is added with every sequence id of its group at
+    /// once, so its cells belong to the group's prefix sequence and to every
+    /// branch from the start and no `seq_cp` is needed; a resident prefix
+    /// (sequence 0, the first group only) is shared by `seq_cp` instead.
+    /// Either way a branch token attends to its group's prefix cells and to
+    /// its own sequence only.
+    fn decode_groups(
         &mut self,
-        prefix: &[Token],
-        decode_prefix: bool,
-        branches: &[BranchTokens],
+        groups: &[Group<'_>],
+        seq_base: &[i32],
+        resident_first: bool,
         want: Want,
-    ) -> anyhow::Result<Vec<BranchOutput>> {
+    ) -> anyhow::Result<Vec<Vec<BranchOutput>>> {
         let n_batch = self.opts.n_batch as usize;
-        let prefix_len = prefix.len();
-        let mut outputs: Vec<BranchOutput> = branches
+        let mut outputs: Vec<Vec<BranchOutput>> = groups
             .iter()
-            .map(|b| BranchOutput {
-                rows: Vec::with_capacity(b.want.len()),
+            .map(|g| {
+                g.branches
+                    .iter()
+                    .map(|b| BranchOutput {
+                        rows: Vec::with_capacity(b.want.len()),
+                    })
+                    .collect()
             })
             .collect();
 
-        // pending: (branch, want slot, batch-local index) for every token
-        // whose output was requested in the batch being filled.
+        // pending: (group, branch, want slot, batch-local index) for every
+        // token whose output was requested in the batch being filled.
         let mut batch = LlamaBatch::new(n_batch, self.n_seq_max as i32);
-        let mut pending: Vec<(usize, usize, usize)> = Vec::new();
-        if decode_prefix {
-            let seqs: Vec<i32> = (0..=branches.len() as i32).collect();
-            for (pos, t) in prefix.iter().enumerate() {
-                if batch.n_tokens() as usize >= n_batch {
-                    self.flush(&mut batch, &mut pending, &mut outputs, want)?;
+        let mut pending: Vec<(usize, usize, usize, usize)> = Vec::new();
+        for (gi, g) in groups.iter().enumerate() {
+            let base = seq_base[gi];
+            let prefix_len = g.prefix.len();
+            let decode_prefix = !(gi == 0 && resident_first);
+            if decode_prefix {
+                let seqs: Vec<i32> = (base..=base + g.branches.len() as i32).collect();
+                for (pos, t) in g.prefix.iter().enumerate() {
+                    if batch.n_tokens() as usize >= n_batch {
+                        self.flush(&mut batch, &mut pending, &mut outputs, want)?;
+                    }
+                    batch.add(LlamaToken(t.0), pos as i32, &seqs, false)?;
                 }
-                batch.add(LlamaToken(t.0), pos as i32, &seqs, false)?;
             }
-        }
-        for (bi, b) in branches.iter().enumerate() {
-            let seq = (bi + 1) as i32;
-            if !decode_prefix {
-                self.ctx
-                    .kv_cache_seq_cp(0, seq, None, None)
-                    .map_err(|e| anyhow!("seq_cp: {e:?}"))?;
-            }
-            let mut want_iter = b.want.iter().enumerate().peekable();
-            for (j, t) in b.tokens.iter().enumerate() {
-                if batch.n_tokens() as usize >= n_batch {
-                    self.flush(&mut batch, &mut pending, &mut outputs, want)?;
+            for (bi, b) in g.branches.iter().enumerate() {
+                let seq = base + 1 + bi as i32;
+                if !decode_prefix {
+                    self.ctx
+                        .kv_cache_seq_cp(base, seq, None, None)
+                        .map_err(|e| anyhow!("seq_cp: {e:?}"))?;
                 }
-                let wanted = matches!(want_iter.peek(), Some((_, &w)) if w == j);
-                batch.add(LlamaToken(t.0), (prefix_len + j) as i32, &[seq], wanted)?;
-                if wanted {
-                    let (slot, _) = want_iter.next().unwrap();
-                    pending.push((bi, slot, batch.n_tokens() as usize - 1));
+                let mut want_iter = b.want.iter().enumerate().peekable();
+                for (j, t) in b.tokens.iter().enumerate() {
+                    if batch.n_tokens() as usize >= n_batch {
+                        self.flush(&mut batch, &mut pending, &mut outputs, want)?;
+                    }
+                    let wanted = matches!(want_iter.peek(), Some((_, &w)) if w == j);
+                    batch.add(LlamaToken(t.0), (prefix_len + j) as i32, &[seq], wanted)?;
+                    if wanted {
+                        let (slot, _) = want_iter.next().unwrap();
+                        pending.push((gi, bi, slot, batch.n_tokens() as usize - 1));
+                    }
                 }
             }
         }
@@ -438,12 +466,12 @@ impl LlamaEngine {
     fn flush(
         &mut self,
         batch: &mut LlamaBatch,
-        pending: &mut Vec<(usize, usize, usize)>,
-        outputs: &mut [BranchOutput],
+        pending: &mut Vec<(usize, usize, usize, usize)>,
+        outputs: &mut [Vec<BranchOutput>],
         want: Want,
     ) -> anyhow::Result<()> {
         self.ctx.decode(batch).context("decoding branches")?;
-        for &(bi, slot, pos) in pending.iter() {
+        for &(gi, bi, slot, pos) in pending.iter() {
             let row: Vec<f32> = match want {
                 Want::Logits => self.ctx.get_logits_ith(pos as i32).to_vec(),
                 Want::Hidden => self
@@ -452,7 +480,7 @@ impl LlamaEngine {
                     .map_err(|e| anyhow!("embeddings at {pos}: {e:?}"))?
                     .to_vec(),
             };
-            let out = &mut outputs[bi];
+            let out = &mut outputs[gi][bi];
             if out.rows.len() != slot {
                 return Err(anyhow!("row order mismatch for branch {bi}"));
             }
@@ -526,35 +554,119 @@ impl Backend for LlamaEngine {
         branches: &[BranchTokens],
         want: Want,
     ) -> grande_core::Result<Vec<BranchOutput>> {
-        if branches.len() + 1 > self.n_seq_max {
+        let mut outs = self.evaluate_many(&[Group { prefix, branches }], want)?;
+        Ok(outs.pop().expect("one output per group").branches)
+    }
+
+    /// Every group in one `llama_decode`: the group whose prefix is resident
+    /// (or restorable) runs in sequence 0 and shares it, every other group
+    /// gets a run of fresh sequence ids and decodes its prefix into them.
+    /// Afterwards only sequence 0 (the first group's prefix) stays; every
+    /// decoded prefix is in the state cache.
+    fn evaluate_many(
+        &mut self,
+        groups: &[Group<'_>],
+        want: Want,
+    ) -> grande_core::Result<Vec<GroupOutput>> {
+        if groups.is_empty() {
+            return Err(Error::Backend("empty request".into()));
+        }
+        if groups.len() > 1 && !self.opts.batch_requests {
+            let mut out = Vec::with_capacity(groups.len());
+            for g in groups {
+                out.push(GroupOutput {
+                    branches: self.evaluate(g.prefix, g.branches, want)?,
+                    prefix_source: self.last_source,
+                });
+            }
+            return Ok(out);
+        }
+        let seqs: usize = groups.iter().map(|g| g.sequences()).sum();
+        if seqs > self.n_seq_max {
             return Err(Error::Backend(format!(
-                "{} branches exceed n_seq_max {}",
-                branches.len(),
-                self.n_seq_max - 1
+                "{seqs} sequences ({} groups) exceed n_seq_max {}",
+                groups.len(),
+                self.n_seq_max
             )));
         }
-        let total = prefix.len() + branches.iter().map(|b| b.tokens.len()).sum::<usize>();
+        let total: usize = groups.iter().map(|g| g.tokens()).sum();
         if total > self.ctx.n_ctx() as usize {
             return Err(Error::Backend(format!(
                 "{total} tokens exceed n_ctx {}",
                 self.ctx.n_ctx()
             )));
         }
-        let have_prefix = self.prepare_prefix(prefix);
+        // The resident group goes first, in sequence 0.
+        let first = groups
+            .iter()
+            .position(|g| self.resident_prefix.as_deref() == Some(g.prefix))
+            .unwrap_or(0);
+        let order: Vec<usize> = std::iter::once(first)
+            .chain((0..groups.len()).filter(|&i| i != first))
+            .collect();
+        let laid: Vec<Group<'_>> = order.iter().map(|&i| groups[i]).collect();
+        let mut seq_base = Vec::with_capacity(laid.len());
+        let mut next = 0i32;
+        for g in &laid {
+            seq_base.push(next);
+            next += g.sequences() as i32;
+        }
+        let have_prefix = self.prepare_prefix(laid[0].prefix);
+        let first_source = if have_prefix {
+            self.last_source
+        } else {
+            Some(PrefixSource::Decoded)
+        };
         let out = self
-            .decode_branches(prefix, !have_prefix, branches, want)
+            .decode_groups(&laid, &seq_base, have_prefix, want)
             .map_err(core_err);
-        // Drop the branch sequences; the prefix cells (sequence 0) stay
-        // resident for the next request over the same state.
-        for seq in 1..=branches.len() as i32 {
+        // Every decoded prefix goes to the state cache before its cells go.
+        let mut remembered = Ok(());
+        if out.is_ok() {
+            for (k, g) in laid.iter().enumerate() {
+                if k == 0 && have_prefix {
+                    continue;
+                }
+                if let Err(e) = self.remember(g.prefix, seq_base[k]) {
+                    remembered = Err(core_err(e));
+                    break;
+                }
+            }
+        }
+        // Drop everything but sequence 0; the first group's prefix cells
+        // stay resident for the next request over the same state.
+        for seq in 1..next {
             self.ctx.kv_cache_seq_rm(seq, None, None).ok();
         }
-        if !have_prefix && out.is_ok() {
-            self.resident_prefix = Some(prefix.to_vec());
+        let outs = out?;
+        remembered?;
+        if !have_prefix {
+            self.resident_prefix = Some(laid[0].prefix.to_vec());
             self.last_source = Some(PrefixSource::Decoded);
-            self.remember(prefix).map_err(core_err)?;
         }
-        out
+        let mut result: Vec<Option<GroupOutput>> = (0..groups.len()).map(|_| None).collect();
+        for (k, (&gi, branches)) in order.iter().zip(outs).enumerate() {
+            result[gi] = Some(GroupOutput {
+                branches,
+                prefix_source: if k == 0 {
+                    first_source
+                } else {
+                    Some(PrefixSource::Decoded)
+                },
+            });
+        }
+        Ok(result
+            .into_iter()
+            .map(|r| r.expect("every group decoded"))
+            .collect())
+    }
+
+    fn limits(&self) -> Limits {
+        Limits {
+            tokens: self.ctx.n_ctx() as usize,
+            sequences: self.n_seq_max,
+            rows: usize::MAX,
+        }
     }
 
     fn prefix_source(&self) -> Option<PrefixSource> {

@@ -246,6 +246,18 @@ milliseconds. The `X-Grande-State` response header says which path a
 request took: `resident`, `ram`, `disk` or `decoded`. `grande bench`
 reports the restore (`restored_ms`, `restored_from`) next to cold and warm.
 
+`serve` takes a GGUF (llama.cpp) or a wgpu checkpoint directory. Requests
+that arrive while the engine is busy are queued and then handed to it
+together (`--max-batch`, default 32): each keeps its own response and its
+own error, and `X-Grande-Batch` says how many shared the pass. On the wgpu
+engine a batch is literally one forward pass over every request's state and
+branches, isolated from each other exactly as branches are; on llama.cpp
+the requests run one after the other unless `--llama-batch` is given (one
+`llama_decode` with a run of sequence ids per request — measured slower on
+Metal, where every ubatch attends over the whole unified cache).
+`tools/http_bench.py` sweeps concurrency against any `/v1/systemone`
+server with a fresh state per request and checks the answers agree.
+
 ## Layout
 
 ```

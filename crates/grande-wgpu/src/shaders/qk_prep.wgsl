@@ -21,7 +21,7 @@ struct Params {
 @group(0) @binding(1) var<storage, read_write> qkv: array<f32>;
 @group(0) @binding(2) var<storage, read> qn: array<u32>;
 @group(0) @binding(3) var<storage, read> kn: array<u32>;
-@group(0) @binding(4) var<storage, read> tok_meta: array<i32>; // (pos, seq) per token
+@group(0) @binding(4) var<storage, read> tok_meta: array<i32>; // (pos, seq, key row lo, key row hi) per token
 @group(0) @binding(5) var<storage, read_write> kv: array<f32>;
 
 const HD: u32 = 256u;
@@ -71,7 +71,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) l: v
     let row = t * p.q_stride;
     // Workspace row t is cache row base + t (the prefix may be resident).
     let tc = p.base + t;
-    let pos = f32(tok_meta[2u * tc]);
+    let pos = f32(tok_meta[4u * tc]);
 
     // q heads, then the k heads (both normed with a weight and roped).
     let kv_row = tc * 2u * p.kv_heads * HD;

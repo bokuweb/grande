@@ -12,11 +12,30 @@ use std::sync::Mutex;
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytemuck::{Pod, Zeroable};
-use grande_core::{BranchOutput, BranchTokens, PrefixSource, Want};
+use grande_core::{BranchOutput, BranchTokens, GroupOutput, PrefixSource, Want};
 use half::f16;
 use wgpu::util::DeviceExt;
 
 use crate::model::{Config, Dtype, QTensor, Weights};
+
+/// Bits of a token's sequence id that number its branch; the bits above
+/// number its group in the pass (see `Engine::run`). Sequence 0 is the first
+/// group's prefix, as it always was for a single group.
+pub const SEQ_GROUP_SHIFT: u32 = 12;
+
+/// One request's prefix and branches for [`Engine::evaluate_groups`]; ids in
+/// this checkpoint's vocabulary.
+#[derive(Debug, Clone, Copy)]
+pub struct Group<'a> {
+    pub prefix: &'a [u32],
+    pub branches: &'a [BranchTokens],
+}
+
+impl Group<'_> {
+    pub fn tokens(&self) -> usize {
+        self.prefix.len() + self.branches.iter().map(|b| b.tokens.len()).sum::<usize>()
+    }
+}
 
 const PARAM_SLOT: u64 = 256;
 
@@ -533,6 +552,7 @@ impl StateCache {
 
 /// Stable 64-bit key for a (model, prefix) pair (FNV-1a), the on-disk
 /// state file name.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // files are native only
 fn state_key(model_id: &str, prefix: &[u32]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut eat = |b: u8| {
@@ -823,9 +843,10 @@ impl EngineBuilder {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // (position, sequence, first key row, own row + 1) per cache token.
         let meta = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("meta"),
-            size: (capacity * 8) as u64,
+            size: (capacity * 16) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1214,20 +1235,41 @@ impl Engine {
         branches: &[BranchTokens],
         want: Want,
     ) -> Result<Vec<BranchOutput>> {
+        let mut outs = self
+            .evaluate_groups(&[Group { prefix, branches }], want)
+            .await?;
+        Ok(outs.pop().expect("one output per group").branches)
+    }
+
+    /// Several prefix + branches groups in one pass: group g's branches see
+    /// g's prefix and themselves, nothing of any other group, so requests
+    /// over different states can share a pass. The group whose prefix is
+    /// resident (or in the state cache) runs first, on top of it; every
+    /// other prefix is decoded. Afterwards the first group's prefix is the
+    /// resident one and every decoded prefix is in the state cache.
+    pub async fn evaluate_groups(
+        &self,
+        groups: &[Group<'_>],
+        want: Want,
+    ) -> Result<Vec<GroupOutput>> {
+        if groups.is_empty() {
+            bail!("empty request");
+        }
+        let (first, source) = self.admit(groups).await;
         let rows = if self.config.per_layer_dim > 0 {
             let table = self
                 .per_layer_table
                 .as_ref()
                 .ok_or_else(|| anyhow!("this model needs per-layer embedding rows; none loaded"))?;
-            // evaluate_rows slices the prefix rows off when it turns out to
-            // be resident or cached; only skip the gather when it is known.
-            let mut ids: Vec<u32> = if self.is_resident(prefix) {
-                Vec::new()
-            } else {
-                prefix.to_vec()
-            };
-            for b in branches {
-                ids.extend(b.tokens.iter().map(|t| t.0 as u32));
+            let mut ids: Vec<u32> = Vec::new();
+            for gi in Self::order(groups.len(), first) {
+                let g = &groups[gi];
+                if !(gi == first && source.is_some()) {
+                    ids.extend_from_slice(g.prefix);
+                }
+                for b in g.branches {
+                    ids.extend(b.tokens.iter().map(|t| t.0 as u32));
+                }
             }
             #[cfg(not(target_arch = "wasm32"))]
             let t0 = std::time::Instant::now();
@@ -1244,27 +1286,66 @@ impl Engine {
         } else {
             None
         };
-        self.evaluate_rows(prefix, branches, want, rows.as_deref())
-            .await
+        self.run(groups, first, source, want, rows.as_deref()).await
     }
 
     /// `evaluate` with the per-layer embedding rows supplied by the caller:
-    /// f16 little-endian, `[prefix + branch tokens][layers x P]`.
-    pub async fn evaluate_rows<'s>(
-        &'s self,
+    /// f16 little-endian, `[prefix + branch tokens][layers x P]` (or the
+    /// branch tokens only when the prefix is known to be resident).
+    pub async fn evaluate_rows(
+        &self,
         prefix: &[u32],
         branches: &[BranchTokens],
         want: Want,
         per_layer_rows: Option<&[u8]>,
     ) -> Result<Vec<BranchOutput>> {
+        let groups = [Group { prefix, branches }];
+        let (first, source) = self.admit(&groups).await;
+        let mut outs = self
+            .run(&groups, first, source, want, per_layer_rows)
+            .await?;
+        Ok(outs.pop().expect("one output per group").branches)
+    }
+
+    /// Which group runs on top of the cache and where its prefix comes from:
+    /// the resident one, else the first found in the state cache (restored
+    /// here), else group 0 decoded.
+    async fn admit(&self, groups: &[Group<'_>]) -> (usize, Option<PrefixSource>) {
+        if let Some(i) = groups.iter().position(|g| self.is_resident(g.prefix)) {
+            return (i, Some(PrefixSource::Resident));
+        }
+        for (i, g) in groups.iter().enumerate() {
+            if let Some(src) = self.restore_from_cache(g.prefix).await {
+                return (i, Some(src));
+            }
+        }
+        (0, None)
+    }
+
+    /// Layout order of `n` groups: `first`, then the rest in order.
+    fn order(n: usize, first: usize) -> impl Iterator<Item = usize> {
+        std::iter::once(first).chain((0..n).filter(move |&i| i != first))
+    }
+
+    /// One pass over the groups laid out as `admit` decided. Positions and
+    /// sequence ids per token: group k of the layout uses sequence ids
+    /// `k << SEQ_GROUP_SHIFT` for its prefix (positions 0..P) and
+    /// `(k << SEQ_GROUP_SHIFT) | (b + 1)` for branch b (positions P..); the
+    /// attention kernel lets a query see keys of its own group only, and of
+    /// those the prefix and its own branch. With the first group's prefix
+    /// resident, K/V rows and tok_meta 0..P are kept and this pass's tokens
+    /// take cache rows P.., workspace rows 0...
+    async fn run<'s>(
+        &'s self,
+        groups: &[Group<'_>],
+        first: usize,
+        mut source: Option<PrefixSource>,
+        want: Want,
+        per_layer_rows: Option<&[u8]>,
+    ) -> Result<Vec<GroupOutput>> {
         let cfg = &self.config;
         let d = cfg.d;
-        // Pack: prefix at positions 0..P in sequence 0, each branch restarting
-        // at P in its own sequence. With the prefix resident from the last
-        // pass, only the branches run: K/V rows and tok_meta 0..P are kept and
-        // this pass's tokens take cache rows P.., workspace rows 0...
-        let p = prefix.len();
-        let total = p + branches.iter().map(|b| b.tokens.len()).sum::<usize>();
+        let total: usize = groups.iter().map(|g| g.tokens()).sum();
         if total > self.capacity {
             bail!(
                 "{total} tokens exceed the engine capacity {}",
@@ -1274,38 +1355,64 @@ impl Engine {
         if total == 0 {
             bail!("empty request");
         }
-        let mut source = if self.is_resident(prefix) {
-            Some(PrefixSource::Resident)
-        } else {
-            self.restore_from_cache(prefix).await
-        };
-        let base = if source.is_some() { p } else { 0 };
+        let p0 = groups[first].prefix.len();
+        let base = if source.is_some() { p0 } else { 0 };
         let mut ids: Vec<u32> = Vec::with_capacity(total - base);
-        let mut meta: Vec<i32> = Vec::with_capacity((total - base) * 2);
-        // (branch, slot, workspace row)
-        let mut wanted: Vec<(usize, usize, usize)> = Vec::new();
-        if base == 0 {
-            ids.extend_from_slice(prefix);
-            for i in 0..p {
-                meta.push(i as i32);
-                meta.push(0);
+        let mut meta: Vec<i32> = Vec::with_capacity((total - base) * 4);
+        // Per token: position, sequence id, and the cache rows its keys can
+        // lie in — from its group's first row to itself — so the attention
+        // kernel scans that range instead of the whole cache.
+        let push_meta = |meta: &mut Vec<i32>, pos: usize, seq: i32, row_lo: usize, row: usize| {
+            meta.push(pos as i32);
+            meta.push(seq);
+            meta.push(row_lo as i32);
+            meta.push(row as i32 + 1);
+        };
+        // (group, branch, slot, workspace row)
+        let mut wanted: Vec<(usize, usize, usize, usize)> = Vec::new();
+        // (group, cache row of its prefix) for the prefixes decoded here.
+        let mut decoded: Vec<(usize, usize)> = Vec::new();
+        for (k, gi) in Self::order(groups.len(), first).enumerate() {
+            let g = &groups[gi];
+            let p = g.prefix.len();
+            if g.branches.len() >= (1 << SEQ_GROUP_SHIFT) {
+                bail!(
+                    "{} branches in one group; the engine addresses at most {}",
+                    g.branches.len(),
+                    (1 << SEQ_GROUP_SHIFT) - 1
+                );
             }
-        }
-        for (bi, b) in branches.iter().enumerate() {
-            let start = ids.len();
-            for (j, t) in b.tokens.iter().enumerate() {
-                ids.push(t.0 as u32);
-                meta.push((p + j) as i32);
-                meta.push((bi + 1) as i32);
-            }
-            for (slot, &w) in b.want.iter().enumerate() {
-                if w >= b.tokens.len() {
-                    bail!(
-                        "branch {bi}: wanted position {w} past its {} tokens",
-                        b.tokens.len()
-                    );
+            let seq_hi = (k as i32) << SEQ_GROUP_SHIFT;
+            // Cache row of this group's first token.
+            let row_lo = if k == 0 { 0 } else { base + ids.len() };
+            if !(k == 0 && base > 0) {
+                decoded.push((gi, base + ids.len()));
+                for (i, &t) in g.prefix.iter().enumerate() {
+                    push_meta(&mut meta, i, seq_hi, row_lo, base + ids.len());
+                    ids.push(t);
                 }
-                wanted.push((bi, slot, start + w));
+            }
+            for (bi, b) in g.branches.iter().enumerate() {
+                let start = ids.len();
+                for (j, t) in b.tokens.iter().enumerate() {
+                    push_meta(
+                        &mut meta,
+                        p + j,
+                        seq_hi | (bi as i32 + 1),
+                        row_lo,
+                        base + ids.len(),
+                    );
+                    ids.push(t.0 as u32);
+                }
+                for (slot, &w) in b.want.iter().enumerate() {
+                    if w >= b.tokens.len() {
+                        bail!(
+                            "branch {bi}: wanted position {w} past its {} tokens",
+                            b.tokens.len()
+                        );
+                    }
+                    wanted.push((gi, bi, slot, start + w));
+                }
             }
         }
         if wanted.len() > self.max_rows {
@@ -1324,7 +1431,7 @@ impl Engine {
         self.queue
             .write_buffer(&self.ids, 0, bytemuck::cast_slice(&ids));
         self.queue
-            .write_buffer(&self.meta, (base * 8) as u64, bytemuck::cast_slice(&meta));
+            .write_buffer(&self.meta, (base * 16) as u64, bytemuck::cast_slice(&meta));
         if let Some(plg) = &self.plg {
             let rows =
                 per_layer_rows.ok_or_else(|| anyhow!("per-layer embedding rows required"))?;
@@ -1532,7 +1639,7 @@ impl Engine {
         }
         // Gather the wanted rows of the final hidden state.
         let row_bytes = (d * 4) as u64;
-        for (r, &(_, _, idx)) in wanted.iter().enumerate() {
+        for (r, &(_, _, _, idx)) in wanted.iter().enumerate() {
             enc.copy_buffer_to_buffer(
                 &self.h,
                 idx as u64 * row_bytes,
@@ -1641,26 +1748,36 @@ impl Engine {
             }
         }
 
-        let mut outputs: Vec<BranchOutput> = branches
+        let mut outputs: Vec<GroupOutput> = groups
             .iter()
-            .map(|b| BranchOutput {
-                rows: Vec::with_capacity(b.want.len()),
+            .map(|g| GroupOutput {
+                branches: g
+                    .branches
+                    .iter()
+                    .map(|b| BranchOutput {
+                        rows: Vec::with_capacity(b.want.len()),
+                    })
+                    .collect(),
+                prefix_source: Some(PrefixSource::Decoded),
             })
             .collect();
-        for (r, &(bi, slot, _)) in wanted.iter().enumerate() {
-            if outputs[bi].rows.len() != slot {
+        for (r, &(gi, bi, slot, _)) in wanted.iter().enumerate() {
+            let out = &mut outputs[gi].branches[bi];
+            if out.rows.len() != slot {
                 bail!("row order mismatch for branch {bi}");
             }
-            outputs[bi]
-                .rows
-                .push(data[r * width..(r + 1) * width].to_vec());
+            out.rows.push(data[r * width..(r + 1) * width].to_vec());
         }
-        // Whichever way this pass ran, cache rows 0..p now hold the prefix.
-        *self.resident.lock().unwrap() = Some(prefix.to_vec());
+        // Whichever way this pass ran, cache rows 0..p0 now hold the first
+        // group's prefix; every prefix decoded here goes to the state cache.
+        *self.resident.lock().unwrap() = Some(groups[first].prefix.to_vec());
+        for &(gi, row0) in &decoded {
+            self.remember(groups[gi].prefix, row0).await?;
+        }
         if source.is_none() {
             source = Some(PrefixSource::Decoded);
-            self.remember(prefix).await?;
         }
+        outputs[first].prefix_source = source;
         *self.last_source.lock().unwrap() = source;
         Ok(outputs)
     }
@@ -1683,6 +1800,7 @@ impl Engine {
         self.states.lock().unwrap().budget > 0 || self.state_dir.is_some()
     }
 
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     fn state_path(&self, prefix: &[u32]) -> Option<std::path::PathBuf> {
         let dir = self.state_dir.as_ref()?;
         Some(dir.join(format!("{:016x}.state", state_key(&self.model_id, prefix))))
@@ -1700,6 +1818,12 @@ impl Engine {
 
     /// Read the resident prefix's K/V rows back as f16.
     pub async fn save_state(&self, prefix: &[u32]) -> Result<SavedState> {
+        self.save_state_at(prefix, 0).await
+    }
+
+    /// `save_state` for a prefix whose rows start at cache row `row0` (a
+    /// group that was not first in its pass).
+    async fn save_state_at(&self, prefix: &[u32], row0: usize) -> Result<SavedState> {
         let cfg = &self.config;
         let p = prefix.len();
         let mut chunks: Vec<(usize, usize, usize, u64)> = Vec::new(); // (layer, row0, rows, byte offset)
@@ -1728,7 +1852,7 @@ impl Engine {
             let row_bytes = (2 * cfg.kv_heads * cfg.head_dim[l] * 4) as u64;
             enc.copy_buffer_to_buffer(
                 self.kv_bufs[l].as_ref().unwrap(),
-                r0 as u64 * row_bytes,
+                (row0 + r0) as u64 * row_bytes,
                 &staging,
                 off,
                 rows as u64 * row_bytes,
@@ -1800,10 +1924,9 @@ impl Engine {
             self.queue
                 .write_buffer(buf, (*r0 * row * 4) as u64, bytemuck::cast_slice(&f32s));
         }
-        let mut meta: Vec<i32> = Vec::with_capacity(p * 2);
+        let mut meta: Vec<i32> = Vec::with_capacity(p * 4);
         for i in 0..p {
-            meta.push(i as i32);
-            meta.push(0);
+            meta.extend_from_slice(&[i as i32, 0, 0, i as i32 + 1]);
         }
         self.queue
             .write_buffer(&self.meta, 0, bytemuck::cast_slice(&meta));
@@ -1839,15 +1962,15 @@ impl Engine {
         None
     }
 
-    /// Serialize the resident prefix into the RAM cache and, if configured,
-    /// its file.
-    async fn remember(&self, prefix: &[u32]) -> Result<()> {
+    /// Serialize a prefix whose K/V rows start at cache row `row0` into the
+    /// RAM cache and, if configured, its file.
+    async fn remember(&self, prefix: &[u32], row0: usize) -> Result<()> {
         if prefix.is_empty() || !self.state_cache_on() {
             return Ok(());
         }
         #[cfg(not(target_arch = "wasm32"))]
         let t0 = std::time::Instant::now();
-        let state = self.save_state(prefix).await?;
+        let state = self.save_state_at(prefix, row0).await?;
         #[cfg(not(target_arch = "wasm32"))]
         if self.profile.is_some() {
             eprintln!(
