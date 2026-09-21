@@ -24,6 +24,9 @@ import torch
 from transformers import AutoModel, AutoTokenizer
 
 JNLI_LABELS = ["entailment", "contradiction", "neutral"]
+# Put in front of every text: e5's "query: " for a symmetric task; Ruri v3
+# wants "" (general) or "トピック: " (classification). Scripts set it from --prefix.
+PREFIX = "query: "
 
 
 def rows(path):
@@ -32,16 +35,16 @@ def rows(path):
 
 def jnli_texts(r):
     s1, s2 = r["sentence1"], r["sentence2"]
-    return {"a": f"query: {s1}", "b": f"query: {s2}", "pair": f"query: 前提: {s1} 仮説: {s2}"}
+    return {"a": f"{PREFIX}{s1}", "b": f"{PREFIX}{s2}", "pair": f"{PREFIX}前提: {s1} 仮説: {s2}"}
 
 
 def jcqa_texts(r):
     q = r["question"]
-    out = {"q": f"query: {q}"}
+    out = {"q": f"{PREFIX}{q}"}
     for i in range(5):
         c = r[f"choice{i}"]
-        out[f"c{i}"] = f"query: {c}"
-        out[f"qc{i}"] = f"query: 質問: {q} 答え: {c}"
+        out[f"c{i}"] = f"{PREFIX}{c}"
+        out[f"qc{i}"] = f"{PREFIX}質問: {q} 答え: {c}"
     return out
 
 
@@ -92,8 +95,10 @@ def latency(emb, recs, texts_fn, groups, n, sync):
 
 
 def main():
+    global PREFIX
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="intfloat/multilingual-e5-small")
+    ap.add_argument("--prefix", default=PREFIX, help='text prefix ("query: " for e5, "" or "トピック: " for Ruri v3)')
     ap.add_argument("--out", default="runs/e5")
     ap.add_argument("--data", default=".cache/jglue")
     ap.add_argument("--device", default="mps" if torch.backends.mps.is_available() else "cpu")
@@ -103,6 +108,7 @@ def main():
     ap.add_argument("--splits", nargs="+", default=["jnli-train", "jnli-valid", "jcqa-train", "jcqa-valid"])
     ap.add_argument("--latency", type=int, default=0, help="time this many valid records at batch 1")
     a = ap.parse_args()
+    PREFIX = a.prefix
 
     dtype = torch.float16 if a.dtype == "fp16" else torch.float32
     emb = Embedder(a.model, a.device, dtype, a.max_len)
@@ -123,7 +129,7 @@ def main():
         if a.latency and part == "valid":
             groups = {"pair": ["pair"], "separate": ["a", "b"]} if task == "jnli" else {"joint": [f"qc{i}" for i in range(5)], "separate": ["q"] + [f"c{i}" for i in range(5)]}
             lat = latency(emb, recs, fn, groups, a.latency, sync)
-            json.dump({"model": a.model, "device": a.device, "dtype": a.dtype, "n": a.latency, "latency": lat}, open(out / f"{split}-latency.json", "w"), indent=1)
+            json.dump({"model": a.model, "prefix": a.prefix, "device": a.device, "dtype": a.dtype, "n": a.latency, "latency": lat}, open(out / f"{split}-latency.json", "w"), indent=1)
 
 
 if __name__ == "__main__":

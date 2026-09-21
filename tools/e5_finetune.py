@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).parent))
+import e5_features  # noqa: E402
 from e5_features import jcqa_texts, jnli_texts, rows, JNLI_LABELS  # noqa: E402
 from e5_head import report  # noqa: E402
 
@@ -77,6 +78,7 @@ def predict(model, tok, recs, task, device, max_len, bs=64):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="intfloat/multilingual-e5-small")
+    ap.add_argument("--prefix", default="query: ", help='text prefix ("query: " for e5, "" for Ruri v3)')
     ap.add_argument("--task", choices=["jnli", "jcqa"], required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--data", default=".cache/jglue")
@@ -89,6 +91,7 @@ def main():
     ap.add_argument("--limit", type=int, help="train on the first N records only")
     a = ap.parse_args()
     np.random.seed(0)
+    e5_features.PREFIX = a.prefix
 
     files = {"jnli": "jnli", "jcqa": "jcommonsenseqa"}
     train = rows(f"{a.data}/{files[a.task]}-train.jsonl")
