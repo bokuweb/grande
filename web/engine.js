@@ -51,11 +51,19 @@ const GEMMA4 = { layout: "label", turn_start: "<|turn>", turn_end: "<turn|>", us
 // one sequence each, the head scores each pair on the GPU, ~15 ms a
 // request. Q8, vocabulary pruned to 76k pieces (tools/export_e5.py), 58 MB.
 // Above Laya on JNLI and JCQA, far below E2B where knowledge is needed.
+//
+// `ruri-v3-130m-wgpu` / `ruri-v3-310m-wgpu` are Ruri v3 (Nagoya University,
+// ModernBERT-Ja sentence embedders, docs/ruri.md) with the same kind of
+// head, on the Laya encoder kernels: Japanese pre-training is what e5 was
+// missing — 130m JNLI 0.785 / JCQA 0.837, 310m 0.807 / 0.852 (zero-shot
+// E2B: 0.614 / 0.853) at a fraction of E2B's time and download.
 export const MODELS = {
   "gemma-4-e2b-wgpu-ja": { id: "gemma-4-e2b-wgpu-ja", local: true, hub: "bokuweb/gemma-4-E2B-it-grande-wgpu-ja", kind: "wgpu", readout: "label", manifest: true, dtype: "q4", layout: GEMMA4, size: "1.2 GB", note: "E2B, wgpu engine: one pass, 25k-token vocabulary" },
   "gemma-4-e4b-wgpu-ja": { id: "gemma-4-e4b-wgpu-ja", local: true, hub: "bokuweb/gemma-4-E4B-it-grande-wgpu-ja", kind: "wgpu", readout: "label", manifest: true, dtype: "q4", layout: GEMMA4, size: "2.5 GB", note: "E4B, wgpu engine: one pass, 25k-token vocabulary" },
   "laya-multilingual-wgpu": { id: "laya-multilingual-wgpu", local: true, hub: "bokuweb/laya-multilingual-grande-wgpu", kind: "laya", manifest: true, dtype: "q8", size: "180 MB", note: "Laya: mmBERT encoder + decision head, ~20 ms a question, 56k-token vocabulary" },
   "multilingual-e5-small-wgpu": { id: "multilingual-e5-small-wgpu", local: true, hub: "bokuweb/multilingual-e5-small-grande-wgpu", kind: "e5", manifest: true, dtype: "q8", size: "58 MB", note: "e5-small embeddings + trained (state, option) head, ~15 ms a request, 76k-token vocabulary" },
+  "ruri-v3-130m-wgpu": { id: "ruri-v3-130m-wgpu", local: true, hub: "bokuweb/ruri-v3-130m-grande-wgpu", kind: "e5", manifest: true, dtype: "q8", size: "146 MB", note: "Ruri v3 130m (ModernBERT-Ja) embeddings + trained head: JNLI 0.785 / JCQA 0.837" },
+  "ruri-v3-310m-wgpu": { id: "ruri-v3-310m-wgpu", local: true, hub: "bokuweb/ruri-v3-310m-grande-wgpu", kind: "e5", manifest: true, dtype: "q8", size: "314 MB", note: "Ruri v3 310m (ModernBERT-Ja) embeddings + trained head: JNLI 0.807 / JCQA 0.852, E2B-class answers" },
 };
 
 const ZWNJ = "‌";

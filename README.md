@@ -102,6 +102,15 @@ on an M4.
       `grande serve --model <e5 export>` picks it by `config.json`;
       `tools/export_e5.py` packs it; `multilingual-e5-small-wgpu` in the
       demo's model list.
+- [x] Ruri v3 on the wgpu engine ([docs/ruri.md](docs/ruri.md)): the
+      Japanese ModernBERT sentence embedders (Nagoya University) with the
+      same (state, option) head, `e5.rs` gaining a ModernBERT path on the
+      Laya encoder kernels. Japanese pre-training is what e5 was missing:
+      frozen ruri-v3-310m + head passes zero-shot E2B on JCQA (0.907 vs
+      0.853) and ties E2B + pointer head on JNLI (0.842 vs 0.848); the 37M
+      ruri-v3-30m fine-tuned on JNLI is 0.875. `ruri-v3-130m-wgpu` (146 MB,
+      19 ms a request) and `ruri-v3-310m-wgpu` (314 MB, 41 ms; generic
+      head JNLI 0.81 / JCQA 0.85) in the demo's model list.
 
 ## First numbers (2026-09-19, M-series Mac, Metal)
 
@@ -214,6 +223,13 @@ See [docs/comparison.md](docs/comparison.md). Short version, same M4:
   engine natively and in the browser (`e5.rs`, `tools/export_e5.py`, 58 MB)
   and behind the PyTorch shim `tools/e5_serve.py`: [docs/e5.md](docs/e5.md).
 
+- [Ruri v3](https://huggingface.co/cl-nagoya/ruri-v3-310m) (Japanese
+  ModernBERT sentence embedders, 37M–315M) through the same pipeline: the
+  frozen 310m + a 1M head gives JNLI 0.842 / JCQA **0.907** (zero-shot E2B
+  0.614 / 0.853, E2B + pointer head 0.848 / –), the 30m fine-tuned on JNLI
+  0.875, and on the wgpu engine the 310m answers a 5-question request in
+  41 ms (E2B ~700 ms): [docs/ruri.md](docs/ruri.md).
+
 - Japanese (JGLUE): grande E2B zero-shot JNLI 0.614 / JCQA 0.853; kev-0.5b
   0.450 / 0.577; a 270M grande head trained on 12k records **0.710 / 0.710**
   at 73–77 ms per record, and a 12-layer vocab-pruned 256 MB version
@@ -258,9 +274,10 @@ difference.
 # tools/export_laya.py directory. Same API; ~20 ms a question on an M4.
 ./target/release/grande serve --model ~/.cache/huggingface/hub/models--aac6fef--laya-multilingual-mlx/snapshots/<rev>
 
-# multilingual-e5-small + the trained (state, option) head on the wgpu
-# engine: a tools/export_e5.py directory. Same API; ~10 ms a request on an M4.
+# multilingual-e5-small or Ruri v3 + the trained (state, option) head on the
+# wgpu engine: a tools/export_e5.py directory. Same API; 10-40 ms a request on an M4.
 ./target/release/grande serve --model web/models/multilingual-e5-small-wgpu
+./target/release/grande serve --model web/models/ruri-v3-310m-wgpu
 ```
 
 `--baseline` (probe, serve, jglue) turns on contextual calibration: every
@@ -320,7 +337,7 @@ crates/grande-core    types, renderer, readout, math, calibration, Backend trait
 crates/grande-llama   llama-cpp-2 backend
 crates/grande-wgpu    wgpu backend: Gemma 3 / Gemma 4 in WGSL, native and WebGPU;
                       laya.rs: ModernBERT / mmBERT + Laya's decision head on the same kernels;
-                      e5.rs: multilingual-e5 (BERT) + the (state, option) head
+                      e5.rs: multilingual-e5 (BERT) / Ruri v3 (ModernBERT) + the (state, option) head
 crates/grande-web     wasm surface for the browser demo (+ the wgpu engine)
 crates/grande-cli     `grande` binary
 examples/             request files
