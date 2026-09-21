@@ -194,6 +194,14 @@ See [docs/comparison.md](docs/comparison.md). Short version, same M4:
   now runs on grande's own wgpu engine, natively and in the browser, as a
   fast tier next to E2B / E4B: [docs/laya.md](docs/laya.md).
 
+- [multilingual-e5-small](https://huggingface.co/intfloat/multilingual-e5-small)
+  (118M embedding model, 21.6M without the embedding table) measured as a
+  backbone: frozen vectors + a 0.8M head trained in seconds beat Laya on
+  both tasks (JNLI 0.758, JCQA 0.665 at 15–20 ms); the whole encoder
+  fine-tuned reaches JNLI 0.831 (E2B + head: 0.848 at 421 ms) but JCQA
+  stays at 0.671 — the knowledge is not in the model. Served behind
+  `/v1/systemone` by `tools/e5_serve.py`: [docs/e5.md](docs/e5.md).
+
 - Japanese (JGLUE): grande E2B zero-shot JNLI 0.614 / JCQA 0.853; kev-0.5b
   0.450 / 0.577; a 270M grande head trained on 12k records **0.710 / 0.710**
   at 73–77 ms per record, and a 12-layer vocab-pruned 256 MB version
