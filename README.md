@@ -229,6 +229,28 @@ cargo build --release            # Metal on macOS; --features cuda / vulkan else
 packed and per-question passes and reports the largest probability
 difference.
 
+Any instruction-tuned GGUF llama.cpp can load is a `--model`; the chat
+layout is picked from the vocabulary (`<|turn>` → Gemma 4, `<|im_start|>`
+→ ChatML / Qwen, `<｜User｜>` → DeepSeek R1, `<start_of_turn>` → Gemma 3).
+Reasoning models get the empty thinking block their template writes when
+thinking is off (`<think>\n\n</think>\n\n`) so the first model token is
+the answer. Qwen 3.5 is a hybrid (Gated DeltaNet + attention) model; its
+recurrent state is shared by `seq_cp` like the KV cells, so packing holds
+(`max |Δp|` 3e-4 on the ticket). Numbers against Gemma 4 E2B are in
+[Other backbones](#other-backbones-qwen-35-deepseek-r1-distill) below;
+the wgpu engine and the browser demo are Gemma-only.
+
+```bash
+# Qwen3.5 2B it, Q8_0 (~2.0 GB)
+curl -L -o models/Qwen3.5-2B-Q8_0.gguf \
+  https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q8_0.gguf
+# DeepSeek-R1-Distill-Qwen-1.5B, Q8_0 (~1.9 GB)
+curl -L -o models/DeepSeek-R1-Distill-Qwen-1.5B-Q8_0.gguf \
+  https://huggingface.co/bartowski/DeepSeek-R1-Distill-Qwen-1.5B-GGUF/resolve/main/DeepSeek-R1-Distill-Qwen-1.5B-Q8_0.gguf
+./target/release/grande probe --model models/Qwen3.5-2B-Q8_0.gguf \
+  --request examples/ticket-ja.json --mode check
+```
+
 ```bash
 ./target/release/grande serve --model models/gemma-4-E2B-it-Q4_0.gguf \
   --state-cache-mb 512 --state-cache-dir .cache/states
@@ -494,6 +516,43 @@ python tools/train_head.py --features runs/feat/e2b-jnli.safetensors runs/feat/e
 
 Extraction runs at ~0.7 s per record on the M4 (the second order reuses
 the resident state). Results: see below once the E2B run lands.
+
+## Other backbones: Qwen 3.5, DeepSeek R1 distill
+
+2026-09-21. A [bake-off on 46 shop orders](https://x.com/Tono_Ken3/status/2101634819994345900)
+had plain Qwen3.5-2B Q8_0 ahead of Gemma 4 E2B (80 % vs 74 % on the order
+type), so both, plus DeepSeek-R1-Distill-Qwen-1.5B, run here as a
+`--model` (chat layout by vocabulary, [Usage](#usage)). Same first 400
+JGLUE valid rows and the same prompts as the table above, zero-shot label
+readout, no temperature:
+
+| | JNLI acc | JNLI ECE | JCQA acc | JCQA ECE | letter mass | ms / record |
+|---|---|---|---|---|---|---|
+| Gemma 4 E2B Q4_0 (above) | 0.575 | 0.279 | 0.855 | 0.046 | 0.99 | 750 |
+| Gemma 4 E2B Q8_0 (above) | 0.585 | 0.414 | | | | 370 |
+| **Qwen3.5-2B Q8_0** | 0.553 | 0.417 | 0.753 | 0.060 | 0.99 | 577 / 398 |
+| Qwen3.5-2B Q8_0, `--orders 3` | 0.553 | 0.372 | 0.788 | 0.049 | | 926 / 847 |
+| Qwen3.5-2B Q8_0, `--baseline` | 0.555 | 0.321 | | | | 517 |
+| DeepSeek-R1-Distill-Qwen-1.5B Q8_0 | 0.145 | 0.581 | 0.203 | 0.642 | **0.002 / 0.07** | 355 / 269 |
+
+- **Qwen3.5-2B answers 中立 on every JNLI row** (0.553 is the share of
+  neutral rows), at 0.97 mean confidence; the temperature fit lands at
+  T=4.9. It is not the letter position: with neutral moved to slot A it
+  still picks it, `--orders 3` averages three orders to the same answer,
+  and contextual calibration (`--baseline`) flips one row. JCQA is 10
+  points under E2B and order averaging gets 3.5 back. The bake-off's
+  order-type question is a different task from NLI; on JGLUE the tweet's
+  ranking does not hold. Speed: Qwen3.5 is a Gated DeltaNet + attention
+  hybrid and llama.cpp runs its recurrent layers one sequence at a time,
+  so the packed pass is no faster than five separate ones on the ticket
+  (1.21 s vs 1.09 s cold; Gemma 4 E2B 0.84 vs 1.63 s).
+- **DeepSeek-R1-Distill-Qwen-1.5B is not a one-pass decider.** With the
+  thinking block closed the model still wants to write its explanation:
+  the top next tokens are `前提` / `Premise` / `The` and the letters hold
+  0.2 % of the mass on JNLI (7 % on JCQA), so the readout is reading noise
+  and the argmax is `A` on 95 % of rows. Prefilling `Answer: ` / `回答: `
+  does not change that. A distilled reasoner needs its tokens; it would
+  need generation, which is not what grande is.
 
 ## Notes
 

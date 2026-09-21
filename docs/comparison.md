@@ -19,6 +19,8 @@ on identical questions), and **latency** on one machine.
 | grande 270M + head, **12k records** (6,000 + 6,000, 1 ep) | 12k | **0.710** (n=200) | 0.160 → 0.086 | 0.710 (n=200) | 0.050 | 73–77 |
 | grande 270M **12 of 18 layers** + head, 6k records, vocab-pruned (**256 MB**) | 6k | 0.685 (n=200) | 0.063 | 0.630 (n=200) | 0.064 | **26–34** |
 | **kev-0.5b** (Qwen2.5-0.5B, English-trained), via its `/v1/systemone` | 6 English datasets | 0.450 (n=300) | 0.168 | 0.577 (n=300) | 0.059 | 136–234 |
+| grande **Qwen3.5-2B it Q8_0**, zero-shot label readout (2026-09-21) | – | 0.553 (first 400; every row 中立) | 0.417 → 0.152 (T=4.89) | 0.753 (first 400; `--orders 3` 0.788) | 0.060 | 577 / 398 |
+| grande DeepSeek-R1-Distill-Qwen-1.5B Q8_0, zero-shot (2026-09-21) | – | 0.145 (first 400; letters hold 0.2 % of the mass) | 0.581 | 0.203 (first 400) | 0.642 | 355 / 269 |
 | reflex | – | not run: Python engine needs CUDA; browser 0.8B below | | | | |
 | jev_local (LFM2.5-1.2B) / Jev | – | not run here | | | | |
 
@@ -31,6 +33,15 @@ zero-shot on JNLI (0.710 vs 0.614) at a tenth of the latency**, and a
 finding (data and a trained readout beat zero-shot size in-distribution)
 reproduced in Japanese. JCQA still favours the bigger backbone (0.853 vs
 0.71): commonsense is knowledge, NLI is a skill.
+
+Other backbones on the same rows (README "Other backbones"): Qwen3.5-2B
+Q8_0 is a majority-class predictor on JNLI (中立 on all 400 rows, not a
+position effect: `--orders 3` and `--baseline` leave it there) and 10
+points under E2B on JCQA; DeepSeek-R1-Distill-Qwen-1.5B puts 0.2 % of its
+next-token mass on the letters (it wants to write `前提` / `Premise`), so
+the label readout is noise and both tasks come out at chance. The
+one-pass label readout wants an instruct model that answers first;
+distilled reasoners do not.
 
 ## 2. Accuracy, kev's frozen English suite (identical questions)
 

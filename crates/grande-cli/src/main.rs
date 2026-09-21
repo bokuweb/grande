@@ -382,7 +382,7 @@ fn readout_for(backend: &dyn Backend, head: Option<&PathBuf>) -> Result<(Rendere
             // The head's metadata says which layout produced its training
             // rows; a head without it is a LoRA-era delimiter-layout head.
             let renderer = match layout.as_deref() {
-                Some("gemma_label_pointer") => label_renderer(backend).pointer(true),
+                Some(l) if l.ends_with("_label_pointer") => label_renderer(backend).pointer(true),
                 _ => Renderer::gemma_pointer(),
             };
             Ok((renderer, Readout::Pointer(h)))
@@ -391,10 +391,16 @@ fn readout_for(backend: &dyn Backend, head: Option<&PathBuf>) -> Result<(Rendere
     }
 }
 
-/// Gemma 4 uses <|turn>; Gemma 3 checkpoints use <start_of_turn>.
+/// The chat layout is picked from the vocabulary: Gemma 4 has `<|turn>`,
+/// Qwen `<|im_start|>` (ChatML), DeepSeek R1 `<｜User｜>`; Gemma 3
+/// checkpoints use `<start_of_turn>`.
 fn label_renderer(backend: &dyn Backend) -> Renderer {
     if backend.special("<|turn>").is_ok() {
         Renderer::gemma_label()
+    } else if backend.special("<|im_start|>").is_ok() {
+        Renderer::qwen_label()
+    } else if backend.special("<｜User｜>").is_ok() {
+        Renderer::deepseek_label()
     } else {
         Renderer::gemma3_label()
     }
@@ -1103,7 +1109,7 @@ fn main() -> Result<()> {
                 },
             )?;
             let renderer = match layout {
-                LayoutArg::Label => Renderer::gemma_label(),
+                LayoutArg::Label => label_renderer(&backend),
                 LayoutArg::Pointer => Renderer::gemma_pointer(),
             };
             let engine = Engine::new(backend, renderer.clone(), Readout::Label, "render");
