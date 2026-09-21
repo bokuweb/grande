@@ -91,6 +91,11 @@ on an M4.
       vocabulary = 180 MB). `grande serve --model <laya dir>` picks it by
       the checkpoint's files; `tools/export_laya.py` packs it for the
       browser; `laya-multilingual-wgpu` in the demo's model list.
+- [x] other chat models as `--model`: the layout is picked from the
+      vocabulary (Gemma 4 / 3, Qwen 3.5 ChatML with the empty thinking
+      block, DeepSeek R1). Qwen3.5-2B Q8_0 and DeepSeek-R1-Distill-Qwen-1.5B
+      measured against E2B on JGLUE below: neither wins (Qwen says 中立 to
+      every NLI pair; the distill puts 0.2 % of its mass on the letters).
 
 ## First numbers (2026-09-19, M-series Mac, Metal)
 
@@ -524,7 +529,8 @@ had plain Qwen3.5-2B Q8_0 ahead of Gemma 4 E2B (80 % vs 74 % on the order
 type), so both, plus DeepSeek-R1-Distill-Qwen-1.5B, run here as a
 `--model` (chat layout by vocabulary, [Usage](#usage)). Same first 400
 JGLUE valid rows and the same prompts as the table above, zero-shot label
-readout, no temperature:
+readout, no temperature (the Qwen JNLI timing had another GPU job
+alongside):
 
 | | JNLI acc | JNLI ECE | JCQA acc | JCQA ECE | letter mass | ms / record |
 |---|---|---|---|---|---|---|
@@ -534,6 +540,7 @@ readout, no temperature:
 | Qwen3.5-2B Q8_0, `--orders 3` | 0.553 | 0.372 | 0.788 | 0.049 | | 926 / 847 |
 | Qwen3.5-2B Q8_0, `--baseline` | 0.555 | 0.321 | | | | 517 |
 | DeepSeek-R1-Distill-Qwen-1.5B Q8_0 | 0.145 | 0.581 | 0.203 | 0.642 | **0.002 / 0.07** | 355 / 269 |
+| DeepSeek-R1-Distill-Qwen-1.5B Q8_0, `--orders 3` | 0.300 | 0.076 | 0.265 | 0.140 | | 897 / 683 |
 
 - **Qwen3.5-2B answers 中立 on every JNLI row** (0.553 is the share of
   neutral rows), at 0.97 mean confidence; the temperature fit lands at
@@ -545,14 +552,18 @@ readout, no temperature:
   ranking does not hold. Speed: Qwen3.5 is a Gated DeltaNet + attention
   hybrid and llama.cpp runs its recurrent layers one sequence at a time,
   so the packed pass is no faster than five separate ones on the ticket
-  (1.21 s vs 1.09 s cold; Gemma 4 E2B 0.84 vs 1.63 s).
+  (1.21 s vs 1.09 s cold; Gemma 4 E2B 0.84 vs 1.63 s), and `grande bench`
+  (12 questions over a 500-token state, idle M4) gives 3.5 s cold / 2.2 s
+  with the state resident against E2B Q4_0's 1.94 / 1.01 s (DeepSeek 1.5B:
+  2.5 / 1.5 s). Q8_0 also weighs 2.0 GB against the pruned E2B's 1.25 GB.
 - **DeepSeek-R1-Distill-Qwen-1.5B is not a one-pass decider.** With the
   thinking block closed the model still wants to write its explanation:
   the top next tokens are `前提` / `Premise` / `The` and the letters hold
   0.2 % of the mass on JNLI (7 % on JCQA), so the readout is reading noise
-  and the argmax is `A` on 95 % of rows. Prefilling `Answer: ` / `回答: `
-  does not change that. A distilled reasoner needs its tokens; it would
-  need generation, which is not what grande is.
+  and the argmax is `A` on 95 % of rows (`--orders 3` averages the
+  position out and lands at chance, 0.30 / 0.27). Prefilling `Answer: ` /
+  `回答: ` does not change that. A distilled reasoner needs its tokens; it
+  would need generation, which is not what grande is.
 
 ## Notes
 
