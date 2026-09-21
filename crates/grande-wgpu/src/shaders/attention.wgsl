@@ -18,7 +18,11 @@
 // of one KV head, wg.y: (ROWS / hpg) tokens x the hpg query heads of that
 // group, with their Q held as f16 in workgroup memory, and streams that
 // head's keys KB at a time. A tile no row can see is skipped (keys after the block,
-// other branches). Otherwise the K tile is staged as f16, each invocation
+// other branches): the workgroup's tokens are consecutive rows, so they fall
+// into a few runs of one sequence each with contiguous positions, and a key
+// is visible to some token of a run iff it passes the sequence test against
+// the run and its position lies in [run min, run max] shifted by the window
+// — KB x runs tests per tile instead of KB x ROWS. Otherwise the K tile is staged as f16, each invocation
 // computes one full (row, key) score, then the same tile buffer is refilled
 // with V and each invocation owns HD/KB output dims of one row for the
 // online softmax and P.V. Staging K and V as f16 (one union buffer) and
@@ -57,6 +61,11 @@ var<workgroup> qlo: array<i32, ROWS>;
 var<workgroup> qhi: array<i32, ROWS>;
 var<workgroup> krange: vec2<u32>;
 var<workgroup> tile_any: bool;
+// Runs of consecutive tokens with one sequence id: id, min and max position.
+var<workgroup> run_seq: array<i32, ROWS>;
+var<workgroup> run_lo: array<i32, ROWS>;
+var<workgroup> run_hi: array<i32, ROWS>;
+var<workgroup> nruns: u32;
 
 // Sequence ids: bits 0..12 number the branch within a request (0 = its
 // prefix), the bits above number the request within the pass. Same request,
@@ -129,10 +138,21 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     if (li == 0u) {
         var lo = 0x7fffffff;
         var hi = 0;
+        var n = 0u;
         for (var qi = 0u; qi < tb; qi++) {
             lo = min(lo, qlo[qi]);
             hi = max(hi, qhi[qi]);
+            if (qi == 0u || qseq[qi] != qseq[qi - 1u]) {
+                run_seq[n] = qseq[qi];
+                run_lo[n] = qpos[qi];
+                run_hi[n] = qpos[qi];
+                n++;
+            } else {
+                run_lo[n - 1u] = min(run_lo[n - 1u], qpos[qi]);
+                run_hi[n - 1u] = max(run_hi[n - 1u], qpos[qi]);
+            }
         }
+        nruns = n;
         krange = vec2<u32>(u32(max(lo, 0)), u32(max(hi, 0)));
     }
     let kr = workgroupUniformLoad(&krange);
@@ -161,9 +181,15 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         // the branch is provably uniform (Tint insists).
         if (li == 0u) {
             var any = false;
-            for (var k = 0u; k < KB; k++) {
-                for (var qi = 0u; qi < tb; qi++) {
-                    any = any || visible(qpos[qi], qseq[qi], kpos[k], kseq[k]);
+            for (var k = 0u; k < KB && !any; k++) {
+                let ks = kseq[k];
+                let kp = kpos[k];
+                for (var r = 0u; r < nruns && !any; r++) {
+                    let qs_ = run_seq[r];
+                    // visible() for some position in [run_lo, run_hi]:
+                    // kp <= qp and qp - kp < window for the run's extremes.
+                    any = ((ks ^ qs_) >> 12u) == 0 && ((ks & 0xfff) == 0 || ks == qs_)
+                        && kp <= run_hi[r] && (p.window == 0u || kp + i32(p.window) > run_lo[r]);
                 }
             }
             tile_any = any;
