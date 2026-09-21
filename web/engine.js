@@ -17,7 +17,14 @@
 import init, * as grande from "./pkg/grande.js";
 import { idbCache } from "./cache.js";
 
-const GEMMA4 = { layout: "label", turn_start: "<|turn>", turn_end: "<turn|>", user: "user", model: "model" };
+// Gemma 4 chat layout: `<bos><|turn>user\n…<turn|>\n<|turn>model\n`
+// (grande-core `Renderer::gemma_label()`).
+const GEMMA4 = {
+  layout: "label",
+  family: "gemma",
+  user_open: [{ kind: "bos" }, { kind: "special", value: "<|turn>" }, { kind: "text", value: "user\n" }],
+  model_open: [{ kind: "special", value: "<turn|>" }, { kind: "text", value: "\n" }, { kind: "special", value: "<|turn>" }, { kind: "text", value: "model\n" }],
+};
 
 // The page offers Gemma 4 E2B and E4B on grande's own wgpu engine
 // (crates/grande-wgpu), Q4_0 codes from the vocabulary-pruned GGUFs

@@ -91,10 +91,18 @@ pub enum Renderer {
     /// lettered options go in a user turn, the model turn is opened, and the
     /// readout looks at the next-token logits over the letters.
     Label {
-        turn_start: String,
-        turn_end: String,
-        user: String,
-        model: String,
+        /// Model family the chat template belongs to (`gemma`, `qwen`,
+        /// `deepseek`); names the layout in run metadata.
+        #[serde(default = "default_family")]
+        family: String,
+        /// Everything before the state: BOS if the tokenizer prepends one,
+        /// the user-turn opener and role line.
+        user_open: Vec<Segment>,
+        /// Everything after the question: closes the user turn, opens the
+        /// model turn, and prefills what the template writes before the
+        /// first answer token (an empty thinking block on Qwen 3.5 and
+        /// DeepSeek R1). The readout position is the last token.
+        model_open: Vec<Segment>,
         /// Drop the "Question:" / "Answer with one letter." scaffolding: the
         /// branch is the instruction, the lettered options and the model
         /// turn. Fewer tokens per question; the model turn already asks for
@@ -113,28 +121,100 @@ pub enum Renderer {
     Pointer(Delimiters),
 }
 
+fn default_family() -> String {
+    "gemma".into()
+}
+
 impl Renderer {
-    /// Gemma 4 chat layout: `<bos><|turn>user\n…<turn|>\n<|turn>model\n`.
-    /// Thinking stays off (no `<|think|>` in a system turn), so the first
-    /// model token is the answer.
-    pub fn gemma_label() -> Self {
+    /// A `<turn_start>role\n … <turn_end>\n` chat layout (Gemma, ChatML).
+    fn turns(
+        family: &str,
+        bos: bool,
+        turn_start: &str,
+        turn_end: &str,
+        user: &str,
+        model: &str,
+    ) -> Self {
+        let mut user_open = Vec::new();
+        if bos {
+            user_open.push(Segment::Bos);
+        }
+        user_open.push(Segment::Special(turn_start.into()));
+        user_open.push(Segment::Text(format!("{user}\n")));
         Renderer::Label {
-            turn_start: "<|turn>".into(),
-            turn_end: "<turn|>".into(),
-            user: "user".into(),
-            model: "model".into(),
+            family: family.into(),
+            user_open,
+            model_open: vec![
+                Segment::Special(turn_end.into()),
+                Segment::Text("\n".into()),
+                Segment::Special(turn_start.into()),
+                Segment::Text(format!("{model}\n")),
+            ],
             terse: false,
             pointer: false,
         }
     }
 
+    /// Gemma 4 chat layout: `<bos><|turn>user\n…<turn|>\n<|turn>model\n`.
+    /// Thinking stays off (no `<|think|>` in a system turn), so the first
+    /// model token is the answer.
+    pub fn gemma_label() -> Self {
+        Self::turns("gemma", true, "<|turn>", "<turn|>", "user", "model")
+    }
+
     /// Gemma 3 chat layout (`<start_of_turn>` / `<end_of_turn>`).
     pub fn gemma3_label() -> Self {
+        Self::turns(
+            "gemma",
+            true,
+            "<start_of_turn>",
+            "<end_of_turn>",
+            "user",
+            "model",
+        )
+    }
+
+    /// The empty thinking block a reasoning model's template writes when
+    /// thinking is off, so the first answer token is the letter.
+    fn no_think() -> [Segment; 4] {
+        [
+            Segment::Special("<think>".into()),
+            Segment::Text("\n\n".into()),
+            Segment::Special("</think>".into()),
+            Segment::Text("\n\n".into()),
+        ]
+    }
+
+    /// Qwen 3.5 chat layout (ChatML): `<|im_start|>user\n…<|im_end|>\n
+    /// <|im_start|>assistant\n<think>\n\n</think>\n\n`, what the chat
+    /// template writes with `enable_thinking` off. No BOS: Qwen's tokenizer
+    /// does not prepend one.
+    pub fn qwen_label() -> Self {
+        let mut r = Self::turns(
+            "qwen",
+            false,
+            "<|im_start|>",
+            "<|im_end|>",
+            "user",
+            "assistant",
+        );
+        if let Renderer::Label { model_open, .. } = &mut r {
+            model_open.extend(Self::no_think());
+        }
+        r
+    }
+
+    /// DeepSeek R1 (and its distills) chat layout:
+    /// `<｜begin▁of▁sentence｜><｜User｜>…<｜Assistant｜><think>\n\n</think>\n\n`.
+    /// The template opens `<think>\n` for the model; the closed empty block
+    /// skips the reasoning so the next token is the answer.
+    pub fn deepseek_label() -> Self {
         Renderer::Label {
-            turn_start: "<start_of_turn>".into(),
-            turn_end: "<end_of_turn>".into(),
-            user: "user".into(),
-            model: "model".into(),
+            family: "deepseek".into(),
+            user_open: vec![Segment::Bos, Segment::Special("<｜User｜>".into())],
+            model_open: std::iter::once(Segment::Special("<｜Assistant｜>".into()))
+                .chain(Self::no_think())
+                .collect(),
             terse: false,
             pointer: false,
         }
@@ -156,13 +236,22 @@ impl Renderer {
         self
     }
 
-    /// Short name for logs and summaries.
-    pub fn layout_name(&self) -> &'static str {
+    /// Short name for logs and summaries (`gemma_label`, `qwen_label_terse`,
+    /// `gemma_label_pointer`, `gemma_pointer`).
+    pub fn layout_name(&self) -> String {
         match self {
-            Renderer::Label { pointer: true, .. } => "gemma_label_pointer",
-            Renderer::Label { terse: true, .. } => "gemma_label_terse",
-            Renderer::Label { .. } => "gemma_label",
-            Renderer::Pointer(_) => "gemma_pointer",
+            Renderer::Label {
+                family,
+                pointer: true,
+                ..
+            } => format!("{family}_label_pointer"),
+            Renderer::Label {
+                family,
+                terse: true,
+                ..
+            } => format!("{family}_label_terse"),
+            Renderer::Label { family, .. } => format!("{family}_label"),
+            Renderer::Pointer(_) => "gemma_pointer".into(),
         }
     }
 
@@ -180,13 +269,12 @@ impl Renderer {
     pub fn render_with(&self, req: &Request, orders: &IndexMap<String, Vec<usize>>) -> Rendered {
         let state = state_text(&req.state);
         let prefix = match self {
-            Renderer::Label {
-                turn_start, user, ..
-            } => vec![
-                Segment::Bos,
-                Segment::Special(turn_start.clone()),
-                Segment::Text(format!("{user}\nState:\n{state}\n\n")),
-            ],
+            Renderer::Label { user_open, .. } => coalesce(
+                user_open
+                    .iter()
+                    .cloned()
+                    .chain([Segment::Text(format!("State:\n{state}\n\n"))]),
+            ),
             Renderer::Pointer(d) => vec![
                 Segment::Bos,
                 Segment::Special(d.state.clone()),
@@ -215,9 +303,7 @@ impl Renderer {
         let mut marks = Vec::new();
         match self {
             Renderer::Label {
-                turn_start,
-                turn_end,
-                model,
+                model_open,
                 terse,
                 pointer,
                 ..
@@ -256,10 +342,7 @@ impl Renderer {
                     text.push_str("Answer with one letter.");
                 }
                 segments.push(Segment::Text(text));
-                segments.push(Segment::Special(turn_end.clone()));
-                segments.push(Segment::Text("\n".into()));
-                segments.push(Segment::Special(turn_start.clone()));
-                segments.push(Segment::Text(format!("{model}\n")));
+                segments.extend(model_open.iter().cloned());
                 marks.push((
                     segments.len() - 1,
                     if *pointer { Mark::Decide } else { Mark::Last },
@@ -291,6 +374,19 @@ impl Renderer {
             marks,
         }
     }
+}
+
+/// Merge adjacent text segments so the role line and the state tokenize as
+/// one string, exactly as before the opener became a segment list.
+fn coalesce(segments: impl IntoIterator<Item = Segment>) -> Vec<Segment> {
+    let mut out: Vec<Segment> = Vec::new();
+    for s in segments {
+        match (out.last_mut(), s) {
+            (Some(Segment::Text(a)), Segment::Text(b)) => a.push_str(&b),
+            (_, s) => out.push(s),
+        }
+    }
+    out
 }
 
 /// `(kind, instructions text, [(key, description)])` for a question.
@@ -406,6 +502,96 @@ mod tests {
             Renderer::gemma_label().pointer(true).layout_name(),
             "gemma_label_pointer"
         );
+    }
+
+    #[test]
+    fn gemma_prefix_is_one_text_after_the_opener() {
+        let r = Renderer::gemma_label().render(&req());
+        assert_eq!(r.prefix.len(), 3);
+        assert_eq!(r.prefix[0], Segment::Bos);
+        assert_eq!(r.prefix[1], Segment::Special("<|turn>".into()));
+        let Segment::Text(p) = &r.prefix[2] else {
+            panic!()
+        };
+        assert!(p.starts_with("user\nState:\nticket: "));
+        let dept = &r.branches[1];
+        let n = dept.segments.len();
+        assert_eq!(
+            &dept.segments[n - 4..],
+            &[
+                Segment::Special("<turn|>".into()),
+                Segment::Text("\n".into()),
+                Segment::Special("<|turn>".into()),
+                Segment::Text("model\n".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn qwen_layout_has_no_bos_and_prefills_an_empty_thinking_block() {
+        let r = Renderer::qwen_label().render(&req());
+        assert_eq!(r.prefix[0], Segment::Special("<|im_start|>".into()));
+        assert!(matches!(&r.prefix[1], Segment::Text(t) if t.starts_with("user\nState:\n")));
+        let dept = &r.branches[1];
+        let n = dept.segments.len();
+        assert_eq!(dept.marks, vec![(n - 1, Mark::Last)]);
+        assert_eq!(
+            &dept.segments[n - 8..],
+            &[
+                Segment::Special("<|im_end|>".into()),
+                Segment::Text("\n".into()),
+                Segment::Special("<|im_start|>".into()),
+                Segment::Text("assistant\n".into()),
+                Segment::Special("<think>".into()),
+                Segment::Text("\n\n".into()),
+                Segment::Special("</think>".into()),
+                Segment::Text("\n\n".into()),
+            ]
+        );
+        assert_eq!(Renderer::qwen_label().layout_name(), "qwen_label");
+        assert_eq!(
+            Renderer::qwen_label().terse(true).layout_name(),
+            "qwen_label_terse"
+        );
+    }
+
+    #[test]
+    fn deepseek_layout_has_bos_and_no_role_lines() {
+        let r = Renderer::deepseek_label().render(&req());
+        assert_eq!(r.prefix[0], Segment::Bos);
+        assert_eq!(r.prefix[1], Segment::Special("<｜User｜>".into()));
+        assert!(matches!(&r.prefix[2], Segment::Text(t) if t.starts_with("State:\n")));
+        let dept = &r.branches[1];
+        let n = dept.segments.len();
+        assert_eq!(dept.marks, vec![(n - 1, Mark::Last)]);
+        assert_eq!(
+            dept.segments[n - 5],
+            Segment::Special("<｜Assistant｜>".into())
+        );
+        assert_eq!(dept.segments[n - 4], Segment::Special("<think>".into()));
+        assert_eq!(Renderer::deepseek_label().layout_name(), "deepseek_label");
+        assert_eq!(
+            Renderer::deepseek_label().pointer(true).layout_name(),
+            "deepseek_label_pointer"
+        );
+    }
+
+    #[test]
+    fn label_layout_json_defaults_to_the_gemma_family() {
+        // The browser passes the layout as JSON; `family` may be omitted.
+        let j: Renderer = serde_json::from_value(json!({
+            "layout": "label",
+            "user_open": [{"kind": "bos"}, {"kind": "special", "value": "<|turn>"},
+                          {"kind": "text", "value": "user\n"}],
+            "model_open": [{"kind": "special", "value": "<turn|>"}, {"kind": "text", "value": "\n"},
+                           {"kind": "special", "value": "<|turn>"}, {"kind": "text", "value": "model\n"}]
+        }))
+        .unwrap();
+        assert_eq!(j.layout_name(), "gemma_label");
+        let a = Renderer::gemma_label().render(&req());
+        let b = j.render(&req());
+        assert_eq!(a.prefix, b.prefix);
+        assert_eq!(a.branches[1].segments, b.branches[1].segments);
     }
 
     #[test]

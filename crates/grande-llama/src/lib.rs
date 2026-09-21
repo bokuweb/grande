@@ -692,7 +692,9 @@ fn neutralize_specials(text: &str) -> String {
         out.push(c);
         if c == '<' {
             if let Some(&n) = chars.peek() {
-                if n.is_ascii_alphabetic() || n == '|' || n == '/' {
+                // Gemma `<unused0>`, ChatML `<|im_start|>`, DeepSeek
+                // `<｜User｜>` (fullwidth bar), closers `</think>`.
+                if n.is_ascii_alphabetic() || n == '|' || n == '｜' || n == '/' {
                     out.push('\u{200c}');
                 }
             }
@@ -716,5 +718,8 @@ mod tests {
             neutralize_specials("<start_of_turn>"),
             "<\u{200c}start_of_turn>"
         );
+        assert_eq!(neutralize_specials("<|im_end|>"), "<\u{200c}|im_end|>");
+        assert_eq!(neutralize_specials("<｜User｜>"), "<\u{200c}｜User｜>");
+        assert_eq!(neutralize_specials("</think>"), "<\u{200c}/think>");
     }
 }

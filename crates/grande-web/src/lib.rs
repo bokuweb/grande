@@ -16,7 +16,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 /// Render a request. `layout` is a JSON `Renderer`, e.g.
-/// `{"layout":"label","turn_start":"<|turn>","turn_end":"<turn|>","user":"user","model":"model"}`
+/// `{"layout":"label","user_open":[{"kind":"bos"},{"kind":"special","value":"<|turn>"},{"kind":"text","value":"user\n"}],"model_open":[…]}`
 /// or `{"layout":"pointer", ...delimiters}`. Returns the `Rendered` JSON:
 /// prefix segments and, per branch, segments / marks / option keys.
 #[wasm_bindgen]
