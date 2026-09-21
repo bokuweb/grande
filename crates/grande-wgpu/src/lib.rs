@@ -24,6 +24,8 @@
 //! kernel after each request (timestamp queries), `GRANDE_WGPU_LAYERS=n` runs
 //! only the first n layers.
 
+#[cfg(feature = "e5")]
+pub mod e5;
 pub mod engine;
 #[cfg(feature = "laya")]
 pub mod laya;
@@ -36,5 +38,7 @@ pub use model::{Config, Dtype, QTensor, Weights};
 mod backend;
 #[cfg(feature = "native")]
 pub use backend::WgpuBackend;
+#[cfg(all(feature = "native", feature = "e5"))]
+pub use e5::E5Backend;
 #[cfg(all(feature = "native", feature = "laya"))]
 pub use laya::LayaBackend;

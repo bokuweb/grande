@@ -35,3 +35,13 @@ for f in config.json tokenizer.json tokenizer_config.json manifest.json embed.bi
     || { echo "no $LTAG release; skipping the Laya model"; rm -rf "$LDEST"; break; }
 done
 ls -la "$LDEST" 2>/dev/null || true
+
+# multilingual-e5-small + the (state, option) head (tools/export_e5.py), 58 MB.
+ETAG="${4:-e5-v1}"
+EDEST="models/multilingual-e5-small-wgpu"
+mkdir -p "$EDEST"
+for f in config.json tokenizer.json tokenizer_config.json special_tokens_map.json manifest.json embed.bin enc.bin head.bin; do
+  gh release download "$ETAG" --repo bokuweb/grande --pattern "$f" --output "$EDEST/$f" --clobber \
+    || { echo "no $ETAG release; skipping the e5 model"; rm -rf "$EDEST"; break; }
+done
+ls -la "$EDEST" 2>/dev/null || true

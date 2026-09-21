@@ -171,14 +171,20 @@ pub(crate) enum K {
     PlGate,
     /// ModernBERT / Laya (laya.rs): LayerNorm, the elementwise bias /
     /// activation / residual tail, in-place RoPE and bidirectional attention.
-    #[cfg_attr(not(feature = "laya"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "laya", feature = "e5")), allow(dead_code))]
     LayerNorm,
-    #[cfg_attr(not(feature = "laya"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "laya", feature = "e5")), allow(dead_code))]
     BiasAct,
-    #[cfg_attr(not(feature = "laya"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "laya", feature = "e5")), allow(dead_code))]
     RopeBi,
-    #[cfg_attr(not(feature = "laya"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "laya", feature = "e5")), allow(dead_code))]
     AttentionBi,
+    /// Mean pooling per packed sequence and the (state, option) feature
+    /// rows (e5.rs).
+    #[cfg_attr(not(feature = "e5"), allow(dead_code))]
+    Pool,
+    #[cfg_attr(not(feature = "e5"), allow(dead_code))]
+    PairFeats,
 }
 
 impl K {
@@ -197,6 +203,8 @@ impl K {
             K::BiasAct => "bias_act",
             K::RopeBi => "rope_bi",
             K::AttentionBi => "attention_bi",
+            K::Pool => "pool",
+            K::PairFeats => "pair_feats",
         }
     }
 
@@ -215,6 +223,8 @@ impl K {
             K::BiasAct => include_str!("shaders/bias_act.wgsl"),
             K::RopeBi => include_str!("shaders/rope_bi.wgsl"),
             K::AttentionBi => include_str!("shaders/attention_bi.wgsl"),
+            K::Pool => include_str!("shaders/pool.wgsl"),
+            K::PairFeats => include_str!("shaders/pair_feats.wgsl"),
         }
     }
 
@@ -236,6 +246,8 @@ impl K {
             K::BiasAct => vec![ro, ro, rw],
             K::RopeBi => vec![ro, rw],
             K::AttentionBi => vec![ro, ro, rw],
+            K::Pool => vec![ro, ro, rw],
+            K::PairFeats => vec![ro, ro, rw],
         }
     }
 
