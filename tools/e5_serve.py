@@ -27,6 +27,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
+import e5_features  # noqa: E402
 from e5_features import Embedder  # noqa: E402
 from e5_generic import render_state  # noqa: E402
 from e5_head import MLP, pair_feats  # noqa: E402
@@ -41,7 +42,7 @@ def option_text(key, desc):
 def state_text(state):
     if isinstance(state, dict):
         return render_state({k: v if isinstance(v, str) else json.dumps(v, ensure_ascii=False) for k, v in state.items()})
-    return "query: " + (state if isinstance(state, str) else json.dumps(state, ensure_ascii=False))
+    return e5_features.PREFIX + (state if isinstance(state, str) else json.dumps(state, ensure_ascii=False))
 
 
 class Head:
@@ -89,7 +90,7 @@ def answer(emb, head, tok, req, T):
         else:
             opts = [(k, option_text(k, d)) for k, d in q["criteria"].items()]
         spans[qid] = (len(texts), opts)
-        texts += [f"query: {t}" for _, t in opts]
+        texts += [f"{e5_features.PREFIX}{t}" for _, t in opts]
     vecs = embed_request(emb, texts[0], texts[1:])
     n_tok = sum(len(ids) for ids in tok(texts)["input_ids"])
     answers = {}
@@ -113,11 +114,13 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="intfloat/multilingual-e5-small")
     p.add_argument("--head", default="runs/e5/generic/head.pt")
+    p.add_argument("--prefix", default="query: ", help='text prefix ("query: " for e5, "" for Ruri v3)')
     p.add_argument("--temperature", type=float, default=1.4)
     p.add_argument("--device", default="mps" if torch.backends.mps.is_available() else "cpu")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8792)
     a = p.parse_args()
+    e5_features.PREFIX = a.prefix
 
     emb = Embedder(a.model, a.device, torch.float16 if a.device != "cpu" else torch.float32, 512)
     head = Head(a.head)

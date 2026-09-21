@@ -23,18 +23,20 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
+import e5_features  # noqa: E402
 from e5_features import Embedder, rows  # noqa: E402
 from e5_head import pair_feats, report, train  # noqa: E402
 from http_eval import JNLI_DESC  # noqa: E402
 
 
 def render_state(state):
-    return "query: " + " ".join(f"{k}: {v}" for k, v in state.items())
+    return e5_features.PREFIX + " ".join(f"{k}: {v}" for k, v in state.items())
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="intfloat/multilingual-e5-small")
+    ap.add_argument("--prefix", default="query: ", help="the prefix the features were embedded with")
     ap.add_argument("--feat", default="runs/e5")
     ap.add_argument("--data", default=".cache/jglue")
     ap.add_argument("--out", default="runs/e5/generic")
@@ -47,9 +49,10 @@ def main():
     a = ap.parse_args()
     feat, out = Path(a.feat), Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
+    e5_features.PREFIX = a.prefix
 
     emb = Embedder(a.model, a.device, torch.float16, 512)
-    desc = emb([f"query: {d}" for d in JNLI_DESC])  # [3, d]
+    desc = emb([f"{a.prefix}{d}" for d in JNLI_DESC])  # [3, d]
 
     def jnli(split):
         d = np.load(feat / f"jnli-{split}.npz")
@@ -83,6 +86,7 @@ def main():
     res["jcqa"] = report("generic", predict(xv), yv)
     torch.save(predict.state, out / "head.pt")
     json.dump({"args": vars(a), "selection": info, "results": res}, open(out / "summary.json", "w"), indent=1)
+    json.dump({"model": a.model, "prefix": a.prefix}, open(out / "model.json", "w"))
     print(f"wrote {out}")
 
 

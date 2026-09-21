@@ -1,16 +1,19 @@
-//! multilingual-e5 on wgpu: a BERT encoder (intfloat/multilingual-e5-small,
-//! MIT) read as a sentence embedder, plus the (state, option) head
-//! `tools/e5_generic.py` trains — the cheapest System One measured in
-//! docs/e5.md. The encoder maps a text to a unit vector; a request is the
-//! rendered state and every option's description, embedded in one pass, and
-//! the head scores each (state, option) pair from `[s, o, |s−o|, s∗o]`; a
-//! softmax over a question's options is its answer.
+//! Sentence embedders on wgpu — multilingual-e5-small (BERT, MIT) and
+//! Ruri v3 (ModernBERT-Ja, Apache-2.0) — plus the (state, option) head
+//! `tools/e5_generic.py` trains: the cheapest System One measured in
+//! docs/e5.md / docs/ruri.md. The encoder maps a text to a unit vector; a
+//! request is the rendered state and every option's description, embedded
+//! in one pass, and the head scores each (state, option) pair from
+//! `[s, o, |s−o|, s∗o]`; a softmax over a question's options is its answer.
 //!
-//! Every text is one sequence `<s> query: … </s>`; all of a request's texts
-//! are packed into one token stream and one command buffer, isolated by the
-//! bidirectional attention mask (same sequence only). Post-LayerNorm BERT:
-//! the residual stream alternates between two buffers so each LayerNorm
-//! writes the other one. Mean pooling (L2-normalised) writes each text's
+//! Every text is one sequence `<s> prefix + text </s>`; all of a request's
+//! texts are packed into one token stream and one command buffer, isolated
+//! by the bidirectional attention mask (same sequence, and the local window
+//! on ModernBERT's sliding layers). BERT is post-LayerNorm with absolute
+//! positions and biases: the residual stream alternates between two buffers
+//! so each LayerNorm writes the other one. ModernBERT is pre-LayerNorm with
+//! RoPE, GeGLU and no biases: the Laya encoder's kernels (`laya.rs`), the
+//! stream stays in one buffer. Mean pooling (L2-normalised) writes each text's
 //! unit vector into a slot; the head reads (state slot, option slot) pairs
 //! from there — its feature rows, two matmuls and the GELU are three more
 //! dispatches of the same pass, so a request is one submit and one
@@ -29,7 +32,7 @@ use wgpu::util::DeviceExt;
 
 use crate::engine::{
     attn_tile, attn_workgroup_bytes, div_ceil, open_device, report_profile, Dispatch, GpuTensor,
-    Kernels, Params, Profiler, Step, K, PARAM_SLOT,
+    Kernels, Params, Profiler, Step, GELU_ERF, K, PARAM_SLOT,
 };
 use crate::model::{Dtype, QTensor, TensorSpec};
 
@@ -51,8 +54,17 @@ impl<F: Fn(&str) -> Vec<u32>> Tokenize for F {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arch {
+    /// Post-LN, absolute positions, token-type row, biases everywhere (e5).
+    Bert,
+    /// Pre-LN, RoPE with local / global layers, GeGLU, no biases (Ruri v3).
+    ModernBert,
+}
+
 #[derive(Debug, Clone)]
 pub struct E5Config {
+    pub arch: Arch,
     pub vocab: usize,
     pub d: usize,
     pub layers: usize,
@@ -60,6 +72,14 @@ pub struct E5Config {
     pub ff: usize,
     pub max_pos: usize,
     pub eps: f32,
+    /// LayerNorms carry a bias (BERT yes, ModernBERT `norm_bias`).
+    pub norm_bias: bool,
+    /// ModernBERT: per layer, true = local (sliding) attention; the
+    /// inclusive local distance (`local_attention / 2`); RoPE thetas.
+    pub sliding: Vec<bool>,
+    pub window: usize,
+    pub theta_global: f32,
+    pub theta_local: f32,
     /// Longest sequence, special tokens included (the model's 512).
     pub max_len: usize,
     /// Head: input width (4 d), hidden width, and the calibration
@@ -79,17 +99,23 @@ impl E5Config {
     /// An exported directory's `config.json` (tools/export_e5.py): the HF
     /// BERT config carrying the head and token ids under `grande_e5`.
     pub fn from_json(config: &Value) -> Result<Self> {
-        if config["model_type"].as_str() != Some("bert") {
-            bail!("model_type {:?} is not bert", config["model_type"]);
-        }
-        if let Some(a) = config["hidden_act"].as_str() {
-            if a != "gelu" {
-                bail!("hidden_act {a} is not gelu");
+        let arch = match config["model_type"].as_str() {
+            Some("bert") => Arch::Bert,
+            Some("modernbert") => Arch::ModernBert,
+            other => bail!("model_type {other:?} is not bert or modernbert"),
+        };
+        for key in ["hidden_act", "hidden_activation"] {
+            if let Some(a) = config[key].as_str() {
+                if a != "gelu" {
+                    bail!("{key} {a} is not gelu");
+                }
             }
         }
-        if let Some(p) = config["position_embedding_type"].as_str() {
-            if p != "absolute" {
-                bail!("position_embedding_type {p} is not absolute");
+        if arch == Arch::Bert {
+            if let Some(p) = config["position_embedding_type"].as_str() {
+                if p != "absolute" {
+                    bail!("position_embedding_type {p} is not absolute");
+                }
             }
         }
         let n = |k: &str| -> Result<usize> {
@@ -107,15 +133,66 @@ impl E5Config {
         };
         let d = n("hidden_size")?;
         let max_pos = n("max_position_embeddings")?;
+        let layers = n("num_hidden_layers")?;
+        let (sliding, window, theta_global, theta_local, eps, norm_bias) = match arch {
+            Arch::Bert => (
+                vec![false; layers],
+                0,
+                0.0,
+                0.0,
+                config["layer_norm_eps"].as_f64().unwrap_or(1e-12) as f32,
+                true,
+            ),
+            Arch::ModernBert => {
+                let every = config["global_attn_every_n_layers"].as_u64().unwrap_or(3) as usize;
+                let sliding: Vec<bool> = match config["layer_types"].as_array() {
+                    Some(a) => a
+                        .iter()
+                        .map(|t| t.as_str() == Some("sliding_attention"))
+                        .collect(),
+                    None => (0..layers).map(|i| i % every != 0).collect(),
+                };
+                if sliding.len() != layers {
+                    bail!(
+                        "layer_types has {} entries for {layers} layers",
+                        sliding.len()
+                    );
+                }
+                let rope = &config["rope_parameters"];
+                let theta = |kind: &str, key: &str, fallback: f64| -> f32 {
+                    rope[kind]["rope_theta"]
+                        .as_f64()
+                        .or_else(|| config[key].as_f64())
+                        .unwrap_or(fallback) as f32
+                };
+                (
+                    sliding,
+                    config["local_attention"].as_u64().unwrap_or(128) as usize / 2,
+                    theta("full_attention", "global_rope_theta", 160000.0),
+                    theta("sliding_attention", "local_rope_theta", 10000.0),
+                    config["norm_eps"]
+                        .as_f64()
+                        .or_else(|| config["layer_norm_eps"].as_f64())
+                        .unwrap_or(1e-5) as f32,
+                    config["norm_bias"].as_bool().unwrap_or(false),
+                )
+            }
+        };
         let cfg = E5Config {
+            arch,
             vocab: n("vocab_size")?,
             d,
-            layers: n("num_hidden_layers")?,
+            layers,
             heads: n("num_attention_heads")?,
             ff: n("intermediate_size")?,
             max_pos,
-            eps: config["layer_norm_eps"].as_f64().unwrap_or(1e-12) as f32,
-            max_len: g["max_len"].as_u64().unwrap_or(max_pos as u64) as usize,
+            eps,
+            norm_bias,
+            sliding,
+            window,
+            theta_global,
+            theta_local,
+            max_len: g["max_len"].as_u64().unwrap_or(max_pos.min(512) as u64) as usize,
             head_in: g["head_in"].as_u64().unwrap_or(4 * d as u64) as usize,
             head_hidden: gn("head_hidden")? as usize,
             temperature: g["temperature"].as_f64().unwrap_or(1.0) as f32,
@@ -163,27 +240,48 @@ impl E5Config {
     pub fn tensors(&self) -> Vec<TensorSpec> {
         let d = self.d;
         let ff = self.ff;
-        let mut v = vec![
-            TensorSpec::new("embed", vec![self.vocab, d]),
-            TensorSpec::new("pos_embed", vec![self.max_pos, d]),
-            TensorSpec::new("type_embed", vec![d]),
-            TensorSpec::new("embed_norm_w", vec![d]),
-            TensorSpec::new("embed_norm_b", vec![d]),
-        ];
-        for l in 0..self.layers {
-            let n = |s: &str| format!("enc.{l}.{s}");
-            v.push(TensorSpec::new(&n("qkv"), vec![3 * d, d]));
-            v.push(TensorSpec::new(&n("qkv_b"), vec![3 * d]));
-            v.push(TensorSpec::new(&n("o"), vec![d, d]));
-            v.push(TensorSpec::new(&n("o_b"), vec![d]));
-            v.push(TensorSpec::new(&n("attn_norm_w"), vec![d]));
-            v.push(TensorSpec::new(&n("attn_norm_b"), vec![d]));
-            v.push(TensorSpec::new(&n("wi"), vec![ff, d]));
-            v.push(TensorSpec::new(&n("wi_b"), vec![ff]));
-            v.push(TensorSpec::new(&n("wo"), vec![d, ff]));
-            v.push(TensorSpec::new(&n("wo_b"), vec![d]));
-            v.push(TensorSpec::new(&n("mlp_norm_w"), vec![d]));
-            v.push(TensorSpec::new(&n("mlp_norm_b"), vec![d]));
+        let mut v = vec![TensorSpec::new("embed", vec![self.vocab, d])];
+        let norm = |v: &mut Vec<TensorSpec>, name: &str| {
+            v.push(TensorSpec::new(&format!("{name}_w"), vec![d]));
+            if self.norm_bias {
+                v.push(TensorSpec::new(&format!("{name}_b"), vec![d]));
+            }
+        };
+        match self.arch {
+            Arch::Bert => {
+                v.push(TensorSpec::new("pos_embed", vec![self.max_pos, d]));
+                v.push(TensorSpec::new("type_embed", vec![d]));
+                norm(&mut v, "embed_norm");
+                for l in 0..self.layers {
+                    let n = |s: &str| format!("enc.{l}.{s}");
+                    v.push(TensorSpec::new(&n("qkv"), vec![3 * d, d]));
+                    v.push(TensorSpec::new(&n("qkv_b"), vec![3 * d]));
+                    v.push(TensorSpec::new(&n("o"), vec![d, d]));
+                    v.push(TensorSpec::new(&n("o_b"), vec![d]));
+                    norm(&mut v, &n("attn_norm"));
+                    v.push(TensorSpec::new(&n("wi"), vec![ff, d]));
+                    v.push(TensorSpec::new(&n("wi_b"), vec![ff]));
+                    v.push(TensorSpec::new(&n("wo"), vec![d, ff]));
+                    v.push(TensorSpec::new(&n("wo_b"), vec![d]));
+                    norm(&mut v, &n("mlp_norm"));
+                }
+            }
+            Arch::ModernBert => {
+                norm(&mut v, "embed_norm");
+                norm(&mut v, "final_norm");
+                for l in 0..self.layers {
+                    let n = |s: &str| format!("enc.{l}.{s}");
+                    if l > 0 {
+                        norm(&mut v, &n("attn_norm"));
+                    }
+                    v.push(TensorSpec::new(&n("qkv"), vec![3 * d, d]));
+                    v.push(TensorSpec::new(&n("o"), vec![d, d]));
+                    norm(&mut v, &n("mlp_norm"));
+                    v.push(TensorSpec::new(&n("wi_val"), vec![ff, d]));
+                    v.push(TensorSpec::new(&n("wi_gate"), vec![ff, d]));
+                    v.push(TensorSpec::new(&n("wo"), vec![d, ff]));
+                }
+            }
         }
         v.push(TensorSpec::new(
             "head.l1",
@@ -249,6 +347,19 @@ struct AttnParams {
     _p2: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct RopeParams {
+    t: u32,
+    heads: u32,
+    stride: u32,
+    k_off: u32,
+    theta: f32,
+    scale: f32,
+    _p0: u32,
+    _p1: u32,
+}
+
 /// Pool (sequences, d) and pair-feature (pairs, d) kernels.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -259,20 +370,38 @@ struct CountParams {
     _p1: u32,
 }
 
-/// One encoder layer's dispatches. The stream enters in `x`, the attention
-/// LayerNorm writes `h`, the MLP LayerNorm writes `x` again.
-struct EncLayer {
-    mm_qkv: Step,
-    bias_qkv: Step,
-    attn: Step,
-    mm_o: Step,
-    add_o: Step,
-    attn_norm: Step,
-    mm_wi: Step,
-    gelu_wi: Step,
-    mm_wo: Step,
-    add_wo: Step,
-    mlp_norm: Step,
+/// One encoder layer's dispatches.
+enum EncLayer {
+    /// The stream enters in `x`, the attention LayerNorm writes `h`, the
+    /// MLP LayerNorm writes `x` again.
+    Bert {
+        mm_qkv: Step,
+        bias_qkv: Step,
+        attn: Step,
+        mm_o: Step,
+        add_o: Step,
+        attn_norm: Step,
+        mm_wi: Step,
+        gelu_wi: Step,
+        mm_wo: Step,
+        add_wo: Step,
+        mlp_norm: Step,
+    },
+    /// The stream stays in `x`; norms write `h` for the projections to read.
+    /// `attn_norm` is None on layer 0 (the projection reads `x`).
+    Modern {
+        attn_norm: Option<Step>,
+        mm_qkv: Step,
+        rope: Step,
+        attn: Step,
+        mm_o: Step,
+        add_o: Step,
+        mlp_norm: Step,
+        mm_wi: Step,
+        mm_wo: Step,
+        add_wo: Step,
+        sliding: bool,
+    },
 }
 
 /// The (state, option) head: feature rows, Linear, GELU, Linear.
@@ -443,7 +572,7 @@ impl E5Builder {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let param_slots = 11 + cfg.layers * 11;
+        let param_slots = 12 + cfg.layers * 11;
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("params"),
             size: PARAM_SLOT * param_slots as u64,
@@ -489,8 +618,15 @@ impl E5Builder {
             }
         };
         let embed_t = w("embed")?;
-        let pos_t = w("pos_embed")?;
-        // h = word[ids]; a = pos[positions]; h += a + type_embed[0]; x = LN(h).
+        let nb = |name: &str| -> Result<&wgpu::Buffer> {
+            Ok(if cfg.norm_bias {
+                &w(&format!("{name}_b"))?.data
+            } else {
+                &dummy
+            })
+        };
+        // BERT: h = word[ids]; a = pos[positions]; h += a + type_embed[0]; x = LN(h).
+        // ModernBERT: h = word[ids]; x = LN(h).
         let embed = step(
             K::Embed,
             0,
@@ -498,107 +634,191 @@ impl E5Builder {
             "embed",
             &[&ids, &embed_t.data, sc(embed_t, &dummy), &h],
         );
-        let pos_embed = step(
-            K::Embed,
-            0,
-            pos_t.dtype.code(),
-            "pos_embed",
-            &[&positions, &pos_t.data, sc(pos_t, &dummy), &a],
-        );
-        let embed_add = step(
-            K::BiasAct,
-            0,
-            0,
-            "embed_add",
-            &[&a, &w("type_embed")?.data, &h],
-        );
+        let (pos_embed, embed_add) = match cfg.arch {
+            Arch::Bert => {
+                let pos_t = w("pos_embed")?;
+                (
+                    Some(step(
+                        K::Embed,
+                        0,
+                        pos_t.dtype.code(),
+                        "pos_embed",
+                        &[&positions, &pos_t.data, sc(pos_t, &dummy), &a],
+                    )),
+                    Some(step(
+                        K::BiasAct,
+                        0,
+                        0,
+                        "embed_add",
+                        &[&a, &w("type_embed")?.data, &h],
+                    )),
+                )
+            }
+            Arch::ModernBert => (None, None),
+        };
         let embed_norm = step(
             K::LayerNorm,
             0,
             0,
             "embed_norm",
-            &[&h, &w("embed_norm_w")?.data, &w("embed_norm_b")?.data, &x],
+            &[&h, &w("embed_norm_w")?.data, nb("embed_norm")?, &x],
         );
         let mut enc = Vec::with_capacity(cfg.layers);
         for l in 0..cfg.layers {
             let n = |s: &str| format!("enc.{l}.{s}");
             let t_qkv = w(&n("qkv"))?;
             let t_o = w(&n("o"))?;
-            let t_wi = w(&n("wi"))?;
             let t_wo = w(&n("wo"))?;
-            enc.push(EncLayer {
-                mm_qkv: step(
-                    K::Matmul,
-                    0,
-                    t_qkv.dtype.code(),
-                    "mm_qkv",
-                    &[&x, &t_qkv.data, sc(t_qkv, &dummy), &qkv],
-                ),
-                bias_qkv: step(
-                    K::BiasAct,
-                    0,
-                    0,
-                    "bias_qkv",
-                    &[&dummy, &w(&n("qkv_b"))?.data, &qkv],
-                ),
-                attn: step(K::AttentionBi, hd, 0, "attention", &[&qkv, &meta, &attn]),
-                mm_o: step(
-                    K::Matmul,
-                    0,
-                    t_o.dtype.code(),
-                    "mm_o",
-                    &[&attn, &t_o.data, sc(t_o, &dummy), &a],
-                ),
-                add_o: step(K::BiasAct, 0, 0, "add_o", &[&a, &w(&n("o_b"))?.data, &x]),
-                attn_norm: step(
-                    K::LayerNorm,
-                    0,
-                    0,
-                    "attn_norm",
-                    &[
-                        &x,
-                        &w(&n("attn_norm_w"))?.data,
-                        &w(&n("attn_norm_b"))?.data,
-                        &h,
-                    ],
-                ),
-                mm_wi: step(
-                    K::Matmul,
-                    0,
-                    t_wi.dtype.code(),
-                    "mm_wi",
-                    &[&h, &t_wi.data, sc(t_wi, &dummy), &act],
-                ),
-                gelu_wi: step(
-                    K::BiasAct,
-                    0,
-                    0,
-                    "gelu_wi",
-                    &[&dummy, &w(&n("wi_b"))?.data, &act],
-                ),
-                mm_wo: step(
-                    K::Matmul,
-                    0,
-                    t_wo.dtype.code(),
-                    "mm_wo",
-                    &[&act, &t_wo.data, sc(t_wo, &dummy), &a],
-                ),
-                add_wo: step(K::BiasAct, 0, 0, "add_wo", &[&a, &w(&n("wo_b"))?.data, &h]),
-                mlp_norm: step(
-                    K::LayerNorm,
-                    0,
-                    0,
-                    "mlp_norm",
-                    &[
-                        &h,
-                        &w(&n("mlp_norm_w"))?.data,
-                        &w(&n("mlp_norm_b"))?.data,
-                        &x,
-                    ],
-                ),
-            });
+            match cfg.arch {
+                Arch::Bert => {
+                    let t_wi = w(&n("wi"))?;
+                    enc.push(EncLayer::Bert {
+                        mm_qkv: step(
+                            K::Matmul,
+                            0,
+                            t_qkv.dtype.code(),
+                            "mm_qkv",
+                            &[&x, &t_qkv.data, sc(t_qkv, &dummy), &qkv],
+                        ),
+                        bias_qkv: step(
+                            K::BiasAct,
+                            0,
+                            0,
+                            "bias_qkv",
+                            &[&dummy, &w(&n("qkv_b"))?.data, &qkv],
+                        ),
+                        attn: step(K::AttentionBi, hd, 0, "attention", &[&qkv, &meta, &attn]),
+                        mm_o: step(
+                            K::Matmul,
+                            0,
+                            t_o.dtype.code(),
+                            "mm_o",
+                            &[&attn, &t_o.data, sc(t_o, &dummy), &a],
+                        ),
+                        add_o: step(K::BiasAct, 0, 0, "add_o", &[&a, &w(&n("o_b"))?.data, &x]),
+                        attn_norm: step(
+                            K::LayerNorm,
+                            0,
+                            0,
+                            "attn_norm",
+                            &[&x, &w(&n("attn_norm_w"))?.data, nb(&n("attn_norm"))?, &h],
+                        ),
+                        mm_wi: step(
+                            K::Matmul,
+                            0,
+                            t_wi.dtype.code(),
+                            "mm_wi",
+                            &[&h, &t_wi.data, sc(t_wi, &dummy), &act],
+                        ),
+                        gelu_wi: step(
+                            K::BiasAct,
+                            0,
+                            0,
+                            "gelu_wi",
+                            &[&dummy, &w(&n("wi_b"))?.data, &act],
+                        ),
+                        mm_wo: step(
+                            K::Matmul,
+                            0,
+                            t_wo.dtype.code(),
+                            "mm_wo",
+                            &[&act, &t_wo.data, sc(t_wo, &dummy), &a],
+                        ),
+                        add_wo: step(K::BiasAct, 0, 0, "add_wo", &[&a, &w(&n("wo_b"))?.data, &h]),
+                        mlp_norm: step(
+                            K::LayerNorm,
+                            0,
+                            0,
+                            "mlp_norm",
+                            &[&h, &w(&n("mlp_norm_w"))?.data, nb(&n("mlp_norm"))?, &x],
+                        ),
+                    });
+                }
+                Arch::ModernBert => {
+                    let t_val = w(&n("wi_val"))?;
+                    let t_gate = w(&n("wi_gate"))?;
+                    if t_val.dtype != t_gate.dtype {
+                        bail!("layer {l}: Wi halves must share a storage type");
+                    }
+                    let attn_norm = if l > 0 {
+                        Some(step(
+                            K::LayerNorm,
+                            0,
+                            0,
+                            "attn_norm",
+                            &[&x, &w(&n("attn_norm_w"))?.data, nb(&n("attn_norm"))?, &h],
+                        ))
+                    } else {
+                        None
+                    };
+                    let qkv_src = if l > 0 { &h } else { &x };
+                    enc.push(EncLayer::Modern {
+                        attn_norm,
+                        mm_qkv: step(
+                            K::Matmul,
+                            0,
+                            t_qkv.dtype.code(),
+                            "mm_qkv",
+                            &[qkv_src, &t_qkv.data, sc(t_qkv, &dummy), &qkv],
+                        ),
+                        rope: step(K::RopeBi, hd, 0, "rope", &[&meta, &qkv]),
+                        attn: step(K::AttentionBi, hd, 0, "attention", &[&qkv, &meta, &attn]),
+                        mm_o: step(
+                            K::Matmul,
+                            0,
+                            t_o.dtype.code(),
+                            "mm_o",
+                            &[&attn, &t_o.data, sc(t_o, &dummy), &a],
+                        ),
+                        add_o: step(K::BiasAct, 0, 0, "add_o", &[&a, &dummy, &x]),
+                        mlp_norm: step(
+                            K::LayerNorm,
+                            0,
+                            0,
+                            "mlp_norm",
+                            &[&x, &w(&n("mlp_norm_w"))?.data, nb(&n("mlp_norm"))?, &h],
+                        ),
+                        mm_wi: step(
+                            K::MatmulGated,
+                            0,
+                            t_val.dtype.code() | GELU_ERF,
+                            "mm_wi",
+                            &[
+                                &h,
+                                &t_val.data,
+                                sc(t_val, &dummy),
+                                &t_gate.data,
+                                sc(t_gate, &dummy),
+                                &act,
+                            ],
+                        ),
+                        mm_wo: step(
+                            K::Matmul,
+                            0,
+                            t_wo.dtype.code(),
+                            "mm_wo",
+                            &[&act, &t_wo.data, sc(t_wo, &dummy), &a],
+                        ),
+                        add_wo: step(K::BiasAct, 0, 0, "add_wo", &[&a, &dummy, &x]),
+                        sliding: cfg.sliding[l],
+                    });
+                }
+            }
         }
-        let pool = step(K::Pool, 0, 0, "pool", &[&spans, &x, &vectors]);
+        // ModernBERT ends with a LayerNorm (into h); the pool reads it. BERT's
+        // last MLP LayerNorm already wrote x.
+        let final_norm = match cfg.arch {
+            Arch::Bert => None,
+            Arch::ModernBert => Some(step(
+                K::LayerNorm,
+                0,
+                0,
+                "final_norm",
+                &[&x, &w("final_norm_w")?.data, nb("final_norm")?, &h],
+            )),
+        };
+        let pool_src = if final_norm.is_some() { &h } else { &x };
+        let pool = step(K::Pool, 0, 0, "pool", &[&spans, pool_src, &vectors]);
         let t_l1 = w("head.l1")?;
         let t_l2 = w("head.l2")?;
         let head = HeadSteps {
@@ -661,6 +881,7 @@ impl E5Builder {
             embed_add,
             embed_norm,
             enc,
+            final_norm,
             pool,
             head,
             cache: Mutex::new(HashMap::new()),
@@ -692,10 +913,11 @@ pub struct E5Engine {
     logits: wgpu::Buffer,
     staging: wgpu::Buffer,
     embed: Step,
-    pos_embed: Step,
-    embed_add: Step,
+    pos_embed: Option<Step>,
+    embed_add: Option<Step>,
     embed_norm: Step,
     enc: Vec<EncLayer>,
+    final_norm: Option<Step>,
     pool: Step,
     head: HeadSteps,
     /// Option text → (unit vector, token count), kept across requests.
@@ -877,14 +1099,14 @@ impl E5Engine {
                     t: t as u32,
                     d: d as u32,
                     eps: cfg.eps,
-                    has_bias: 1,
+                    has_bias: cfg.norm_bias as u32,
                 };
                 let (rows_per_wg, _) = attn_tile(hd);
                 let attn_wg = (div_ceil(t, rows_per_wg), cfg.heads as u32);
-                let attn_p = AttnParams {
+                let attn_p = |window: usize| AttnParams {
                     t: t as u32,
                     heads: cfg.heads as u32,
-                    window: 0,
+                    window: window as u32,
                     stride: 3 * d as u32,
                     k_off: d as u32,
                     v_off: 2 * d as u32,
@@ -899,40 +1121,111 @@ impl E5Engine {
                 };
                 let off = params.push(embed_p);
                 run("embed", &self.embed, off, (div_ceil(t * d / 4, 256), 1));
-                let off = params.push(embed_p);
-                run(
-                    "pos_embed",
-                    &self.pos_embed,
-                    off,
-                    (div_ceil(t * d / 4, 256), 1),
-                );
-                let off = params.push(bias(t, d, 0, true, false, true));
-                run("embed_add", &self.embed_add, off, ew(t, d));
+                if let (Some(pe), Some(ea)) = (&self.pos_embed, &self.embed_add) {
+                    let off = params.push(embed_p);
+                    run("pos_embed", pe, off, (div_ceil(t * d / 4, 256), 1));
+                    let off = params.push(bias(t, d, 0, true, false, true));
+                    run("embed_add", ea, off, ew(t, d));
+                }
                 let off = params.push(ln);
                 run("embed_norm", &self.embed_norm, off, (t as u32, 1));
                 for l in &self.enc {
-                    let off = params.push(mm(t, 3 * d, d));
-                    run("mm_qkv", &l.mm_qkv, off, mm_wg(t, 3 * d));
-                    let off = params.push(bias(t, 3 * d, 0, true, true, false));
-                    run("bias_qkv", &l.bias_qkv, off, ew(t, 3 * d));
-                    let off = params.push(attn_p);
-                    run("attention", &l.attn, off, attn_wg);
-                    let off = params.push(mm(t, d, d));
-                    run("mm_o", &l.mm_o, off, mm_wg(t, d));
-                    let off = params.push(bias(t, d, 0, true, false, true));
-                    run("add_o", &l.add_o, off, ew(t, d));
+                    match l {
+                        EncLayer::Bert {
+                            mm_qkv,
+                            bias_qkv,
+                            attn,
+                            mm_o,
+                            add_o,
+                            attn_norm,
+                            mm_wi,
+                            gelu_wi,
+                            mm_wo,
+                            add_wo,
+                            mlp_norm,
+                        } => {
+                            let off = params.push(mm(t, 3 * d, d));
+                            run("mm_qkv", mm_qkv, off, mm_wg(t, 3 * d));
+                            let off = params.push(bias(t, 3 * d, 0, true, true, false));
+                            run("bias_qkv", bias_qkv, off, ew(t, 3 * d));
+                            let off = params.push(attn_p(0));
+                            run("attention", attn, off, attn_wg);
+                            let off = params.push(mm(t, d, d));
+                            run("mm_o", mm_o, off, mm_wg(t, d));
+                            let off = params.push(bias(t, d, 0, true, false, true));
+                            run("add_o", add_o, off, ew(t, d));
+                            let off = params.push(ln);
+                            run("attn_norm", attn_norm, off, (t as u32, 1));
+                            let off = params.push(mm(t, cfg.ff, d));
+                            run("mm_wi", mm_wi, off, mm_wg(t, cfg.ff));
+                            let off = params.push(bias(t, cfg.ff, 2, true, true, false));
+                            run("gelu_wi", gelu_wi, off, ew(t, cfg.ff));
+                            let off = params.push(mm(t, d, cfg.ff));
+                            run("mm_wo", mm_wo, off, mm_wg(t, d));
+                            let off = params.push(bias(t, d, 0, true, false, true));
+                            run("add_wo", add_wo, off, ew(t, d));
+                            let off = params.push(ln);
+                            run("mlp_norm", mlp_norm, off, (t as u32, 1));
+                        }
+                        EncLayer::Modern {
+                            attn_norm,
+                            mm_qkv,
+                            rope,
+                            attn,
+                            mm_o,
+                            add_o,
+                            mlp_norm,
+                            mm_wi,
+                            mm_wo,
+                            add_wo,
+                            sliding,
+                        } => {
+                            if let Some(s) = attn_norm {
+                                let off = params.push(ln);
+                                run("attn_norm", s, off, (t as u32, 1));
+                            }
+                            let off = params.push(mm(t, 3 * d, d));
+                            run("mm_qkv", mm_qkv, off, mm_wg(t, 3 * d));
+                            let off = params.push(RopeParams {
+                                t: t as u32,
+                                heads: cfg.heads as u32,
+                                stride: 3 * d as u32,
+                                k_off: d as u32,
+                                theta: if *sliding {
+                                    cfg.theta_local
+                                } else {
+                                    cfg.theta_global
+                                },
+                                scale: (hd as f32).powf(-0.5),
+                                _p0: 0,
+                                _p1: 0,
+                            });
+                            run(
+                                "rope",
+                                rope,
+                                off,
+                                (div_ceil(t * cfg.heads * hd / 2, 256), 1),
+                            );
+                            let off = params.push(attn_p(if *sliding { cfg.window } else { 0 }));
+                            run("attention", attn, off, attn_wg);
+                            let off = params.push(mm(t, d, d));
+                            run("mm_o", mm_o, off, mm_wg(t, d));
+                            let off = params.push(bias(t, d, 0, false, false, true));
+                            run("add_o", add_o, off, ew(t, d));
+                            let off = params.push(ln);
+                            run("mlp_norm", mlp_norm, off, (t as u32, 1));
+                            let off = params.push(mm(t, cfg.ff, d));
+                            run("mm_wi", mm_wi, off, mm_wg(t, cfg.ff));
+                            let off = params.push(mm(t, d, cfg.ff));
+                            run("mm_wo", mm_wo, off, mm_wg(t, d));
+                            let off = params.push(bias(t, d, 0, false, false, true));
+                            run("add_wo", add_wo, off, ew(t, d));
+                        }
+                    }
+                }
+                if let Some(s) = &self.final_norm {
                     let off = params.push(ln);
-                    run("attn_norm", &l.attn_norm, off, (t as u32, 1));
-                    let off = params.push(mm(t, cfg.ff, d));
-                    run("mm_wi", &l.mm_wi, off, mm_wg(t, cfg.ff));
-                    let off = params.push(bias(t, cfg.ff, 2, true, true, false));
-                    run("gelu_wi", &l.gelu_wi, off, ew(t, cfg.ff));
-                    let off = params.push(mm(t, d, cfg.ff));
-                    run("mm_wo", &l.mm_wo, off, mm_wg(t, d));
-                    let off = params.push(bias(t, d, 0, true, false, true));
-                    run("add_wo", &l.add_wo, off, ew(t, d));
-                    let off = params.push(ln);
-                    run("mlp_norm", &l.mlp_norm, off, (t as u32, 1));
+                    run("final_norm", s, off, (t as u32, 1));
                 }
                 let off = params.push(CountParams {
                     n: seqs.len() as u32,
