@@ -1030,6 +1030,24 @@ fn main() -> Result<()> {
             n_seq_max,
             llama_batch,
         } => {
+            // An e5 export (embedding encoder + (state, option) head) has its own runtime.
+            if grande_wgpu::E5Backend::is_e5_dir(&model) {
+                let mut e5 = grande_wgpu::E5Backend::load(&model, n_ctx as usize, 256)?;
+                e5.temperature = temperature;
+                let name = e5.model.clone();
+                let state = std::sync::Arc::new(grande_server::AppState {
+                    engine: grande_server::EngineHandle::spawn(e5, max_batch),
+                    api_key,
+                    model_id: name.clone(),
+                });
+                let rt = tokio::runtime::Runtime::new()?;
+                return rt.block_on(async move {
+                    let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
+                    eprintln!("grande: http://{host}:{port}/v1/systemone  backend {name} (e5)  temperature x{temperature}");
+                    axum::serve(listener, grande_server::router(state)).await?;
+                    Ok::<(), anyhow::Error>(())
+                });
+            }
             // A Laya checkpoint (encoder + decision head) has its own runtime.
             if grande_wgpu::LayaBackend::is_laya_dir(&model) {
                 let mut laya = grande_wgpu::LayaBackend::load(&model, n_ctx as usize, 1024)?;
@@ -1491,6 +1509,32 @@ fn main() -> Result<()> {
             let req: Request = serde_json::from_slice(&std::fs::read(&request)?)
                 .with_context(|| format!("parsing {}", request.display()))?;
             let t0 = Instant::now();
+            if grande_wgpu::E5Backend::is_e5_dir(&model) {
+                use grande_core::Decider;
+                let mut e5 = grande_wgpu::E5Backend::load(&model, n_ctx as usize, 256)?;
+                e5.temperature = temperature;
+                eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f32());
+                let t = Instant::now();
+                let (resp, diag) = e5.answer(&req, Mode::Packed)?;
+                let mut times = vec![t.elapsed().as_secs_f64() * 1e3];
+                for _ in 1..repeat {
+                    let t = Instant::now();
+                    e5.answer(&req, Mode::Packed)?;
+                    times.push(t.elapsed().as_secs_f64() * 1e3);
+                }
+                times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+                eprintln!(
+                    "e5: {:.1} ms (min {:.1}, median {:.1} over {}), state {} tok, options {:?} tok",
+                    times[0],
+                    times[0],
+                    times[times.len() / 2],
+                    times.len(),
+                    diag.prefix_tokens,
+                    diag.branch_tokens
+                );
+                return Ok(());
+            }
             if grande_wgpu::LayaBackend::is_laya_dir(&model) {
                 use grande_core::Decider;
                 let mut laya = grande_wgpu::LayaBackend::load(&model, n_ctx as usize, 1024)?;

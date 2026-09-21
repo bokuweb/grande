@@ -44,10 +44,18 @@ const GEMMA4 = { layout: "label", turn_start: "<|turn>", turn_end: "<turn|>", us
 // strong on reading questions (JNLI), weak where knowledge is needed; its
 // action head's `act_probability` (1 − the escalate mass) says when to hand
 // a question to E2B / E4B.
+//
+// `multilingual-e5-small-wgpu` is intfloat/multilingual-e5-small (a 118M
+// BERT sentence embedder, docs/e5.md) with the (state, option) head trained
+// on JGLUE, on the same engine: the state and every option description are
+// one sequence each, the head scores each pair on the GPU, ~15 ms a
+// request. Q8, vocabulary pruned to 76k pieces (tools/export_e5.py), 58 MB.
+// Above Laya on JNLI and JCQA, far below E2B where knowledge is needed.
 export const MODELS = {
   "gemma-4-e2b-wgpu-ja": { id: "gemma-4-e2b-wgpu-ja", local: true, hub: "bokuweb/gemma-4-E2B-it-grande-wgpu-ja", kind: "wgpu", readout: "label", manifest: true, dtype: "q4", layout: GEMMA4, size: "1.2 GB", note: "E2B, wgpu engine: one pass, 25k-token vocabulary" },
   "gemma-4-e4b-wgpu-ja": { id: "gemma-4-e4b-wgpu-ja", local: true, hub: "bokuweb/gemma-4-E4B-it-grande-wgpu-ja", kind: "wgpu", readout: "label", manifest: true, dtype: "q4", layout: GEMMA4, size: "2.5 GB", note: "E4B, wgpu engine: one pass, 25k-token vocabulary" },
   "laya-multilingual-wgpu": { id: "laya-multilingual-wgpu", local: true, hub: "bokuweb/laya-multilingual-grande-wgpu", kind: "laya", manifest: true, dtype: "q8", size: "180 MB", note: "Laya: mmBERT encoder + decision head, ~20 ms a question, 56k-token vocabulary" },
+  "multilingual-e5-small-wgpu": { id: "multilingual-e5-small-wgpu", local: true, hub: "bokuweb/multilingual-e5-small-grande-wgpu", kind: "e5", manifest: true, dtype: "q8", size: "58 MB", note: "e5-small embeddings + trained (state, option) head, ~15 ms a request, 76k-token vocabulary" },
 };
 
 const ZWNJ = "‌";
@@ -189,6 +197,24 @@ async function loadLayaManifest(base, config, specials, onProgress) {
   return loader.finish(4096, 1024);
 }
 
+// An exported e5 directory (tools/export_e5.py): the same manifest layout
+// into `E5Loader`.
+async function loadE5Manifest(base, config, onProgress) {
+  const manifest = await (await fetch(`${base}manifest.json`)).json();
+  const loader = await grande.E5Loader.open(config);
+  let done = 0;
+  for (const file of manifest.files) {
+    const buf = new Uint8Array(await (await cachedFetch(`${base}${file.path}`, onProgress)).arrayBuffer());
+    for (const t of file.tensors) {
+      loader.push(t.name, t.dtype, Uint32Array.from(t.shape), buf.subarray(t.offset, t.offset + t.nbytes),
+        t.scales_nbytes ? buf.subarray(t.scales_offset, t.scales_offset + t.scales_nbytes) : new Uint8Array(0));
+    }
+    onProgress?.({ status: "upload", file: file.path, loaded: ++done, total: manifest.files.length });
+  }
+  onProgress?.({ status: "ready" });
+  return loader.finish(4096, 256);
+}
+
 // Where a model directory's files are: same-origin ./models/<id>/ when
 // present, else its Hugging Face repo. The tokenizer is loaded from the
 // same place through transformers.js.
@@ -247,6 +273,39 @@ async function loadLaya({ transformers, spec, onProgress }) {
     return { ...out.response,
       usage: { ...out.response.usage, state_tokens: d.state_tokens, questions, branches: d.branch_tokens.length, orders: 1, mode: "packed", ms, forwards: 1, passes: 1 },
       diagnostics: { candidate_mass: {}, act_probability: d.act_probability, branch_tokens: d.branch_tokens } };
+  }
+  return {
+    model: spec.id, spec, tokenizer: tok, net: null, device: "webgpu", labels: [],
+    answer: (request, opts) => enqueue(() => answerNow(request, opts)),
+    render: (request) => ({ prefix: [], branches: [] }),
+  };
+}
+
+// e5: the whole request goes to the wasm engine, which renders the state
+// and option texts (calling back into the page's tokenizer), embeds them
+// and runs the head in one pass. `temperature` multiplies the head's own
+// calibration temperature; `mode`, `calibrate` and `orders` do not apply.
+async function loadE5({ transformers, spec, onProgress }) {
+  const { base, tok } = await resolveBase(transformers, spec, onProgress);
+  const configText = await (await fetch(`${base}config.json`)).text();
+  const g = JSON.parse(configText).grande_e5;
+  const encode = (text) => tok.encode(text, { add_special_tokens: false });
+  const [cls, sep] = tok.encode("", { add_special_tokens: true });
+  if (cls !== g.cls || sep !== g.sep) throw new Error(`${spec.id}: tokenizer specials ${cls}/${sep} do not match config ${g.cls}/${g.sep}`);
+  const e5 = await loadE5Manifest(base, configText, onProgress);
+  await e5.warmup();
+  const tokenize = (text) => Uint32Array.from(encode(text));
+  let queue = Promise.resolve();
+  const enqueue = (job) => { const p = queue.then(job, job); queue = p.catch(() => {}); return p; };
+  async function answerNow(request, { temperature = 1.0 } = {}) {
+    const t0 = performance.now();
+    const out = JSON.parse(await e5.answer(JSON.stringify(request), tokenize, temperature));
+    const ms = performance.now() - t0;
+    const d = out.diagnostics;
+    const questions = Object.keys(request.questions).length;
+    return { ...out.response,
+      usage: { ...out.response.usage, state_tokens: d.state_tokens, questions, branches: d.branch_tokens.length, orders: 1, mode: "packed", ms, forwards: 1, passes: 1 },
+      diagnostics: { candidate_mass: {}, branch_tokens: d.branch_tokens } };
   }
   return {
     model: spec.id, spec, tokenizer: tok, net: null, device: "webgpu", labels: [],
@@ -327,11 +386,11 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
   transformers.env.useCustomCache = true;
   transformers.env.customCache = idbCache;
   navigator.storage?.persist?.().catch(() => {});
-  if (spec.kind === "laya") {
+  if (spec.kind === "laya" || spec.kind === "e5") {
     const env0 = { remoteHost: transformers.env.remoteHost, remotePathTemplate: transformers.env.remotePathTemplate };
     if (modelBase && !spec.local) Object.assign(transformers.env, { remoteHost: modelBase, remotePathTemplate: "{model}/" });
     try {
-      return await loadLaya({ transformers, spec, onProgress });
+      return await (spec.kind === "laya" ? loadLaya : loadE5)({ transformers, spec, onProgress });
     } finally {
       Object.assign(transformers.env, env0);
     }

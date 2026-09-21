@@ -20,13 +20,17 @@ python3 -m http.server 8765 --directory web
 open "http://localhost:8765/"
 ```
 
-The page offers three models: `gemma-4-e2b-wgpu-ja` (the default) and
-`gemma-4-e4b-wgpu-ja`, Gemma 4 E2B / E4B on grande's own wgpu engine, and
+The page offers four models: `gemma-4-e2b-wgpu-ja` (the default) and
+`gemma-4-e4b-wgpu-ja`, Gemma 4 E2B / E4B on grande's own wgpu engine,
 `laya-multilingual-wgpu`, Convai's Laya (mmBERT encoder + decision head,
 docs/laya.md) on the same engine — 180 MB (Q8, 56k-token vocabulary,
 `tools/export_laya.py`), one bidirectional sequence per question, ~50 ms
 for a 3-question request; fetched from the `laya-v1` release into
-`./models/` by `fetch-models.sh` (small enough for the Pages site). The
+`./models/` by `fetch-models.sh` (small enough for the Pages site) — and
+`multilingual-e5-small-wgpu`, the e5 sentence embedder with grande's
+trained (state, option) head (docs/e5.md) — 58 MB (Q8, 76k-piece
+vocabulary, `tools/export_e5.py`), one sequence per text, ~35 ms for a
+5-question request; the `e5-v1` release, the same way. The
 Gemma models share the same 25k-token vocabulary, 1.2 GB / 2.5 GB, streamed from the Hugging
 Face repos `bokuweb/gemma-4-E2B-it-grande-wgpu-ja` /
 `bokuweb/gemma-4-E4B-it-grande-wgpu-ja` (or from `./models/<id>/` when

@@ -91,6 +91,17 @@ on an M4.
       vocabulary = 180 MB). `grande serve --model <laya dir>` picks it by
       the checkpoint's files; `tools/export_laya.py` packs it for the
       browser; `laya-multilingual-wgpu` in the demo's model list.
+- [x] multilingual-e5-small on the wgpu engine ([docs/e5.md](docs/e5.md)):
+      a BERT sentence embedder (118M, 21.6M without the embedding table)
+      plus a 0.8M (state, option) head trained on JGLUE, behind the same
+      `/v1/systemone`, CLI and browser page — the state and every option
+      description are one sequence each, one pass, the head's two matmuls
+      on the GPU too. Same answers as the PyTorch shim (JNLI 0.712 / JCQA
+      0.615 on the full valid split), 10 ms for the 5-question ticket
+      natively, 34 ms in the browser, Q8 + 76k-piece vocabulary = 58 MB.
+      `grande serve --model <e5 export>` picks it by `config.json`;
+      `tools/export_e5.py` packs it; `multilingual-e5-small-wgpu` in the
+      demo's model list.
 
 ## First numbers (2026-09-19, M-series Mac, Metal)
 
@@ -194,6 +205,15 @@ See [docs/comparison.md](docs/comparison.md). Short version, same M4:
   now runs on grande's own wgpu engine, natively and in the browser, as a
   fast tier next to E2B / E4B: [docs/laya.md](docs/laya.md).
 
+- [multilingual-e5-small](https://huggingface.co/intfloat/multilingual-e5-small)
+  (118M embedding model, 21.6M without the embedding table) measured as a
+  backbone: frozen vectors + a 0.8M head trained in seconds beat Laya on
+  both tasks (JNLI 0.758, JCQA 0.665 at 15–20 ms); the whole encoder
+  fine-tuned reaches JNLI 0.831 (E2B + head: 0.848 at 421 ms) but JCQA
+  stays at 0.671 — the knowledge is not in the model. Runs on the wgpu
+  engine natively and in the browser (`e5.rs`, `tools/export_e5.py`, 58 MB)
+  and behind the PyTorch shim `tools/e5_serve.py`: [docs/e5.md](docs/e5.md).
+
 - Japanese (JGLUE): grande E2B zero-shot JNLI 0.614 / JCQA 0.853; kev-0.5b
   0.450 / 0.577; a 270M grande head trained on 12k records **0.710 / 0.710**
   at 73–77 ms per record, and a 12-layer vocab-pruned 256 MB version
@@ -237,6 +257,10 @@ difference.
 # aac6fef/laya-multilingual-mlx or convaiinnovations/laya-multilingual, or a
 # tools/export_laya.py directory. Same API; ~20 ms a question on an M4.
 ./target/release/grande serve --model ~/.cache/huggingface/hub/models--aac6fef--laya-multilingual-mlx/snapshots/<rev>
+
+# multilingual-e5-small + the trained (state, option) head on the wgpu
+# engine: a tools/export_e5.py directory. Same API; ~10 ms a request on an M4.
+./target/release/grande serve --model web/models/multilingual-e5-small-wgpu
 ```
 
 `--baseline` (probe, serve, jglue) turns on contextual calibration: every
@@ -295,7 +319,8 @@ server with a fresh state per request and checks the answers agree.
 crates/grande-core    types, renderer, readout, math, calibration, Backend trait
 crates/grande-llama   llama-cpp-2 backend
 crates/grande-wgpu    wgpu backend: Gemma 3 / Gemma 4 in WGSL, native and WebGPU;
-                      laya.rs: ModernBERT / mmBERT + Laya's decision head on the same kernels
+                      laya.rs: ModernBERT / mmBERT + Laya's decision head on the same kernels;
+                      e5.rs: multilingual-e5 (BERT) + the (state, option) head
 crates/grande-web     wasm surface for the browser demo (+ the wgpu engine)
 crates/grande-cli     `grande` binary
 examples/             request files

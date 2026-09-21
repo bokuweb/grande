@@ -551,6 +551,152 @@ impl LayaEngine {
     }
 }
 
+#[cfg(feature = "wgpu")]
+impl grande_wgpu::e5::Tokenize for JsTokenize<'_> {
+    fn encode(&self, text: &str) -> Vec<u32> {
+        grande_wgpu::laya::prompt::Tokenize::encode(self, text)
+    }
+}
+
+/// multilingual-e5 (BERT sentence embedder) + the (state, option) head on
+/// WebGPU (docs/e5.md): the rendered state and every option description
+/// are one sequence each, all in one pass; the head scores each pair on
+/// the GPU. Tokenization is the page's (transformers.js).
+#[cfg(feature = "wgpu")]
+#[wasm_bindgen]
+pub struct E5Engine {
+    inner: grande_wgpu::e5::E5Engine,
+    name: String,
+}
+
+#[cfg(feature = "wgpu")]
+#[wasm_bindgen]
+impl E5Engine {
+    pub fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    /// Hidden width, vocabulary, sequence budget, special ids and the
+    /// head's temperature, as JSON.
+    pub fn config(&self) -> String {
+        let c = &self.inner.config;
+        serde_json::json!({
+            "d": c.d, "vocab": c.vocab, "layers": c.layers, "max_len": c.max_len,
+            "cls": c.cls, "sep": c.sep, "pad": c.pad, "temperature": c.temperature, "prefix": c.prefix,
+        })
+        .to_string()
+    }
+
+    pub async fn warmup(&self) -> Result<(), JsError> {
+        self.inner
+            .warmup()
+            .await
+            .map_err(|e| JsError::new(&format!("{e:#}")))
+    }
+
+    /// Answer a request (JSON). `tokenize` maps text to token ids without
+    /// special tokens (a `Uint32Array` or array). `temperature` multiplies
+    /// the head's own. Returns `{"response": Response, "diagnostics":
+    /// {"branch_tokens": [...], "state_tokens": n}}`.
+    pub async fn answer(
+        &self,
+        request: &str,
+        tokenize: &js_sys::Function,
+        temperature: f32,
+    ) -> Result<String, JsError> {
+        let req: Request = js(serde_json::from_str(request), "request")?;
+        let tok = JsTokenize(tokenize);
+        let (resp, _, diag) = self
+            .inner
+            .decide(&tok, &self.name, temperature, &req, &IndexMap::new())
+            .await
+            .map_err(|e| JsError::new(&format!("{e:#}")))?;
+        js(
+            serde_json::to_string(&serde_json::json!({
+                "response": resp,
+                "diagnostics": {
+                    "branch_tokens": diag.branch_tokens,
+                    "state_tokens": diag.prefix_tokens,
+                },
+            })),
+            "response",
+        )
+    }
+}
+
+/// Streams an exported e5 directory (tools/export_e5.py) into the engine
+/// one tensor at a time.
+#[cfg(feature = "wgpu")]
+#[wasm_bindgen]
+pub struct E5Loader {
+    inner: Option<grande_wgpu::e5::E5Builder>,
+    name: String,
+}
+
+#[cfg(feature = "wgpu")]
+#[wasm_bindgen]
+impl E5Loader {
+    /// `config` is the directory's config.json.
+    pub async fn open(config: &str) -> Result<E5Loader, JsError> {
+        let v: serde_json::Value = js(serde_json::from_str(config), "config")?;
+        let cfg = grande_wgpu::e5::E5Config::from_json(&v)
+            .map_err(|e| JsError::new(&format!("{e:#}")))?;
+        let name = cfg.name.clone();
+        let inner = grande_wgpu::e5::E5Builder::new(cfg)
+            .await
+            .map_err(|e| JsError::new(&format!("{e:#}")))?;
+        Ok(E5Loader {
+            inner: Some(inner),
+            name,
+        })
+    }
+
+    pub fn push(
+        &mut self,
+        name: &str,
+        dtype: &str,
+        shape: Vec<u32>,
+        data: Vec<u8>,
+        scales: Vec<u8>,
+    ) -> Result<(), JsError> {
+        let b = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| JsError::new("loader already finished"))?;
+        let dtype =
+            grande_wgpu::Dtype::parse(dtype).map_err(|e| JsError::new(&format!("{e:#}")))?;
+        let t = grande_wgpu::QTensor::from_raw(
+            dtype,
+            shape.into_iter().map(|x| x as usize).collect(),
+            data,
+            scales,
+        )
+        .map_err(|e| JsError::new(&format!("{name}: {e:#}")))?;
+        b.push(name, &t)
+            .map_err(|e| JsError::new(&format!("{name}: {e:#}")))
+    }
+
+    pub fn missing(&self) -> Vec<String> {
+        self.inner.as_ref().map(|b| b.missing()).unwrap_or_default()
+    }
+
+    /// `capacity` is the packed-token budget per pass, `max_seqs` the texts
+    /// (state + options) a request may hold.
+    pub fn finish(&mut self, capacity: u32, max_seqs: u32) -> Result<E5Engine, JsError> {
+        let b = self
+            .inner
+            .take()
+            .ok_or_else(|| JsError::new("loader already finished"))?;
+        let inner = b
+            .finish(capacity as usize, max_seqs as usize)
+            .map_err(|e| JsError::new(&format!("{e:#}")))?;
+        Ok(E5Engine {
+            inner,
+            name: self.name.clone(),
+        })
+    }
+}
+
 /// Streams an exported Laya directory (tools/export_laya.py) into the
 /// engine one tensor at a time.
 #[cfg(feature = "wgpu")]
