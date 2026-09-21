@@ -100,8 +100,8 @@ on an M4.
       0.615 on the full valid split), 10 ms for the 5-question ticket
       natively, 34 ms in the browser, Q8 + 76k-piece vocabulary = 58 MB.
       `grande serve --model <e5 export>` picks it by `config.json`;
-      `tools/export_e5.py` packs it; `multilingual-e5-small-wgpu` in the
-      demo's model list.
+      `tools/export_e5.py` packs it. Not in the demo's model list: the
+      head never reads a question's instructions (see below).
 - [x] Ruri v3 on the wgpu engine ([docs/ruri.md](docs/ruri.md)): the
       Japanese ModernBERT sentence embedders (Nagoya University) with the
       same (state, option) head, `e5.rs` gaining a ModernBERT path on the
@@ -110,7 +110,15 @@ on an M4.
       0.853) and ties E2B + pointer head on JNLI (0.842 vs 0.848); the 37M
       ruri-v3-30m fine-tuned on JNLI is 0.875. `ruri-v3-130m-wgpu` (146 MB,
       19 ms a request) and `ruri-v3-310m-wgpu` (314 MB, 41 ms; generic
-      head JNLI 0.81 / JCQA 0.85) in the demo's model list.
+      head JNLI 0.81 / JCQA 0.85) run natively and in the browser (releases
+      `e5-v1` / `ruri-v1`) but are **not offered in the demo**: the
+      (state, option) head scores the state against each option's text
+      and never sees the question's instructions, so two noul questions
+      over one state get the same probability — it is a classifier for
+      question families it was trained on, not a System One that reads a
+      new question. What would make it one is a Laya-style cross-encoder
+      (instructions, options and state in one sequence) trained on diverse
+      question types; measured, not built.
 
 ## First numbers (2026-09-19, M-series Mac, Metal)
 
@@ -228,7 +236,8 @@ See [docs/comparison.md](docs/comparison.md). Short version, same M4:
   frozen 310m + a 1M head gives JNLI 0.842 / JCQA **0.907** (zero-shot E2B
   0.614 / 0.853, E2B + pointer head 0.848 / –), the 30m fine-tuned on JNLI
   0.875, and on the wgpu engine the 310m answers a 5-question request in
-  41 ms (E2B ~700 ms): [docs/ruri.md](docs/ruri.md).
+  41 ms (E2B ~700 ms) — for the question families its head was trained
+  on; the head does not read instructions: [docs/ruri.md](docs/ruri.md).
 
 - Japanese (JGLUE): grande E2B zero-shot JNLI 0.614 / JCQA 0.853; kev-0.5b
   0.450 / 0.577; a 270M grande head trained on 12k records **0.710 / 0.710**

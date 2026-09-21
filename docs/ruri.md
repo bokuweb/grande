@@ -38,6 +38,7 @@ wgpu engine the 30m / 70m would sit where e5-small does, ~10 ms a request.
 | ruri-v3-70m `pair-lr` | 0.758 | 0.020 → 0.029 | 0.600 → 0.600 | 1.09 | 0.738 / 0.054 | 15 |
 | ruri-v3-70m `both-mlp` | 0.758 | 0.036 → 0.030 | 0.630 → 0.618 | 1.30 | 0.755 / 0.043 | 15 |
 | ruri-v3-70m `generic` | 0.744 | 0.043 → 0.021 | 0.655 → 0.642 | 1.31 | 0.760 / 0.062 | 15 |
+| ruri-v3-70m `ft` (whole encoder) | **0.913** | 0.005 → 0.006 | 0.236 → 0.236 | 0.99 | **0.895** / 0.027 | 15 |
 | ruri-v3-130m `pair-lr` | **0.810** | 0.029 → 0.034 | 0.501 → 0.501 | 1.09 | 0.805 / 0.044 | 31 |
 | ruri-v3-130m `both-mlp` | 0.771 | 0.034 → 0.024 | 0.563 → 0.553 | 1.19 | 0.772 / 0.049 | 31 |
 | ruri-v3-130m `generic` | 0.785 | 0.038 → 0.032 | 0.554 → 0.543 | 1.32 | 0.782 / 0.046 | 31 |
@@ -57,9 +58,11 @@ wgpu engine the 30m / 70m would sit where e5-small does, ~10 ms a request.
 | ruri-v3-30m `cos` zero-shot | 0.753 | 0.543 → 0.412 | 1.567 → 1.172 | 0.08 | 0.715 / 0.505 | 14 |
 | ruri-v3-30m `both-mlp` | 0.776 | 0.041 → 0.044 | 0.614 → 0.603 | 1.15 | 0.762 / 0.051 | 14 |
 | ruri-v3-30m `generic` | 0.750 | 0.102 → 0.039 | 0.793 → 0.675 | 1.86 | 0.762 / 0.117 | 14 |
+| ruri-v3-30m `ft` (whole encoder) | 0.794 | 0.034 → 0.034 | 0.498 → 0.497 | 1.05 | 0.802 / 0.023 | 14 |
 | ruri-v3-70m `cos` zero-shot | 0.787 | 0.578 → 0.452 | 1.567 → 1.166 | 0.08 | 0.772 / 0.563 | 19 |
 | ruri-v3-70m `both-mlp` | 0.825 | 0.051 → 0.050 | 0.537 → 0.517 | 1.27 | 0.802 / 0.066 | 19 |
 | ruri-v3-70m `generic` | 0.807 | 0.076 → 0.036 | 0.649 → 0.563 | 1.67 | 0.785 / 0.091 | 19 |
+| ruri-v3-70m `ft` (1 epoch, queue stopped) | 0.837 | 0.057 → 0.016 | 0.441 → 0.409 | 1.60 | 0.818 / 0.078 | 19 |
 | ruri-v3-130m `cos` zero-shot | 0.826 | 0.616 → 0.484 | 1.564 → 1.133 | 0.08 | 0.818 / 0.608 | 25 |
 | ruri-v3-130m `both-mlp` | **0.857** | 0.049 → 0.037 | 0.423 → 0.421 | 0.93 | 0.855 / 0.055 | 25 |
 | ruri-v3-130m `generic` | 0.837 | 0.074 → 0.045 | 0.563 → 0.468 | 1.75 | 0.843 / 0.080 | 25 |
@@ -103,11 +106,34 @@ point or three on the separate-embedding heads, nothing on the best one.
 - **Calibration** comes out at ECE 0.02–0.05 raw for every trained head,
   as with e5; the zero-shot `cos` needs T = 0.08 and stays at 0.4–0.5.
 - **Fine-tuning** (whole encoder, 3 epochs, the e5 recipe; `tools/ruri.sh`,
-  smallest first, the larger sizes still running when this was written):
-  ruri-v3-30m fine-tuned on JNLI reaches **0.875** (first 400: 0.853) —
-  a 37M model above the frozen E2B + pointer head (0.848) and e5-small
-  fine-tuned (0.831), at 7 ms in PyTorch. The remaining rows land in this
-  table as the queue finishes.
+  smallest first; the queue was stopped after the 70m once the embedder
+  backends were taken out of the demo, so 130m / 310m have no `ft` rows):
+  ruri-v3-30m fine-tuned on JNLI reaches **0.875** (first 400: 0.853) and
+  the 70m **0.913** (0.895) — a 37M / 70M model above the frozen E2B +
+  pointer head (0.848) and e5-small fine-tuned (0.831), at 7–15 ms in
+  PyTorch, with ECE 0.005 raw for the 70m. On JCQA fine-tuning adds 2
+  points over the frozen head at 30m (0.794 vs 0.776) and, after one epoch,
+  1 at 70m (0.837 vs 0.825): the knowledge is already in the frozen
+  vectors; what fine-tuning buys is the NLI skill.
+
+## What the head cannot do
+
+The (state, option) head reads two vectors — the rendered state and an
+option's description — and nothing else. A question's `instructions` are
+never in its input, so two questions with the same options over the same
+state get the same answer: in `examples/ticket-ja.json` the three noul
+questions (escalate, refund_requested, churn_risk) come out at one
+identical probability, and the contract preset's five nouls likewise. It
+is a classifier for question families it was trained on (JNLI-shaped
+pairs, JCQA-shaped choices, whatever else is in its training set), not a
+System One that reads a new question — which is why these backends are
+not offered in the browser demo and stay a native option for known
+families. Reading the instructions takes a cross-encoder in Laya's shape
+(instructions, marked options and the state in one sequence, a scorer on
+the marker rows) trained on many question types; Ruri v3 is a ModernBERT
+and could be trained that way (`tools/e5_finetune.py`'s JNLI mode is
+already a one-task cross-encoder), the open question being how far 33
+distinct instruction strings in `.cache/distill` generalise.
 
 ## On grande's wgpu engine
 
@@ -120,9 +146,8 @@ the BERT one, selected by the export's `model_type`. `tools/export_e5.py
 head: Q8, `mlp.Wi` split into value / gate, the 102k-piece vocabulary
 pruned to 86k (the corpus uses most of a Japanese vocabulary, so little
 goes), 146 MB / 314 MB. `grande serve | probe --model <export>` pick them
-by `config.json`; the page lists both (release `ruri-v1`,
-`web/fetch-models.sh`; the unlisted 270M models are no longer fetched so
-the Pages site stays under 1 GB).
+by `config.json`; the browser loader (`kind: "e5"` in `web/engine.js`)
+runs both (release `ruri-v1`), unlisted for the reason above.
 
 Parity with the PyTorch shim (fp16 MPS, full vocabulary), first 400 rows
 through `tools/http_eval.py`, generic head, T 1.5 (130m) / 1.3 (310m):
