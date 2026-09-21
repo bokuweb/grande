@@ -20,19 +20,20 @@ python3 -m http.server 8765 --directory web
 open "http://localhost:8765/"
 ```
 
-The page offers six models: `gemma-4-e2b-wgpu-ja` (the default) and
-`gemma-4-e4b-wgpu-ja`, Gemma 4 E2B / E4B on grande's own wgpu engine,
+The page offers three models: `gemma-4-e2b-wgpu-ja` (the default) and
+`gemma-4-e4b-wgpu-ja`, Gemma 4 E2B / E4B on grande's own wgpu engine, and
 `laya-multilingual-wgpu`, Convai's Laya (mmBERT encoder + decision head,
 docs/laya.md) on the same engine — 180 MB (Q8, 56k-token vocabulary,
 `tools/export_laya.py`), one bidirectional sequence per question, ~50 ms
 for a 3-question request; fetched from the `laya-v1` release into
-`./models/` by `fetch-models.sh` (small enough for the Pages site) — and
-`multilingual-e5-small-wgpu`, the e5 sentence embedder with grande's
-trained (state, option) head (docs/e5.md) — 58 MB (Q8, 76k-piece
-vocabulary, `tools/export_e5.py`), one sequence per text, ~35 ms for a
-5-question request; the `e5-v1` release, the same way — and
-`ruri-v3-130m-wgpu` / `ruri-v3-310m-wgpu`, Ruri v3 (ModernBERT-Ja) with the
-same kind of head (docs/ruri.md), 146 / 314 MB, the `ruri-v1` release. The
+`./models/` by `fetch-models.sh` (small enough for the Pages site). The
+sentence-embedder backends (multilingual-e5-small, Ruri v3 130m / 310m
+with a trained (state, option) head; docs/e5.md, docs/ruri.md; releases
+`e5-v1`, `ruri-v1`) run on the engine too (`kind: "e5"` in engine.js) but
+are not listed: the head never reads a question's instructions, so every
+noul question over one state gets the same answer — they are a native
+option (`grande serve --model <export>`) for question families a head was
+trained on, not a general System One. The
 Gemma models share the same 25k-token vocabulary, 1.2 GB / 2.5 GB, streamed from the Hugging
 Face repos `bokuweb/gemma-4-E2B-it-grande-wgpu-ja` /
 `bokuweb/gemma-4-E4B-it-grande-wgpu-ja` (or from `./models/<id>/` when
@@ -88,8 +89,7 @@ block-causal mask, no ONNX Runtime. Its files (`config.json`,
 `tokenizer.json`, `head.safetensors`, `model.safetensors` f16, 320 MB) come
 from `tools/export_wgpu.py` and live in `models/grande-270m-ja-wgpu/`
 (release `wgpu-v1`; neither 270M model is in the page's list or fetched by
-`fetch-models.sh` any more — the Pages site's 1 GB holds the Laya, e5 and
-Ruri exports instead). Measured with the
+`fetch-models.sh` any more). Measured with the
 GPU shared with a training job, interleaved with the ONNX model: ticket
 0.17–0.55 s vs 0.86–1.35 s, contract 0.41–0.74 s vs 2.9–4.0 s.
 

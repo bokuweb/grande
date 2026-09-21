@@ -109,6 +109,25 @@ point or three on the separate-embedding heads, nothing on the best one.
   fine-tuned (0.831), at 7 ms in PyTorch. The remaining rows land in this
   table as the queue finishes.
 
+## What the head cannot do
+
+The (state, option) head reads two vectors — the rendered state and an
+option's description — and nothing else. A question's `instructions` are
+never in its input, so two questions with the same options over the same
+state get the same answer: in `examples/ticket-ja.json` the three noul
+questions (escalate, refund_requested, churn_risk) come out at one
+identical probability, and the contract preset's five nouls likewise. It
+is a classifier for question families it was trained on (JNLI-shaped
+pairs, JCQA-shaped choices, whatever else is in its training set), not a
+System One that reads a new question — which is why these backends are
+not offered in the browser demo and stay a native option for known
+families. Reading the instructions takes a cross-encoder in Laya's shape
+(instructions, marked options and the state in one sequence, a scorer on
+the marker rows) trained on many question types; Ruri v3 is a ModernBERT
+and could be trained that way (`tools/e5_finetune.py`'s JNLI mode is
+already a one-task cross-encoder), the open question being how far 33
+distinct instruction strings in `.cache/distill` generalise.
+
 ## On grande's wgpu engine
 
 Done (this branch): `ruri-v3-130m-wgpu` and `ruri-v3-310m-wgpu`, on the
@@ -120,9 +139,8 @@ the BERT one, selected by the export's `model_type`. `tools/export_e5.py
 head: Q8, `mlp.Wi` split into value / gate, the 102k-piece vocabulary
 pruned to 86k (the corpus uses most of a Japanese vocabulary, so little
 goes), 146 MB / 314 MB. `grande serve | probe --model <export>` pick them
-by `config.json`; the page lists both (release `ruri-v1`,
-`web/fetch-models.sh`; the unlisted 270M models are no longer fetched so
-the Pages site stays under 1 GB).
+by `config.json`; the browser loader (`kind: "e5"` in `web/engine.js`)
+runs both (release `ruri-v1`), unlisted for the reason above.
 
 Parity with the PyTorch shim (fp16 MPS, full vocabulary), first 400 rows
 through `tools/http_eval.py`, generic head, T 1.5 (130m) / 1.3 (310m):
