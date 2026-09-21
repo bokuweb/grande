@@ -31,7 +31,7 @@ use serde_json::Value;
 use wgpu::util::DeviceExt;
 
 use crate::engine::{
-    attn_tile, attn_workgroup_bytes, div_ceil, open_device, report_profile, Dispatch, GpuTensor,
+    attn_tile_bi, attn_workgroup_bytes, div_ceil, open_device, report_profile, Dispatch, GpuTensor,
     Kernels, Params, Profiler, Step, GELU_ERF, K, PARAM_SLOT,
 };
 use crate::model::{Dtype, QTensor, TensorSpec};
@@ -215,7 +215,7 @@ impl E5Config {
             bail!("hidden_size {} / heads {}", self.d, self.heads);
         }
         let hd = self.head_dim();
-        let (_, kb) = attn_tile(hd);
+        let (_, kb) = attn_tile_bi(hd);
         if !hd.is_multiple_of(4 * kb) || hd < 32 {
             bail!("head_dim {hd} must be a multiple of {}", 4 * kb);
         }
@@ -300,9 +300,10 @@ struct EmbedParams {
     t: u32,
     d: u32,
     scale: f32,
-    _pad: u32,
+    residual: u32,
 }
 
+/// layernorm.wgsl; the residual / in-place modes are Laya's, unused here.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct LnParams {
@@ -310,6 +311,10 @@ struct LnParams {
     d: u32,
     eps: f32,
     has_bias: u32,
+    residual: u32,
+    has_rbias: u32,
+    in_place: u32,
+    _pad: u32,
 }
 
 #[repr(C)]
@@ -427,8 +432,11 @@ impl E5Builder {
     pub async fn new(config: E5Config) -> Result<Self> {
         config.validate()?;
         let need = (config.vocab * config.d * 2) as u64;
-        let (device, queue, profile) =
-            open_device(need, attn_workgroup_bytes(config.head_dim())).await?;
+        let (device, queue, profile) = open_device(
+            need,
+            attn_workgroup_bytes(config.head_dim(), attn_tile_bi(config.head_dim())),
+        )
+        .await?;
         let expected = config
             .tensors()
             .into_iter()
@@ -661,7 +669,14 @@ impl E5Builder {
             0,
             0,
             "embed_norm",
-            &[&h, &w("embed_norm_w")?.data, nb("embed_norm")?, &x],
+            &[
+                &dummy,
+                &w("embed_norm_w")?.data,
+                nb("embed_norm")?,
+                &dummy,
+                &h,
+                &x,
+            ],
         );
         let mut enc = Vec::with_capacity(cfg.layers);
         for l in 0..cfg.layers {
@@ -701,7 +716,14 @@ impl E5Builder {
                             0,
                             0,
                             "attn_norm",
-                            &[&x, &w(&n("attn_norm_w"))?.data, nb(&n("attn_norm"))?, &h],
+                            &[
+                                &dummy,
+                                &w(&n("attn_norm_w"))?.data,
+                                nb(&n("attn_norm"))?,
+                                &dummy,
+                                &x,
+                                &h,
+                            ],
                         ),
                         mm_wi: step(
                             K::Matmul,
@@ -730,7 +752,14 @@ impl E5Builder {
                             0,
                             0,
                             "mlp_norm",
-                            &[&h, &w(&n("mlp_norm_w"))?.data, nb(&n("mlp_norm"))?, &x],
+                            &[
+                                &dummy,
+                                &w(&n("mlp_norm_w"))?.data,
+                                nb(&n("mlp_norm"))?,
+                                &dummy,
+                                &h,
+                                &x,
+                            ],
                         ),
                     });
                 }
@@ -746,7 +775,14 @@ impl E5Builder {
                             0,
                             0,
                             "attn_norm",
-                            &[&x, &w(&n("attn_norm_w"))?.data, nb(&n("attn_norm"))?, &h],
+                            &[
+                                &dummy,
+                                &w(&n("attn_norm_w"))?.data,
+                                nb(&n("attn_norm"))?,
+                                &dummy,
+                                &x,
+                                &h,
+                            ],
                         ))
                     } else {
                         None
@@ -776,7 +812,14 @@ impl E5Builder {
                             0,
                             0,
                             "mlp_norm",
-                            &[&x, &w(&n("mlp_norm_w"))?.data, nb(&n("mlp_norm"))?, &h],
+                            &[
+                                &dummy,
+                                &w(&n("mlp_norm_w"))?.data,
+                                nb(&n("mlp_norm"))?,
+                                &dummy,
+                                &x,
+                                &h,
+                            ],
                         ),
                         mm_wi: step(
                             K::MatmulGated,
@@ -814,7 +857,14 @@ impl E5Builder {
                 0,
                 0,
                 "final_norm",
-                &[&x, &w("final_norm_w")?.data, nb("final_norm")?, &h],
+                &[
+                    &dummy,
+                    &w("final_norm_w")?.data,
+                    nb("final_norm")?,
+                    &dummy,
+                    &x,
+                    &h,
+                ],
             )),
         };
         let pool_src = if final_norm.is_some() { &h } else { &x };
@@ -1100,8 +1150,12 @@ impl E5Engine {
                     d: d as u32,
                     eps: cfg.eps,
                     has_bias: cfg.norm_bias as u32,
+                    residual: 0,
+                    has_rbias: 0,
+                    in_place: 0,
+                    _pad: 0,
                 };
-                let (rows_per_wg, _) = attn_tile(hd);
+                let (rows_per_wg, _) = attn_tile_bi(hd);
                 let attn_wg = (div_ceil(t, rows_per_wg), cfg.heads as u32);
                 let attn_p = |window: usize| AttnParams {
                     t: t as u32,
@@ -1117,7 +1171,7 @@ impl E5Engine {
                     t: t as u32,
                     d: d as u32,
                     scale: 1.0,
-                    _pad: 0,
+                    residual: 0,
                 };
                 let off = params.push(embed_p);
                 run("embed", &self.embed, off, (div_ceil(t * d / 4, 256), 1));

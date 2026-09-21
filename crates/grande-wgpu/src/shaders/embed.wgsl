@@ -1,8 +1,10 @@
-// out[t, :] = W[ids[t], :] * scale   (Gemma scales embeddings by sqrt(d))
-// W is the (possibly quantized) embedding table; one invocation per 4
-// consecutive elements. d is a multiple of 32.
+// out[t, :] (+)= W[ids[t], :] * scale   (Gemma scales embeddings by sqrt(d);
+// `residual` adds the row to `out` instead of overwriting it: Laya's type
+// embedding onto the encoder output). W is the (possibly quantized)
+// embedding table; one invocation per 4 consecutive elements. d is a
+// multiple of 32.
 
-struct Params { t: u32, d: u32, scale: f32, _pad: u32 }
+struct Params { t: u32, d: u32, scale: f32, residual: u32 }
 
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> ids: array<u32>;
@@ -36,6 +38,9 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
     }
     v = v * p.scale;
     let o = row * p.d + c;
+    if (p.residual == 1u) {
+        v += vec4<f32>(out[o], out[o + 1u], out[o + 2u], out[o + 3u]);
+    }
     out[o] = v.x;
     out[o + 1u] = v.y;
     out[o + 2u] = v.z;

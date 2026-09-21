@@ -3,11 +3,16 @@
 // local layers, |query position - key position| <= window. Q, K and V are
 // read from the fused projection buffer [t][q | k | v] (row stride
 // `stride`, K at `k_off`, V at `v_off`, `heads` heads of HD each; no K/V
-// sharing, no cache). Otherwise the same tiling as attention.wgsl: a
-// workgroup of ROWS x KB invocations handles ROWS query rows of one head
-// (wg.y) and streams that head's keys KB at a time, restricted to the cache
-// rows the tokens' sequences span (tok_meta: position, sequence, first row,
-// last row + 1). HD, ROWS and KB are substituted by the engine.
+// sharing, no cache). Same tiling as attention.wgsl: a workgroup of
+// ROWS x KB invocations handles ROWS query rows of one head (wg.y) and
+// streams that head's keys KB at a time. A sequence's rows are contiguous
+// and its positions count up from its first row (tok_meta: position,
+// sequence, first row, last row + 1), so the position difference is the
+// row difference and the keys a tile of queries can see are the rows
+// [max(lo, tok0 - window), min(hi, tok0 + ROWS + window)) of their
+// sequences' span [lo, hi): the tile loop runs over exactly that range and
+// a pair is masked by its sequence ids and row distance alone, with no
+// per-tile metadata staging. HD, ROWS and KB are substituted by the engine.
 
 struct Params { t: u32, heads: u32, window: u32, stride: u32, k_off: u32, v_off: u32, _p1: u32, _p2: u32 }
 
@@ -30,18 +35,11 @@ var<workgroup> qs: array<u32, ROWS * HP>;  // [ROWS][HP] f16 pairs
 var<workgroup> kvs: array<u32, KB * HP>;   // [KB][HP] f16 pairs: K, then V
 var<workgroup> s: array<f32, ROWS * KB>;   // [ROWS][KB] masked scores
 var<workgroup> ps: array<f32, ROWS * KB>;  // [ROWS][KB] exp(score - m), 0 if masked
-var<workgroup> kpos: array<i32, KB>;
 var<workgroup> kseq: array<i32, KB>;
-var<workgroup> qpos: array<i32, ROWS>;
 var<workgroup> qseq: array<i32, ROWS>;
 var<workgroup> qlo: array<i32, ROWS>;
 var<workgroup> qhi: array<i32, ROWS>;
 var<workgroup> krange: vec2<u32>;
-var<workgroup> tile_any: bool;
-
-fn visible(qp: i32, qs_: i32, kp: i32, ks_: i32) -> bool {
-    return ks_ == qs_ && (p.window == 0u || u32(abs(qp - kp)) <= p.window);
-}
 
 // Stage KB rows of K (half == 0) or V (half == 1) of head g, tile j0, as f16 pairs.
 fn stage_kv(li: u32, j0: u32, half: u32, g: u32) {
@@ -82,25 +80,28 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     if (li < ROWS) {
         let tk = tok0 + li;
         if (tk < p.t) {
-            qpos[li] = tok_meta[4u * tk];
             qseq[li] = tok_meta[4u * tk + 1u];
             qlo[li] = tok_meta[4u * tk + 2u];
             qhi[li] = tok_meta[4u * tk + 3u];
         } else {
-            qpos[li] = -1;
             qseq[li] = -2;
             qlo[li] = 0x7fffffff;
             qhi[li] = 0;
         }
     }
     workgroupBarrier();
-    // Keys these tokens can see lie in rows [lo, hi): their sequences' spans.
+    // Keys these tokens can see lie in their sequences' spans, cut to the
+    // window on local layers.
     if (li == 0u) {
         var lo = 0x7fffffff;
         var hi = 0;
         for (var qi = 0u; qi < ROWS; qi++) {
             lo = min(lo, qlo[qi]);
             hi = max(hi, qhi[qi]);
+        }
+        if (p.window != 0u) {
+            lo = max(lo, i32(tok0) - i32(p.window));
+            hi = min(hi, i32(tok0 + ROWS + p.window));
         }
         krange = vec2<u32>(u32(max(lo, 0)), u32(max(hi, 0)));
     }
@@ -114,28 +115,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let ntiles = (min(kr.y, p.t) + KB - 1u) / KB;
     for (var tile = kr.x / KB; tile < ntiles; tile++) {
         let j0 = tile * KB;
+        // The previous tile's V reads are done before kvs is overwritten.
+        workgroupBarrier();
         if (li < KB) {
             let j = j0 + li;
-            if (j < p.t) {
-                kpos[li] = tok_meta[4u * j];
-                kseq[li] = tok_meta[4u * j + 1u];
-            } else {
-                kpos[li] = 0x7fffffff;
-                kseq[li] = -3;
-            }
-        }
-        workgroupBarrier();
-        if (li == 0u) {
-            var any = false;
-            for (var k = 0u; k < KB; k++) {
-                for (var qi = 0u; qi < ROWS; qi++) {
-                    any = any || visible(qpos[qi], qseq[qi], kpos[k], kseq[k]);
-                }
-            }
-            tile_any = any;
-        }
-        if (!workgroupUniformLoad(&tile_any)) {
-            continue;
+            kseq[li] = select(-3, tok_meta[4u * min(j, p.t - 1u) + 1u], j < p.t);
         }
         stage_kv(li, j0, 0u, g);
         workgroupBarrier();
@@ -155,7 +139,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
                 a3 += dot(unpack2x16float(qs[qb + i + 3u]), unpack2x16float(kvs[kb + i + 3u]));
             }
             let acc = (a0 + a1) + (a2 + a3);
-            let vis = visible(qpos[row], qseq[row], kpos[key], kseq[key]);
+            let dist = abs(i32(tok) - i32(j0 + key));
+            let vis = kseq[key] == qseq[row] && (p.window == 0u || u32(dist) <= p.window);
             s[li] = select(NEG, acc, vis);
         }
         workgroupBarrier();

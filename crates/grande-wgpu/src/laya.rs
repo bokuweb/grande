@@ -27,7 +27,7 @@ use serde_json::Value;
 use wgpu::util::DeviceExt;
 
 use crate::engine::{
-    attn_tile, attn_workgroup_bytes, div_ceil, open_device, report_profile, Dispatch, GpuTensor,
+    attn_tile_bi, attn_workgroup_bytes, div_ceil, open_device, report_profile, Dispatch, GpuTensor,
     Kernels, Params, Profiler, Step, GELU_ERF, K, PARAM_SLOT,
 };
 use crate::model::{Dtype, QTensor, SafeTensors, TensorSpec};
@@ -204,13 +204,17 @@ impl LayaConfig {
             bail!("hidden_size {} / heads {}", self.d, self.heads);
         }
         let hd = self.head_dim();
-        let (_, kb) = attn_tile(hd);
+        let (_, kb) = attn_tile_bi(hd);
         // attention_bi: every invocation owns HD / KB output dims as vec4s.
         if !hd.is_multiple_of(4 * kb) || hd < 32 {
             bail!("head_dim {hd} must be a multiple of {}", 4 * kb);
         }
         if !self.d.is_multiple_of(32) || !self.ff.is_multiple_of(32) {
             bail!("hidden_size and intermediate_size must be multiples of 32");
+        }
+        // layernorm.wgsl keeps a row in registers, 8 elements per invocation.
+        if self.d > 2048 {
+            bail!("hidden_size {} > 2048", self.d);
         }
         Ok(())
     }
@@ -472,9 +476,11 @@ struct EmbedParams {
     t: u32,
     d: u32,
     scale: f32,
-    _pad: u32,
+    residual: u32,
 }
 
+/// layernorm.wgsl: LayerNorm of a row, optionally after adding a linear
+/// layer's output (and its bias) to it, optionally written over the row.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct LnParams {
@@ -482,6 +488,10 @@ struct LnParams {
     d: u32,
     eps: f32,
     has_bias: u32,
+    residual: u32,
+    has_rbias: u32,
+    in_place: u32,
+    _pad: u32,
 }
 
 #[repr(C)]
@@ -532,33 +542,42 @@ struct AttnParams {
     _p2: u32,
 }
 
+/// One encoder layer: 8 dispatches. The residual adds ride in the
+/// LayerNorm that follows them (`add_o_norm` = x += o, h = mlp_norm(x);
+/// `add_wo_norm` = x += wo, h = the next layer's attn_norm(x) — or, on the
+/// last layer, x = final_norm(x) in place). Layer 0 has no attention norm
+/// (the embedding norm is it) and projects x directly.
 struct EncLayer {
-    /// None on layer 0 (no attention norm; the projection reads x).
-    attn_norm: Option<Step>,
     mm_qkv: Step,
     rope: Step,
     attn: Step,
     mm_o: Step,
-    add_o: Step,
-    mlp_norm: Step,
+    add_o_norm: Step,
     mm_wi: Step,
     mm_wo: Step,
-    add_wo: Step,
+    add_wo_norm: Step,
     sliding: bool,
+    /// The layer whose attention norm `add_wo_norm` applies: the last
+    /// layer normalizes x in place with the final norm instead.
+    last: bool,
 }
 
+/// One decision-head layer. `norm1` is only dispatched on the first layer:
+/// the others' is fused into the previous layer's `add_l2` (the last
+/// layer's `add_l2` is a plain residual add; the scorer reads x on the
+/// host).
 struct HeadLayer {
     norm1: Step,
     mm_in: Step,
     bias_in: Step,
     attn: Step,
     mm_out: Step,
-    add_out: Step,
-    norm2: Step,
+    add_out_norm2: Step,
     mm_l1: Step,
     relu_l1: Step,
     mm_l2: Step,
     add_l2: Step,
+    last: bool,
 }
 
 /// Host-side scorer and act head (f32).
@@ -590,8 +609,11 @@ impl LayaBuilder {
     pub async fn new(config: LayaConfig) -> Result<Self> {
         config.validate()?;
         let need = (config.vocab * config.d * 2) as u64;
-        let (device, queue, profile) =
-            open_device(need, attn_workgroup_bytes(config.head_dim())).await?;
+        let (device, queue, profile) = open_device(
+            need,
+            attn_workgroup_bytes(config.head_dim(), attn_tile_bi(config.head_dim())),
+        )
+        .await?;
         let expected = config
             .tensors()
             .into_iter()
@@ -712,6 +734,8 @@ impl LayaBuilder {
             })
         };
         let dummy = f32_buf("dummy", 4);
+        // A dispatch may not bind one buffer both read-only and read-write.
+        let dummy_rw = f32_buf("dummy_rw", 4);
         let u32_buf = |name: &str, n: usize| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(name),
@@ -781,7 +805,7 @@ impl LayaBuilder {
                 bind,
             }
         };
-        // LayerNorm of `src` into `dst` with weight `wn` and optional bias.
+        // layernorm.wgsl bindings: (added row, w, b, added row's bias, x, out).
         let embed_t = w("embed")?;
         // Embedding rows land in h; their LayerNorm writes the residual stream x.
         let embed = step(
@@ -796,26 +820,17 @@ impl LayaBuilder {
             0,
             0,
             "embed_norm",
-            &[&h, &w("embed_norm")?.data, &dummy, &x],
+            &[&dummy, &w("embed_norm")?.data, &dummy, &dummy, &h, &x],
         );
-        let final_norm = step(
-            K::LayerNorm,
-            0,
-            0,
-            "final_norm",
-            &[&x, &w("final_norm")?.data, &dummy, &h],
-        );
+        // x = final_norm(x) (in place, by the last encoder layer) + type_emb[qtype].
         let type_t = w("type_emb")?;
         let type_embed = step(
             K::Embed,
             0,
             type_t.dtype.code(),
             "type_emb",
-            &[&qtypes, &type_t.data, sc(type_t, &dummy), &a],
+            &[&qtypes, &type_t.data, sc(type_t, &dummy), &x],
         );
-        // x = final_norm(x) (copied from h) + type_emb[qtype].
-        let final_copy = step(K::BiasAct, 0, 0, "final_copy", &[&h, &dummy, &x]);
-        let type_add = step(K::BiasAct, 0, 0, "type_add", &[&a, &dummy, &x]);
 
         let mut enc = Vec::with_capacity(cfg.layers);
         for l in 0..cfg.layers {
@@ -828,20 +843,16 @@ impl LayaBuilder {
             if t_val.dtype != t_gate.dtype {
                 bail!("layer {l}: Wi halves must share a storage type");
             }
-            let attn_norm = if l > 0 {
-                Some(step(
-                    K::LayerNorm,
-                    0,
-                    0,
-                    "attn_norm",
-                    &[&x, &w(&n("attn_norm"))?.data, &dummy, &h],
-                ))
+            let last = l + 1 == cfg.layers;
+            // The norm after this layer's MLP: the next layer's attention
+            // norm into h, or the final norm over x itself.
+            let (next_norm, next_out) = if last {
+                (w("final_norm")?, &dummy_rw)
             } else {
-                None
+                (w(&format!("enc.{}.attn_norm", l + 1))?, &h)
             };
             let qkv_src = if l > 0 { &h } else { &x };
             enc.push(EncLayer {
-                attn_norm,
                 mm_qkv: step(
                     K::Matmul,
                     0,
@@ -858,13 +869,12 @@ impl LayaBuilder {
                     "mm_o",
                     &[&attn, &t_o.data, sc(t_o, &dummy), &a],
                 ),
-                add_o: step(K::BiasAct, 0, 0, "add_o", &[&a, &dummy, &x]),
-                mlp_norm: step(
+                add_o_norm: step(
                     K::LayerNorm,
                     0,
                     0,
-                    "mlp_norm",
-                    &[&x, &w(&n("mlp_norm"))?.data, &dummy, &h],
+                    "add_o_norm",
+                    &[&a, &w(&n("mlp_norm"))?.data, &dummy, &dummy, &x, &h],
                 ),
                 mm_wi: step(
                     K::MatmulGated,
@@ -887,8 +897,15 @@ impl LayaBuilder {
                     "mm_wo",
                     &[&act, &t_wo.data, sc(t_wo, &dummy), &a],
                 ),
-                add_wo: step(K::BiasAct, 0, 0, "add_wo", &[&a, &dummy, &x]),
+                add_wo_norm: step(
+                    K::LayerNorm,
+                    0,
+                    0,
+                    "add_wo_norm",
+                    &[&a, &next_norm.data, &dummy, &dummy, &x, next_out],
+                ),
                 sliding: cfg.sliding[l],
+                last,
             });
         }
         let mut head = Vec::with_capacity(cfg.head_layers);
@@ -898,13 +915,21 @@ impl LayaBuilder {
             let t_out = w(&n("out_proj"))?;
             let t_l1 = w(&n("l1"))?;
             let t_l2 = w(&n("l2"))?;
+            let last = hl + 1 == cfg.head_layers;
             head.push(HeadLayer {
                 norm1: step(
                     K::LayerNorm,
                     0,
                     0,
                     "norm1",
-                    &[&x, &w(&n("norm1_w"))?.data, &w(&n("norm1_b"))?.data, &h],
+                    &[
+                        &dummy,
+                        &w(&n("norm1_w"))?.data,
+                        &w(&n("norm1_b"))?.data,
+                        &dummy,
+                        &x,
+                        &h,
+                    ],
                 ),
                 mm_in: step(
                     K::Matmul,
@@ -934,19 +959,19 @@ impl LayaBuilder {
                     "mm_out",
                     &[&attn, &t_out.data, sc(t_out, &dummy), &a],
                 ),
-                add_out: step(
-                    K::BiasAct,
-                    0,
-                    0,
-                    "add_out",
-                    &[&a, &w(&n("out_proj_b"))?.data, &x],
-                ),
-                norm2: step(
+                add_out_norm2: step(
                     K::LayerNorm,
                     0,
                     0,
-                    "norm2",
-                    &[&x, &w(&n("norm2_w"))?.data, &w(&n("norm2_b"))?.data, &h],
+                    "add_out_norm2",
+                    &[
+                        &a,
+                        &w(&n("norm2_w"))?.data,
+                        &w(&n("norm2_b"))?.data,
+                        &w(&n("out_proj_b"))?.data,
+                        &x,
+                        &h,
+                    ],
                 ),
                 mm_l1: step(
                     K::Matmul,
@@ -969,7 +994,26 @@ impl LayaBuilder {
                     "mm_l2",
                     &[&act, &t_l2.data, sc(t_l2, &dummy), &a],
                 ),
-                add_l2: step(K::BiasAct, 0, 0, "add_l2", &[&a, &w(&n("l2_b"))?.data, &x]),
+                add_l2: if last {
+                    step(K::BiasAct, 0, 0, "add_l2", &[&a, &w(&n("l2_b"))?.data, &x])
+                } else {
+                    let m = |s: &str| format!("head.{}.{s}", hl + 1);
+                    step(
+                        K::LayerNorm,
+                        0,
+                        0,
+                        "add_l2_norm1",
+                        &[
+                            &a,
+                            &w(&m("norm1_w"))?.data,
+                            &w(&m("norm1_b"))?.data,
+                            &w(&n("l2_b"))?.data,
+                            &x,
+                            &h,
+                        ],
+                    )
+                },
+                last,
             });
         }
         let hv = |name: &str| -> Result<Vec<f32>> {
@@ -1007,10 +1051,7 @@ impl LayaBuilder {
             staging,
             embed,
             embed_norm,
-            final_norm,
-            final_copy,
             type_embed,
-            type_add,
             enc,
             head,
             host,
@@ -1038,10 +1079,7 @@ pub struct LayaEngine {
     staging: wgpu::Buffer,
     embed: Step,
     embed_norm: Step,
-    final_norm: Step,
-    final_copy: Step,
     type_embed: Step,
-    type_add: Step,
     enc: Vec<EncLayer>,
     head: Vec<HeadLayer>,
     host: Host,
@@ -1157,11 +1195,16 @@ impl LayaEngine {
                     wg,
                 });
             };
-            let ln = |bias: bool| LnParams {
+            // (has_bias, residual, has_rbias, in_place)
+            let ln = |bias: bool, residual: bool, rbias: bool, in_place: bool| LnParams {
                 t: t as u32,
                 d: d as u32,
                 eps: cfg.eps,
                 has_bias: bias as u32,
+                residual: residual as u32,
+                has_rbias: rbias as u32,
+                in_place: in_place as u32,
+                _pad: 0,
             };
             let mm = |n: usize, k: usize| MatmulParams {
                 m: t as u32,
@@ -1183,7 +1226,7 @@ impl LayaEngine {
                     _p1: 0,
                 };
             let ew = |n: usize| (div_ceil(t * n, 256), 1);
-            let (rows_per_wg, _) = attn_tile(hd);
+            let (rows_per_wg, _) = attn_tile_bi(hd);
             let attn_wg = (div_ceil(t, rows_per_wg), cfg.heads as u32);
             let attn_p = |window: usize| AttnParams {
                 t: t as u32,
@@ -1200,16 +1243,12 @@ impl LayaEngine {
                 t: t as u32,
                 d: d as u32,
                 scale: 1.0,
-                _pad: 0,
+                residual: 0,
             });
             run("embed", &self.embed, off, (div_ceil(t * d / 4, 256), 1));
-            let off = params.push(ln(false));
+            let off = params.push(ln(false, false, false, false));
             run("embed_norm", &self.embed_norm, off, (t as u32, 1));
             for l in &self.enc {
-                if let Some(s) = &l.attn_norm {
-                    let off = params.push(ln(false));
-                    run("attn_norm", s, off, (t as u32, 1));
-                }
                 let off = params.push(mm(3 * d, d));
                 run("mm_qkv", &l.mm_qkv, off, mm_wg(3 * d));
                 let off = params.push(RopeParams {
@@ -1236,26 +1275,20 @@ impl LayaEngine {
                 run("attention", &l.attn, off, attn_wg);
                 let off = params.push(mm(d, d));
                 run("mm_o", &l.mm_o, off, mm_wg(d));
-                let off = params.push(bias(d, 0, false, false, true));
-                run("add_o", &l.add_o, off, ew(d));
-                let off = params.push(ln(false));
-                run("mlp_norm", &l.mlp_norm, off, (t as u32, 1));
+                let off = params.push(ln(false, true, false, false));
+                run("add_o_norm", &l.add_o_norm, off, (t as u32, 1));
                 let off = params.push(mm(cfg.ff, d));
                 run("mm_wi", &l.mm_wi, off, mm_wg(cfg.ff));
                 let off = params.push(mm(d, cfg.ff));
                 run("mm_wo", &l.mm_wo, off, mm_wg(d));
-                let off = params.push(bias(d, 0, false, false, true));
-                run("add_wo", &l.add_wo, off, ew(d));
+                let off = params.push(ln(false, true, false, l.last));
+                run("add_wo_norm", &l.add_wo_norm, off, (t as u32, 1));
             }
-            let off = params.push(ln(false));
-            run("final_norm", &self.final_norm, off, (t as u32, 1));
-            let off = params.push(bias(d, 0, false, false, false));
-            run("final_copy", &self.final_copy, off, ew(d));
             let off = params.push(EmbedParams {
                 t: t as u32,
                 d: d as u32,
                 scale: 1.0,
-                _pad: 0,
+                residual: 1,
             });
             run(
                 "type_emb",
@@ -1263,11 +1296,11 @@ impl LayaEngine {
                 off,
                 (div_ceil(t * d / 4, 256), 1),
             );
-            let off = params.push(bias(d, 0, false, false, true));
-            run("type_add", &self.type_add, off, ew(d));
-            for l in &self.head {
-                let off = params.push(ln(true));
-                run("norm1", &l.norm1, off, (t as u32, 1));
+            for (i, l) in self.head.iter().enumerate() {
+                if i == 0 {
+                    let off = params.push(ln(true, false, false, false));
+                    run("norm1", &l.norm1, off, (t as u32, 1));
+                }
                 let off = params.push(mm(3 * d, d));
                 run("mm_in", &l.mm_in, off, mm_wg(3 * d));
                 let off = params.push(bias(3 * d, 0, true, true, false));
@@ -1276,18 +1309,21 @@ impl LayaEngine {
                 run("head_attention", &l.attn, off, attn_wg);
                 let off = params.push(mm(d, d));
                 run("mm_out", &l.mm_out, off, mm_wg(d));
-                let off = params.push(bias(d, 0, true, false, true));
-                run("add_out", &l.add_out, off, ew(d));
-                let off = params.push(ln(true));
-                run("norm2", &l.norm2, off, (t as u32, 1));
+                let off = params.push(ln(true, true, true, false));
+                run("add_out_norm2", &l.add_out_norm2, off, (t as u32, 1));
                 let off = params.push(mm(4 * d, d));
                 run("mm_l1", &l.mm_l1, off, mm_wg(4 * d));
                 let off = params.push(bias(4 * d, 1, true, true, false));
                 run("relu_l1", &l.relu_l1, off, ew(4 * d));
                 let off = params.push(mm(d, 4 * d));
                 run("mm_l2", &l.mm_l2, off, mm_wg(d));
-                let off = params.push(bias(d, 0, true, false, true));
-                run("add_l2", &l.add_l2, off, ew(d));
+                if l.last {
+                    let off = params.push(bias(d, 0, true, false, true));
+                    run("add_l2", &l.add_l2, off, ew(d));
+                } else {
+                    let off = params.push(ln(true, true, true, false));
+                    run("add_l2_norm1", &l.add_l2, off, (t as u32, 1));
+                }
             }
         }
         if params.bytes.len() > self.param_slots * PARAM_SLOT as usize {
