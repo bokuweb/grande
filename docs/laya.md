@@ -171,7 +171,33 @@ by hand) and both lost on the M4:
 f32 staging costs more workgroup-memory bandwidth than the unpacks save
 (the same result the Gemma kernel's notes record), so a plain WGSL tile
 sits at ~1.3 TFLOPS here; MLX's 2× comes from the simdgroup matrix units,
-which WGSL cannot reach in shipping wgpu / browsers. Cross-request
+which WGSL cannot reach in shipping wgpu / browsers.
+
+Two things that were not the matmul (2026-09-21, same request):
+
+- `attention_bi` staged each 8-key tile's positions and sequence ids and
+  had one invocation scan all 128 (query, key) pairs serially to decide
+  whether the tile could be skipped, with the other 127 waiting. A packed
+  sequence's rows are contiguous and its positions count from its first
+  row, so the keys a tile of queries can see are an arithmetic range
+  (`[max(lo, tok0 − window), min(hi, tok0 + ROWS + window))` of the
+  sequences' span) and a pair's mask is its sequence ids plus the row
+  distance. The kernel now loops over that range with four barriers per
+  tile instead of five and no per-tile scan: 1.2 → 0.55 ms a layer in the
+  profile (2.2×). 16 × 8 stays the tile at HD 64 (16 × 16 is 1.6× slower,
+  32 × 8 and 8 × 16 within the noise).
+- The residual adds now ride in the LayerNorm that follows them
+  (`layernorm.wgsl` gets `residual` / `has_rbias` / `in_place`): an
+  encoder layer is 8 dispatches instead of 10, the tail (final norm, copy,
+  type embedding, add) is one in-place norm plus a residual gather, and a
+  head layer's `add_l2` carries the next layer's `norm1`. 247 → 198
+  dispatches. Outputs are unchanged to 1e-7 on the three example requests.
+
+Still open, roughly in order: the N = 768 matmuls (`mm_o`, `mm_wo`,
+`mm_l2`: 42 workgroups on 10 cores, ~30 % below the wide layers'
+throughput — a 32 × 64 tile or split-K), RoPE into the attention's Q / K
+staging (22 dispatches of ~50 µs), and the browser's tokenizer time.
+Cross-request
 batching (`answer_many` packs queued requests into one pass, `X-Grande-Batch`)
 is in, and worth +25 % throughput at 16 concurrent clients (23 → 29 req/s)
 — the pass is compute-bound, so it cannot do more. What would move the

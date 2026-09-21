@@ -41,8 +41,7 @@ pub(crate) const PARAM_SLOT: u64 = 256;
 
 /// Workgroup memory the attention kernel declares at a head_dim (see
 /// attention.wgsl): Q tile, K/V tile, scores, positions.
-pub(crate) fn attn_workgroup_bytes(hd: usize) -> u32 {
-    let (rows, kb) = attn_tile(hd);
+pub(crate) fn attn_workgroup_bytes(hd: usize, (rows, kb): (usize, usize)) -> u32 {
     (rows * hd / 2 * 4 + kb * hd / 2 * 4 + 2 * rows * kb * 4 + kb * 8 + rows * 8 + 4) as u32
 }
 
@@ -57,13 +56,22 @@ pub(crate) fn attn_tile(hd: usize) -> (usize, usize) {
     (16, 8)
 }
 
+/// attention_bi's (query rows, keys per tile). 16 x 8 again at HD 64
+/// (Laya, 3 questions / 222 tokens): 16 x 16 is 1.6x slower, 32 x 8 and
+/// 8 x 16 within the noise.
+#[cfg_attr(not(feature = "laya"), allow(dead_code))]
+pub(crate) fn attn_tile_bi(hd: usize) -> (usize, usize) {
+    let _ = hd;
+    (16, 8)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct EmbedParams {
     t: u32,
     d: u32,
     scale: f32,
-    _pad: u32,
+    residual: u32,
 }
 
 #[repr(C)]
@@ -242,7 +250,7 @@ impl K {
             K::Attention => vec![ro, ro, ro, rw],
             K::PlCombine => vec![ro, ro, ro, rw],
             K::PlGate => vec![ro, rw],
-            K::LayerNorm => vec![ro, ro, ro, rw],
+            K::LayerNorm => vec![ro, ro, ro, ro, rw, rw],
             K::BiasAct => vec![ro, ro, rw],
             K::RopeBi => vec![ro, rw],
             K::AttentionBi => vec![ro, ro, rw],
@@ -284,7 +292,11 @@ impl Kernels {
             // Attention tile shape per head_dim: 8 rows x 16 keys fits HD 256
             // in ~12.5 KB of workgroup memory; HD 512 needs 16 x 8 to stay
             // under 32 KB.
-            let (rows, kb) = attn_tile(hd);
+            let (rows, kb) = if k == K::AttentionBi {
+                attn_tile_bi(hd)
+            } else {
+                attn_tile(hd)
+            };
             src.push_str(
                 &k.source()
                     .replace(
@@ -824,8 +836,11 @@ impl EngineBuilder {
         config.validate()?;
         // The embedding table is the largest single binding (f16: vocab x d x 2).
         let need = (config.vocab * config.d * 2) as u64;
-        let (device, queue, profile) =
-            open_device(need, attn_workgroup_bytes(config.max_head_dim())).await?;
+        let (device, queue, profile) = open_device(
+            need,
+            attn_workgroup_bytes(config.max_head_dim(), attn_tile(config.max_head_dim())),
+        )
+        .await?;
         let expected = config
             .tensors()
             .into_iter()
@@ -1580,7 +1595,7 @@ impl Engine {
                 t: t as u32,
                 d: d as u32,
                 scale: (d as f32).sqrt(),
-                _pad: 0,
+                residual: 0,
             });
             run("embed", &self.embed, off, (div_ceil(t * d / 4, 256), 1));
 
