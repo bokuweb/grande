@@ -13,8 +13,11 @@
 // prefetching the next tile into registers before the multiply (+20-140%: the
 // live registers cut occupancy), row tiles as the fast dispatch axis (+7%),
 // and `enable f16` tiles with f16 FMAs and per-step f16 partial sums (+5%:
-// the M4 has no double-rate f16). K must be a multiple of 32; M and N are
-// bounds-checked.
+// the M4 has no double-rate f16), and the X tile held in registers and
+// fetched per k step with subgroupShuffle from the lane that loaded it
+// (+40-55%: four shuffles cost more than one broadcast workgroup load; the
+// loop is issue-bound, not workgroup-bandwidth-bound). K must be a multiple
+// of 32; M and N are bounds-checked.
 
 struct Params { m: u32, n: u32, k: u32, _pad: u32 }
 
