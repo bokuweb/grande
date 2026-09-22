@@ -1,0 +1,22 @@
+[package]
+name = "omg-llama"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "llama.cpp backend for omg: shared state prefix, isolated question branches, one decode."
+
+[dependencies]
+omg-core = { path = "../omg-core" }
+llama-cpp-2.workspace = true
+llama-cpp-sys-2 = { version = "0.1.156", default-features = false }
+anyhow.workspace = true
+tracing.workspace = true
+encoding_rs = "0.8"
+
+[features]
+default = []
+metal = ["llama-cpp-2/metal"]
+cuda = ["llama-cpp-2/cuda"]
+vulkan = ["llama-cpp-2/vulkan"]
+openmp = ["llama-cpp-2/openmp"]

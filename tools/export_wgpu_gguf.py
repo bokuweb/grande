@@ -1,4 +1,4 @@
-"""Package a Gemma 3 / Gemma 4 GGUF for the wgpu engine (crates/grande-wgpu).
+"""Package a Gemma 3 / Gemma 4 GGUF for the wgpu engine (crates/omg-wgpu).
 
 The quantized weights are kept as they are (Q8_0 / Q4_0 codes) but repacked
 into the engine's layout: per tensor, the f16 block scales in one contiguous
@@ -169,7 +169,7 @@ def main():
         "final_logit_softcapping": float(g("final_logit_softcapping", 0.0)),
         "bos_token_id": int(fields.get("tokenizer.ggml.bos_token_id", 2)),
         # GGUF norm weights already include Gemma 3's +1.
-        "grande_norm_offset": 0.0,
+        "omg_norm_offset": 0.0,
         "grande_source": os.path.basename(a.gguf),
     }
     if arch == "gemma3":

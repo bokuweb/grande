@@ -1,5 +1,5 @@
 """Serve a frozen embedding model + the generic (state, option) head from
-tools/e5_generic.py behind grande's `/v1/systemone` shape, so
+tools/e5_generic.py behind omg's `/v1/systemone` shape, so
 `tools/http_eval.py`, the JevBench harness and the web page can use it
 unchanged.
 

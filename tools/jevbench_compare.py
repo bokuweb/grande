@@ -1,4 +1,4 @@
-"""Rank grande JevBench runs among the published JevBench v1.2 systems on the 231 public items,
+"""Rank omg JevBench runs among the published JevBench v1.2 systems on the 231 public items,
 and estimate a JevBench Score with the official formulas (composite_v12)."""
 import json, sys, math, glob, os
 sys.path.insert(0, sys.argv[1])  # usage: jevbench_compare.py <jevbench checkout> <runs dir with <model>/<tier>/results.jsonl>
@@ -36,7 +36,7 @@ for run in sorted(glob.glob(f'{RUNS}/*/hard/results.jsonl')):
                 if gp: tvds.append(c.tvd(probs, gp, pub[r['task_id']]['labels']))
     if len(pt) < 231: continue
     e, s_, h = acc(pt, tiers['easy']), acc(pt, tiers['standard']), acc(pt, tiers['hard'])
-    rows.append((f'>> grande {M} zero-shot (M4 Metal)', e, s_, h, None))
+    rows.append((f'>> omg {M} zero-shot (M4 Metal)', e, s_, h, None))
     # the official p50/p95 come from the standard+judge run; judge is not public, so standard only
     l = sorted(x for x in lat['standard'] if x is not None)
     p50, p95 = l[len(l) // 2], l[int(len(l) * 0.95)]
@@ -45,7 +45,7 @@ rows.sort(key=lambda r: -Ipub(r[1], r[2], r[3]))
 print(f"{'#':>2} {'system (same 231 public items)':58} {'easy':>5} {'std':>5} {'hard':>5} {'I(pub)':>6} {'I(official)':>11}")
 for n, r in enumerate(rows, 1):
     print(f"{n:2} {r[0]:58} {r[1]*100:5.1f} {r[2]*100:5.1f} {r[3]*100:5.1f} {Ipub(r[1],r[2],r[3]):6.1f} {'' if r[4] is None else f'{r[4]:11.1f}'}")
-print("\nEstimated JevBench Score for grande (official formulas). Judge tier (not public) proxied as standard - 3 pts; speed from the\n"
+print("\nEstimated JevBench Score for omg (official formulas). Judge tier (not public) proxied as standard - 3 pts; speed from the\n"
       "standard tier as our own server (x2 + 0.15 s); cost = hosted-provider estimate for the size class; calibration raw (T = 1).")
 for M, m in mine.items():
     for kind, usd in (('cpu', 0.016 if 'E2B' in M else 0.023),):

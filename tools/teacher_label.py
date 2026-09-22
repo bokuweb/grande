@@ -1,5 +1,5 @@
 """Label synthetic states with a teacher served at /v1/systemone (e.g.
-`grande serve` with Gemma 4 E4B, zero-shot label readout). Writes the same
+`omg serve` with Gemma 4 E4B, zero-shot label readout). Writes the same
 records with `probs` (teacher distribution over the question's options, in
 criteria order) and `labels` (teacher argmax).
 

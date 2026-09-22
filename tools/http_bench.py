@@ -2,7 +2,7 @@
 request file with a cache-busting line prepended to the state (so every
 request is a fresh document), and the sweep reports requests/s, decisions/s,
 latency percentiles and how many requests the server put in one pass
-(`X-Grande-Batch`). Same shape as the vLLM DiffusionGemma read benchmark
+(`X-Omg-Batch`). Same shape as the vLLM DiffusionGemma read benchmark
 (concurrency sweep, three decisions per request, prefix cached).
 
     python tools/http_bench.py --url http://127.0.0.1:8080 --request examples/ticket-ja.json --concurrency 1,4,16,32 --requests 64
@@ -26,8 +26,8 @@ def call(url, body, key):
     t = time.perf_counter()
     with urllib.request.urlopen(req, timeout=600) as r:
         out = json.load(r)
-        batch = int(r.headers.get("X-Grande-Batch", "1"))
-        source = r.headers.get("X-Grande-State", "?")
+        batch = int(r.headers.get("X-Omg-Batch", "1"))
+        source = r.headers.get("X-Omg-State", "?")
     return out, (time.perf_counter() - t) * 1000, batch, source
 
 

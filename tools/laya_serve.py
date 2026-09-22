@@ -1,4 +1,4 @@
-"""Serve a Laya checkpoint through laya-mlx behind grande's `/v1/systemone`
+"""Serve a Laya checkpoint through laya-mlx behind omg's `/v1/systemone`
 shape, so `tools/http_eval.py` and the JevBench harness can score it
 unchanged. Apple Silicon only (MLX).
 

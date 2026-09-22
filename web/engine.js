@@ -1,5 +1,5 @@
-// grande in the browser: transformers.js (ONNX Runtime Web, WebGPU) does the forward
-// pass, the wasm build of grande-core does everything that must match the native
+// omg in the browser: transformers.js (ONNX Runtime Web, WebGPU) does the forward
+// pass, the wasm build of omg-core does everything that must match the native
 // runtime (validation, layout, labels, softmax / temperature / confidence, response).
 //
 //   const engine = await loadEngine({ transformers, model: "gemma-3-1b", onProgress });
@@ -14,13 +14,13 @@
 // runs batched. `calibrate` subtracts the model's prior over the options (the
 // same questions over a content-free state) before the softmax.
 
-import init, * as grande from "./pkg/grande.js";
+import init, * as omg from "./pkg/omg.js";
 import { idbCache } from "./cache.js";
 
 const GEMMA4 = { layout: "label", turn_start: "<|turn>", turn_end: "<turn|>", user: "user", model: "model" };
 
-// The page offers Gemma 4 E2B and E4B on grande's own wgpu engine
-// (crates/grande-wgpu), Q4_0 codes from the vocabulary-pruned GGUFs
+// The page offers Gemma 4 E2B and E4B on omg's own wgpu engine
+// (crates/omg-wgpu), Q4_0 codes from the vocabulary-pruned GGUFs
 // (tools/prune_vocab.py: the same 25k tokens from JGLUE train, kev's suites
 // and the examples for both sizes), repacked by tools/export_wgpu_gguf.py.
 // Zero-shot label readout, state + every question in ONE block-causal
@@ -50,7 +50,7 @@ const GEMMA4 = { layout: "label", turn_start: "<|turn>", turn_end: "<turn|>", us
 // `tools/export_e5.py`) run on this engine too, through `loadE5` below, but
 // are not listed: their (state, option) head never reads a question's
 // instructions, so two noul questions over one state get the same answer.
-// They stay a native option (`grande serve --model <export>`) for question
+// They stay a native option (`omg serve --model <export>`) for question
 // families a head was trained on.
 export const MODELS = {
   "gemma-4-e2b-wgpu-ja": { id: "gemma-4-e2b-wgpu-ja", local: true, hub: "bokuweb/gemma-4-E2B-it-grande-wgpu-ja", kind: "wgpu", readout: "label", manifest: true, dtype: "q4", layout: GEMMA4, size: "1.2 GB", note: "E2B, wgpu engine: one pass, 25k-token vocabulary" },
@@ -63,7 +63,7 @@ export const MODELS = {
 //   { id: "ruri-v3-310m-wgpu", local: true, kind: "e5", manifest: true, dtype: "q8", size: "314 MB" }
 
 const ZWNJ = "‌";
-// Mirror of grande-llama's neutralize_specials: caller text can never tokenize
+// Mirror of omg-llama's neutralize_specials: caller text can never tokenize
 // into a control token, so option boundaries cannot be forged.
 export function neutralize(text) {
   return text.replace(/<(?=[A-Za-z|/])/g, "<" + ZWNJ);
@@ -159,7 +159,7 @@ async function cachedFetch(url, onProgress) {
 // per-layer token table (Gemma 4) is kept in JS and gathered per request.
 async function loadManifest(base, config, onProgress) {
   const manifest = await (await fetch(`${base}manifest.json`)).json();
-  const loader = await grande.WgpuLoader.open(config);
+  const loader = await omg.WgpuLoader.open(config);
   const total = manifest.files.length + (manifest.per_layer_table ? 1 : 0);
   let done = 0;
   for (const file of manifest.files) {
@@ -187,7 +187,7 @@ async function loadManifest(base, config, onProgress) {
 // their ids in the page's tokenizer.
 async function loadLayaManifest(base, config, specials, onProgress) {
   const manifest = await (await fetch(`${base}manifest.json`)).json();
-  const loader = await grande.LayaLoader.open(config, JSON.stringify(specials));
+  const loader = await omg.LayaLoader.open(config, JSON.stringify(specials));
   let done = 0;
   for (const file of manifest.files) {
     const buf = new Uint8Array(await (await cachedFetch(`${base}${file.path}`, onProgress)).arrayBuffer());
@@ -205,7 +205,7 @@ async function loadLayaManifest(base, config, specials, onProgress) {
 // into `E5Loader`.
 async function loadE5Manifest(base, config, onProgress) {
   const manifest = await (await fetch(`${base}manifest.json`)).json();
-  const loader = await grande.E5Loader.open(config);
+  const loader = await omg.E5Loader.open(config);
   let done = 0;
   for (const file of manifest.files) {
     const buf = new Uint8Array(await (await cachedFetch(`${base}${file.path}`, onProgress)).arrayBuffer());
@@ -292,7 +292,7 @@ async function loadLaya({ transformers, spec, onProgress }) {
 async function loadE5({ transformers, spec, onProgress }) {
   const { base, tok } = await resolveBase(transformers, spec, onProgress);
   const configText = await (await fetch(`${base}config.json`)).text();
-  const g = JSON.parse(configText).grande_e5;
+  const g = JSON.parse(configText).omg_e5;
   const encode = (text) => tok.encode(text, { add_special_tokens: false });
   const [cls, sep] = tok.encode("", { add_special_tokens: true });
   if (cls !== g.cls || sep !== g.sep) throw new Error(`${spec.id}: tokenizer specials ${cls}/${sep} do not match config ${g.cls}/${g.sep}`);
@@ -380,8 +380,8 @@ let wasmReady = null;
 // the Hub (a local http.server over a directory of exports while one is being checked).
 export async function loadEngine({ transformers, model = "gemma-3-1b", device = "webgpu", onProgress, modelBase } = {}) {
   // Fetch the wasm with a cache-busting query: GitHub Pages caches for 10 min
-  // and a stale wasm with a fresh grande.js fails at Table.grow.
-  wasmReady ??= init({ module_or_path: new URL(`./pkg/grande_bg.wasm?v=${Date.now()}`, import.meta.url) });
+  // and a stale wasm with a fresh omg.js fails at Table.grow.
+  wasmReady ??= init({ module_or_path: new URL(`./pkg/omg_bg.wasm?v=${Date.now()}`, import.meta.url) });
   await wasmReady;
   const spec = MODELS[model];
   if (!spec) throw new Error(`unknown model ${model}`);
@@ -434,7 +434,7 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
         head = await loadHead(`${base}head.safetensors`);
         const weights = new Uint8Array(await (await cachedFetch(`${base}model.safetensors`, onProgress)).arrayBuffer());
         onProgress?.({ status: "ready" });
-        gpu = await grande.WgpuEngine.load(config, weights, 4096, 256);
+        gpu = await omg.WgpuEngine.load(config, weights, 4096, 256);
       }
       await gpu.warmup();
       // States seen before come back from a RAM copy of their K/V (19 MB per
@@ -467,7 +467,7 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     Object.assign(env, hubEnv);
   }
   const bos = tok.bos_token ?? "<bos>";
-  const LABELS = grande.labels();
+  const LABELS = omg.labels();
   const labelIds = [];
   for (const ch of LABELS) {
     const ids = tok.encode(ch, { add_special_tokens: false });
@@ -560,7 +560,7 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     return { rows, tokens };
   }
 
-  // Shared state: the browser counterpart of grande-llama's resident prefix.
+  // Shared state: the browser counterpart of omg-llama's resident prefix.
   // The state is decoded once into a KV cache and stays resident; every branch
   // then continues from that cache, so the state is never re-read and a second
   // request over the same state skips it entirely. A branch attends to the
@@ -608,7 +608,7 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     return { rows, tokens: tokens + (warm ? 0 : P), forwards: branchTexts.length + (warm ? 0 : 1), warm, state_tokens: P };
   }
 
-  // Tokenize rendered segments one by one (mirror of grande-core's pack): text
+  // Tokenize rendered segments one by one (mirror of omg-core's pack): text
   // segments never parse control tokens, specials resolve to one id, and the
   // wanted positions (each </opt>, then <decide>) are the last token of their
   // segment.
@@ -737,11 +737,11 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
 
   // Contextual calibration (Zhao et al. 2021): the same branches over the
   // content-free state "N/A" give the model's prior over the options, which
-  // grande.answer subtracts in logit space. The prior depends on the question
+  // omg.answer subtracts in logit space. The prior depends on the question
   // alone, so it is cached per rendered branch; a fixed question set over
   // changing states pays for it once. Never runs through `shared`, so the
   // live state stays resident.
-  const CONTENT_FREE = grande.content_free_state();
+  const CONTENT_FREE = omg.content_free_state();
   const baselineCache = new Map();
   async function baselineRows(cfPrefix, branches, mode, contentFree) {
     const keys = branches.map((b) => JSON.stringify([contentFree, b.segments, b.keys]));
@@ -756,7 +756,7 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     return { rows: keys.map((k) => baselineCache.get(k)), forwards, tokens };
   }
 
-  // The branch plan is grande-core's (wasm), the same code as the native
+  // The branch plan is omg-core's (wasm), the same code as the native
   // engine: with `orders` > 1 every Choice / Noul is asked under that many
   // option orders in the same pass and the logits are averaged (position
   // bias out); a Choice with more options than the readout can letter runs
@@ -767,9 +767,9 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     const reqJson = JSON.stringify(request);
     const layoutJson = JSON.stringify(spec.layout);
     const cap = spec.readout === "label" ? labelIds.length : 0;
-    const plan = JSON.parse(grande.plan(reqJson, layoutJson, orders, cap));
+    const plan = JSON.parse(omg.plan(reqJson, layoutJson, orders, cap));
     const contentFree = typeof calibrate === "string" ? calibrate : CONTENT_FREE;
-    const cfPrefix = calibrate ? JSON.parse(grande.plan(JSON.stringify({ ...request, state: contentFree }), layoutJson, orders, cap)).prefix : null;
+    const cfPrefix = calibrate ? JSON.parse(omg.plan(JSON.stringify({ ...request, state: contentFree }), layoutJson, orders, cap)).prefix : null;
     const t0 = performance.now();
     // Baseline first: on a cold state its forwards would otherwise sit
     // between the state and its questions.
@@ -778,7 +778,7 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     const rows = JSON.stringify(r.rows);
     const baseRows = base ? JSON.stringify(base.rows) : undefined;
     // Second pass: the finalists of every grouped Choice (none for most requests).
-    const second = JSON.parse(grande.plan_second(reqJson, layoutJson, orders, cap, rows, temperature, baseRows));
+    const second = JSON.parse(omg.plan_second(reqJson, layoutJson, orders, cap, rows, temperature, baseRows));
     let r2 = null, base2 = null;
     if (second.branches.length) {
       base2 = calibrate ? await baselineRows(cfPrefix, second.branches, mode, contentFree) : null;
@@ -787,7 +787,7 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     const ms = performance.now() - t0;
     const tokens = r.tokens + (base?.tokens ?? 0) + (r2?.tokens ?? 0) + (base2?.tokens ?? 0);
     const forwards = r.forwards + (base?.forwards ?? 0) + (r2?.forwards ?? 0) + (base2?.forwards ?? 0);
-    const out = JSON.parse(grande.answer(reqJson, layoutJson, orders, cap, rows, r2 ? JSON.stringify(r2.rows) : undefined, temperature, spec.id, tokens,
+    const out = JSON.parse(omg.answer(reqJson, layoutJson, orders, cap, rows, r2 ? JSON.stringify(r2.rows) : undefined, temperature, spec.id, tokens,
       baseRows, base2 ? JSON.stringify(base2.rows) : undefined));
     const stateTokens = r.state_tokens ?? tok.encode(segmentsToText(plan.prefix, bos), { add_special_tokens: false }).length;
     const questions = Object.keys(request.questions).length;
@@ -801,6 +801,6 @@ export async function loadEngine({ transformers, model = "gemma-3-1b", device = 
     model, spec, tokenizer: tok, net, device,
     labels: LABELS.slice(0, labelIds.length),
     answer: (request, opts) => enqueue(() => answerNow(request, opts)),
-    render: (request) => JSON.parse(grande.render(JSON.stringify(request), JSON.stringify(spec.layout))),
+    render: (request) => JSON.parse(omg.render(JSON.stringify(request), JSON.stringify(spec.layout))),
   };
 }

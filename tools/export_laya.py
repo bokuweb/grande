@@ -1,5 +1,5 @@
 """Package a Laya checkpoint (ModernBERT / mmBERT encoder + decision head,
-convaiinnovations/laya*) for grande's wgpu engine (crates/grande-wgpu/src/laya.rs),
+convaiinnovations/laya*) for omg's wgpu engine (crates/omg-wgpu/src/laya.rs),
 natively and in the browser.
 
 Weights go to the engine's manifest layout (model::Manifest): f16, or Q8_0
@@ -229,7 +229,7 @@ def main():
 
     special = {k: (tok_cfg[k]["content"] if isinstance(tok_cfg[k], dict) else tok_cfg[k])
                for k in ("cls_token", "sep_token", "pad_token", "mask_token")}
-    cfg = dict(enc_cfg, laya_agent=agent, laya_tokens=special, laya_name=a.name or out.name, grande_laya=1)
+    cfg = dict(enc_cfg, laya_agent=agent, laya_tokens=special, laya_name=a.name or out.name, omg_laya=1)
     json.dump(cfg, open(out / "config.json", "w"), indent=2, ensure_ascii=False)
 
     files = []

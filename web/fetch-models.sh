@@ -16,12 +16,12 @@ LTAG="${3:-laya-v1}"
 LDEST="models/laya-multilingual-wgpu"
 mkdir -p "$LDEST"
 for f in config.json tokenizer.json tokenizer_config.json manifest.json embed.bin enc.bin head.bin; do
-  gh release download "$LTAG" --repo bokuweb/grande --pattern "$f" --output "$LDEST/$f" --clobber \
+  gh release download "$LTAG" --repo bokuweb/omg --pattern "$f" --output "$LDEST/$f" --clobber \
     || { echo "no $LTAG release; skipping the Laya model"; rm -rf "$LDEST"; break; }
 done
 ls -la "$LDEST" 2>/dev/null || true
 
 # The e5 / Ruri v3 embedder exports (releases e5-v1, ruri-v1; tools/export_e5.py)
 # are not fetched: they are not in the page's model list (their head does
-# not read a question's instructions). `grande serve --model <export>`
+# not read a question's instructions). `omg serve --model <export>`
 # still runs them natively; download a release by hand to try one here.

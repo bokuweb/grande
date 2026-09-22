@@ -56,7 +56,7 @@ def field_scalar(f):
     return f.parts[f.data[0]][0]
 
 
-# The label layout's own scaffolding (grande-core render.rs), so its pieces
+# The label layout's own scaffolding (omg-core render.rs), so its pieces
 # survive whatever the corpus happens to contain.
 SCAFFOLD = ["State:\n", "\n\nQuestion: ", "\nA: ", "\nB: ", " — ", "\nAnswer with one letter.", "\nmodel\n", "user\n",
             "\nA: true\nB: false\n", "\nA: 0\nB: 1\nC: 2\nD: 3\nE: 4\n"]

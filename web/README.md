@@ -1,7 +1,7 @@
-# grande web demo
+# omg web demo
 
 Static page: `index.html` + `app.js` + `engine.js` + `cache.js` +
-`presets.js` + `pkg/` (wasm-bindgen output of `crates/grande-web`).
+`presets.js` + `pkg/` (wasm-bindgen output of `crates/omg-web`).
 transformers.js is loaded from jsDelivr; model weights stream from the
 Hugging Face Hub once and are kept in IndexedDB (`cache.js`, plugged in as
 `env.customCache`: Chromium's Cache API rejects the large `.onnx_data`
@@ -10,10 +10,10 @@ stay resident for the page's lifetime, so switching back is instant.
 Nothing is uploaded.
 
 ```bash
-# build the wasm (once per grande-core change)
-cargo build --release -p grande-web --target wasm32-unknown-unknown
-wasm-bindgen --target web --out-dir web/pkg --out-name grande target/wasm32-unknown-unknown/release/grande_web.wasm
-wasm-opt -Oz -o web/pkg/grande_bg.wasm web/pkg/grande_bg.wasm
+# build the wasm (once per omg-core change)
+cargo build --release -p omg-web --target wasm32-unknown-unknown
+wasm-bindgen --target web --out-dir web/pkg --out-name omg target/wasm32-unknown-unknown/release/omg_web.wasm
+wasm-opt -Oz -o web/pkg/omg_bg.wasm web/pkg/omg_bg.wasm
 
 # serve
 python3 -m http.server 8765 --directory web
@@ -21,7 +21,7 @@ open "http://localhost:8765/"
 ```
 
 The page offers three models: `gemma-4-e2b-wgpu-ja` (the default) and
-`gemma-4-e4b-wgpu-ja`, Gemma 4 E2B / E4B on grande's own wgpu engine, and
+`gemma-4-e4b-wgpu-ja`, Gemma 4 E2B / E4B on omg's own wgpu engine, and
 `laya-multilingual-wgpu`, Convai's Laya (mmBERT encoder + decision head,
 docs/laya.md) on the same engine — 180 MB (Q8, 56k-token vocabulary,
 `tools/export_laya.py`), one bidirectional sequence per question, ~50 ms
@@ -32,7 +32,7 @@ with a trained (state, option) head; docs/e5.md, docs/ruri.md; releases
 `e5-v1`, `ruri-v1`) run on the engine too (`kind: "e5"` in engine.js) but
 are not listed: the head never reads a question's instructions, so every
 noul question over one state gets the same answer — they are a native
-option (`grande serve --model <export>`) for question families a head was
+option (`omg serve --model <export>`) for question families a head was
 trained on, not a general System One. The
 Gemma models share the same 25k-token vocabulary, 1.2 GB / 2.5 GB, streamed from the Hugging
 Face repos `bokuweb/gemma-4-E2B-it-grande-wgpu-ja` /
@@ -47,13 +47,13 @@ and vision encoder shards (270 MB for E2B) are never fetched.
 
 What runs where:
 
-- `grande-core` (wasm): request validation, the rendered layout (Gemma 3 and
+- `omg-core` (wasm): request validation, the rendered layout (Gemma 3 and
   Gemma 4 turn markers), the branch plan (`plan` / `plan_second`: option
   orders to average, the group and finalist passes of a Choice with more
   than 52 options), option labels, temperature / softmax / confidence, the
   TypeSafe-shaped response. Same crate as the native runtime, so **Orders**
   in the page is `--orders` and a 77-way Choice runs the same two stages as
-  `grande serve` (the page shows `2-stage N` and the order `spread` per
+  `omg serve` (the page shows `2-stage N` and the order `spread` per
   question).
 - `engine.js`: tokenizes the rendered segments (control tokens in caller text
   are neutralized the same way as native), decodes the state once into a KV
@@ -61,7 +61,7 @@ What runs where:
   reads the label logits and candidate mass. **Calibrate** (on by default)
   runs the same questions over the content-free state `N/A` once (cached per question,
   never through the resident cache) and hands those logits to
-  `grande.answer`, which subtracts them before the softmax — contextual
+  `omg.answer`, which subtracts them before the softmax — contextual
   calibration, the same `--baseline` as native.
 
 Modes:
@@ -82,8 +82,8 @@ Modes:
 The trained pointer model (`grande-270m-ja`, a hidden-state export without
 a KV cache) always runs batched, so it still re-reads the state per question.
 
-`grande-270m-ja-wgpu` is the same checkpoint on grande's own engine
-(`crates/grande-wgpu`, compiled into `pkg/grande_bg.wasm` and run on WebGPU
+`grande-270m-ja-wgpu` is the same checkpoint on omg's own engine
+(`crates/omg-wgpu`, compiled into `pkg/omg_bg.wasm` and run on WebGPU
 through wgpu): state and every question in one forward pass with a
 block-causal mask, no ONNX Runtime. Its files (`config.json`,
 `tokenizer.json`, `head.safetensors`, `model.safetensors` f16, 320 MB) come

@@ -1,13 +1,13 @@
-# grande on JevBench (public items)
+# omg on JevBench (public items)
 
 2026-09-20. [JevBench](https://benchmarkheaven.com/jev-models) is Benchmark
 Heaven's benchmark for Jev-class decision models: 534 decisions per system
 (easy 72, standard 96, judge 146, hard 220), one question per request, scored
-as the geometric mean of Intelligence, Calibration, Speed and Cost. grande is
+as the geometric mean of Intelligence, Calibration, Speed and Cost. omg is
 not on the published v1.2.2 table (21 systems); this is our own run of the
 231 public items with the published harness
 ([fstandhartinger/jevbench](https://github.com/fstandhartinger/jevbench), MIT)
-against `grande serve`, whose `/v1/systemone` the harness's `typesafe`
+against `omg serve`, whose `/v1/systemone` the harness's `typesafe`
 adapter speaks unchanged.
 
 Machine: Apple M4 (base), 16 GB, Metal, llama.cpp backend, zero-shot label
@@ -23,7 +23,7 @@ same 231 items can be compared exactly.
 
 `I(pub)` = 100 × (0.14 easy + 0.28 standard + 0.30 hard) / 0.72, i.e. the
 official Intelligence weights with the judge tier left out. Published rows
-come from `results/v1.2/jevbench-v1.2-per-task.json`; the two grande rows
+come from `results/v1.2/jevbench-v1.2-per-task.json`; the two omg rows
 are ours (`tools/jevbench_compare.py`).
 
 | # | system | easy 48 | std 72 | hard 111 | I(pub) |
@@ -37,14 +37,14 @@ are ours (`tools/jevbench_compare.py`).
 | 7 | djev (diffusion-gemma) | 100.0 | 98.6 | 67.6 | 85.9 |
 | 8 | OpenJev (DiffusionGemma 26B-A4B) | 100.0 | 97.2 | 64.0 | 83.9 |
 | 9 | SemIf (Qwen3.5-4B, zero-shot) | 100.0 | 98.6 | 61.3 | 83.3 |
-| **10** | **grande, Gemma 4 E4B it Q4_0, zero-shot** | **100.0** | **94.4** | **51.4** | **77.6** |
+| **10** | **omg, Gemma 4 E4B it Q4_0, zero-shot** | **100.0** | **94.4** | **51.4** | **77.6** |
 | 11 | system-one-open (Gemma 4 E2B LoRA) | 100.0 | 93.1 | 48.6 | 75.9 |
 | 12 | open-alternative-jev (Qwen3.5-4B) | 100.0 | 83.3 | 56.8 | 75.5 |
 | 13 | Qwen3.8 27B (partial) | 100.0 | 98.6 | 42.3 | 75.4 |
 | 14 | system-one (Qwen3-8B) | 100.0 | 88.9 | 48.6 | 74.3 |
 | 15 | Bespoke Nimble 9B | 100.0 | 93.1 | 36.9 | 71.0 |
 | 16 | jeff (GLiFormer 400M) | 100.0 | 75.0 | 38.7 | 64.8 |
-| **17** | **grande, Gemma 4 E2B it Q4_0 vocab-pruned (1.2 GB), zero-shot** | 97.9 | 73.6 | 34.2 | 61.9 |
+| **17** | **omg, Gemma 4 E2B it Q4_0 vocab-pruned (1.2 GB), zero-shot** | 97.9 | 73.6 | 34.2 | 61.9 |
 | 18 | Laya (ModernBERT-large 421M) | 95.8 | 69.4 | 35.1 | 60.3 |
 | – | laya-multilingual (mmBERT-base 322M) through laya-mlx, our run — see [laya.md](laya.md) | 89.6 | 40.3 | 33.3 | 47.0 |
 | 19 | GLiNER2 (gliner2.5-base) | 97.9 | 63.9 | 36.9 | 59.3 |
@@ -74,7 +74,7 @@ ordinal / routing 1.00.
 
 Hard by family, against the published outcomes of the same items:
 
-| family | n | grande E4B | SemIf | system-one-open | Jev | GPT-5.6 |
+| family | n | omg E4B | SemIf | system-one-open | Jev | GPT-5.6 |
 |---|---|---|---|---|---|---|
 | adversarial | 6 | 0.83 | 0.67 | 0.67 | 1.00 | 1.00 |
 | ambiguous | 7 | 0.57 | 0.71 | 0.43 | 0.86 | 1.00 |
@@ -120,7 +120,7 @@ would be worth).
 The E2B failures were not option-order bias (`/v1/systemone/permute` gives
 the same distribution under both orders). Two things:
 
-- **noul wording.** JevBench sends `criteria: {true: …, false: …}` and grande
+- **noul wording.** JevBench sends `criteria: {true: …, false: …}` and omg
   renders the keys literally (`A: true — Every required condition is
   established…`). Over a policy state that plainly permits the action, E2B
   answers `false` at 0.96; the same state with a plain yes / no question is
@@ -135,8 +135,8 @@ the same distribution under both orders). Two things:
 ## Reading
 
 - JevBench is one question per request over a fresh state every time.
-  grande's packing, resident state and state cache do nothing here; a
-  ranking on it says nothing about the N-questions-per-document case grande
+  omg's packing, resident state and state cache do nothing here; a
+  ranking on it says nothing about the N-questions-per-document case omg
   is built for.
 - For a JevBench submission the model to send is E4B (unpruned, or pruned
   on an English rendered corpus), with a temperature fitted on long-state
@@ -149,7 +149,7 @@ the same distribution under both orders). Two things:
 
 ```bash
 git clone https://github.com/fstandhartinger/jevbench.git
-./target/release/grande serve --model models/gemma-4-E4B-it-Q4_0.gguf --port 8787
+./target/release/omg serve --model models/gemma-4-E4B-it-Q4_0.gguf --port 8787
 cd jevbench && for t in easy original hard; do
   python3 -m jevbench.cli run --tasks datasets/public/$t.jsonl --adapter typesafe \
     --endpoint http://127.0.0.1:8787 --key-env '' --model grande-latest \

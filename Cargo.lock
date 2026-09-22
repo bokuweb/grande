@@ -725,104 +725,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "grande-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "grande-core",
- "grande-eval",
- "grande-llama",
- "grande-server",
- "grande-wgpu",
- "half",
- "indexmap",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "grande-core"
-version = "0.1.0"
-dependencies = [
- "indexmap",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "grande-eval"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "grande-core",
- "indexmap",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "grande-llama"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "encoding_rs",
- "grande-core",
- "llama-cpp-2",
- "llama-cpp-sys-2",
- "tracing",
-]
-
-[[package]]
-name = "grande-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "grande-core",
- "indexmap",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "grande-web"
-version = "0.1.0"
-dependencies = [
- "grande-core",
- "grande-wgpu",
- "indexmap",
- "js-sys",
- "serde",
- "serde_json",
- "wasm-bindgen",
- "wasm-bindgen-futures",
-]
-
-[[package]]
-name = "grande-wgpu"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "futures-channel",
- "grande-core",
- "half",
- "indexmap",
- "pollster",
- "serde",
- "serde_json",
- "tokenizers",
- "wgpu",
-]
-
-[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1322,6 +1224,104 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-foundation",
  "objc2-metal",
+]
+
+[[package]]
+name = "omg-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "half",
+ "indexmap",
+ "omg-core",
+ "omg-eval",
+ "omg-llama",
+ "omg-server",
+ "omg-wgpu",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "omg-core"
+version = "0.1.0"
+dependencies = [
+ "indexmap",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "omg-eval"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "indexmap",
+ "omg-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "omg-llama"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "encoding_rs",
+ "llama-cpp-2",
+ "llama-cpp-sys-2",
+ "omg-core",
+ "tracing",
+]
+
+[[package]]
+name = "omg-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "indexmap",
+ "omg-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "omg-web"
+version = "0.1.0"
+dependencies = [
+ "indexmap",
+ "js-sys",
+ "omg-core",
+ "omg-wgpu",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+]
+
+[[package]]
+name = "omg-wgpu"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "futures-channel",
+ "half",
+ "indexmap",
+ "omg-core",
+ "pollster",
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "wgpu",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 [project]
-name = "grande-train"
+name = "omg-train"
 version = "0.1.0"
-description = "Training side of grande: LoRA + pointer head on Gemma 4 with the packed branch layout."
+description = "Training side of omg: LoRA + pointer head on Gemma 4 with the packed branch layout."
 requires-python = ">=3.12"
 dependencies = [
   "torch>=2.6",
@@ -12,4 +12,4 @@ dependencies = [
 ]
 
 [tool.setuptools]
-packages = ["grande_train"]
+packages = ["omg_train"]

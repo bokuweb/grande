@@ -24,19 +24,19 @@ from huggingface_hub import HfApi
 README = """---
 license: gemma
 base_model: google/gemma-4-{size}-it
-tags: [grande, webgpu, wgpu, gemma4]
+tags: [omg, webgpu, wgpu, gemma4]
 ---
 
 # {repo}
 
 Gemma 4 {size} ({quant} codes from the llama.cpp GGUF, repacked) for
-[grande](https://github.com/bokuweb/grande)'s wgpu engine: state + every
+[omg](https://github.com/bokuweb/omg)'s wgpu engine: state + every
 question in one block-causal forward pass, in the browser on WebGPU or
 natively on Metal / Vulkan. Exported with `tools/export_wgpu_gguf.py`;
 `manifest.json` maps tensors to files. Not a standalone checkpoint format.
 {vocab_note}
 ```bash
-grande probe --model <this directory> --request examples/ticket-ja.json
+omg probe --model <this directory> --request examples/ticket-ja.json
 ```
 """
 
@@ -68,7 +68,7 @@ def main():
     api = HfApi()
     api.create_repo(a.repo, repo_type="model", exist_ok=True, private=a.private)
     api.upload_folder(folder_path=str(d), repo_id=a.repo, repo_type="model",
-                      commit_message="grande wgpu export", allow_patterns=["*.json", "*.bin", "README.md"])
+                      commit_message="omg wgpu export", allow_patterns=["*.json", "*.bin", "README.md"])
     print(f"https://huggingface.co/{a.repo}")
 
 

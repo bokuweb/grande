@@ -1,0 +1,33 @@
+[package]
+name = "omg-wgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "wgpu backend for omg: Gemma 3 / Gemma 4 forward pass in WGSL, one block-causal pass for state + isolated branches, native (Metal / Vulkan) and WebGPU."
+
+[dependencies]
+omg-core = { path = "../omg-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+indexmap.workspace = true
+wgpu = { version = "29", default-features = false, features = ["std", "wgsl"] }
+bytemuck = { version = "1", features = ["derive"] }
+half = "2"
+futures-channel = "0.3"
+tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
+pollster = { version = "1", optional = true }
+
+[dev-dependencies]
+pollster = "1"
+
+[features]
+default = ["native", "laya", "e5"]
+# Laya (ModernBERT / mmBERT encoder + decision head) on the same kernels: laya.rs.
+laya = []
+# multilingual-e5 (BERT encoder, mean pooling) + the (state, option) head: e5.rs.
+e5 = []
+# Backend impl with the HF tokenizer and a blocking evaluate.
+native = ["dep:tokenizers", "dep:pollster", "wgpu/metal", "wgpu/vulkan"]
+web = ["wgpu/webgpu"]
