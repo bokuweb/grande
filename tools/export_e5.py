@@ -1,6 +1,6 @@
 """Package a sentence embedder — multilingual-e5-small (BERT) or Ruri v3
 (ModernBERT-Ja) — plus the (state, option) head of tools/e5_generic.py for
-grande's wgpu engine (crates/grande-wgpu/src/e5.rs), natively and in the
+omg's wgpu engine (crates/omg-wgpu/src/e5.rs), natively and in the
 browser.
 
 Weights go to the engine's manifest layout (model::Manifest): f16, or Q8_0
@@ -19,7 +19,7 @@ matches the full vocabulary). The embedding is 82% of the model, so this
 is what makes it a small download (118M f16: 235 MB -> ~50 MB q8).
 
 Output directory:
-    config.json            HF config + `grande_e5` (head, token ids, temperature, name)
+    config.json            HF config + `omg_e5` (head, token ids, temperature, name)
     tokenizer.json         pruned (or copied) HF tokenizer
     tokenizer_config.json  special_tokens_map.json
     manifest.json          tensor -> file / byte ranges
@@ -143,7 +143,7 @@ def main():
     g = {"name": a.name or out.name, "cls": ids["<s>"], "sep": ids["</s>"], "pad": ids["<pad>"], "prefix": a.prefix,
          "max_len": min(cfg["max_position_embeddings"], 512), "head_in": 4 * d, "head_hidden": int(l1.shape[0]), "temperature": a.temperature,
          "head_source": str(a.head)}
-    json.dump(dict(cfg, vocab_size=vocab, grande_e5=g), open(out / "config.json", "w"), indent=2, ensure_ascii=False)
+    json.dump(dict(cfg, vocab_size=vocab, omg_e5=g), open(out / "config.json", "w"), indent=2, ensure_ascii=False)
 
     files = []
     w = Writer(out / "embed.bin")

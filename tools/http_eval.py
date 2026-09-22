@@ -1,5 +1,5 @@
-"""Score any /v1/systemone server (grande, kev, jev_local, Jev) on JGLUE, or
-time a request file. Same prompts as grande-eval / jev_local.
+"""Score any /v1/systemone server (omg, kev, jev_local, Jev) on JGLUE, or
+time a request file. Same prompts as omg-eval / jev_local.
 
     python tools/http_eval.py --url http://127.0.0.1:8009 --task jnli --limit 300
     python tools/http_eval.py --url http://127.0.0.1:8009 --request examples/ticket-ja.json --repeat 5

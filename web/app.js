@@ -135,7 +135,7 @@ let loading = false;
 function selectModel() {
   const model = $("model").value;
   engine = engines.get(model) ?? null;
-  window.grandeEngine = engine; // for the console
+  window.omgEngine = engine; // for the console
   $("run").disabled = !engine;
   if (engine) {
     setStatus(`${engine.spec.id} loaded (WebGPU, ${engine.spec.dtype})`, null, "ok");

@@ -7,7 +7,7 @@
 //
 // Keys are the request URLs transformers.js uses; values are { blob, headers }.
 
-const DB = "grande-models";
+const DB = "omg-models";
 const STORE = "files";
 
 let dbPromise = null;

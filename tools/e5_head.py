@@ -46,7 +46,7 @@ def ece(conf, ok, bins=10):
 
 
 def fit_temperature(logits, gold):
-    """Minimise NLL over T on a log grid (the same one-scalar fit grande uses)."""
+    """Minimise NLL over T on a log grid (the same one-scalar fit omg uses)."""
     best = (1e9, 1.0)
     for lt in np.linspace(-2.5, 2.5, 501):
         T = math.exp(lt)

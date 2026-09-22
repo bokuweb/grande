@@ -1,6 +1,6 @@
-"""Package a merged (vocab-pruned) grande checkpoint for the wgpu engine:
+"""Package a merged (vocab-pruned) omg checkpoint for the wgpu engine:
 config.json, tokenizer.json / tokenizer_config.json, head.safetensors and
-model.safetensors cast to f16 — the same files serve `grande` natively (a
+model.safetensors cast to f16 — the same files serve `omg` natively (a
 model directory instead of a GGUF) and the browser (fetched into web/models/).
 
     python tools/export_wgpu.py --run runs/grande-270m-12k --out web/models/grande-270m-ja-wgpu

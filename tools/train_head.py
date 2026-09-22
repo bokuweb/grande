@@ -1,4 +1,4 @@
-"""Train a pointer head on hidden states `grande features` extracted, and
+"""Train a pointer head on hidden states `omg features` extracted, and
 write head.safetensors (with `layout` metadata so `--head` picks the same
 layout at inference).
 

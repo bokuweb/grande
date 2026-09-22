@@ -1,0 +1,13 @@
+[package]
+name = "omg-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Decision model core: typed questions in, calibrated probabilities out, one forward pass. Backend-agnostic, no I/O."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+indexmap.workspace = true
+thiserror.workspace = true

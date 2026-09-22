@@ -1,7 +1,7 @@
 """Fine-tune the whole embedding encoder (default multilingual-e5-small) as a
 cross-encoder on one JGLUE task and score it with the protocol of
 tools/e5_head.py. This is the "small model trained on the task" row, the
-counterpart of grande's 270M + LoRA + head, not of the frozen-backbone heads.
+counterpart of omg's 270M + LoRA + head, not of the frozen-backbone heads.
 
     python tools/e5_finetune.py --task jnli --out runs/e5/ft-jnli
     python tools/e5_finetune.py --task jcqa --out runs/e5/ft-jcqa

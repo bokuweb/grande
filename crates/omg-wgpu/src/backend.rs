@@ -1,0 +1,208 @@
+//! Native `Backend`: the HF tokenizer of the checkpoint plus a blocking
+//! `evaluate` over the wgpu engine.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use anyhow::{anyhow, Context};
+use omg_core::{
+    Backend, BranchOutput, BranchTokens, Error, GroupOutput, Limits, PrefixSource, Token, Want,
+};
+use tokenizers::Tokenizer;
+
+use crate::model::{Config, Manifest};
+use crate::{Engine, EngineBuilder, Weights};
+
+pub struct WgpuBackend {
+    engine: Engine,
+    tokenizer: Tokenizer,
+    specials: Mutex<HashMap<String, Token>>,
+}
+
+impl WgpuBackend {
+    /// Load a checkpoint directory: `config.json` + `tokenizer.json` and
+    /// either `manifest.json` with the exported tensor files
+    /// (tools/export_wgpu_gguf.py) or an HF `model.safetensors` (Gemma 3).
+    /// `capacity` is the packed-token budget.
+    pub fn load(dir: &Path, capacity: usize, max_rows: usize) -> anyhow::Result<Self> {
+        let read = |name: &str| {
+            std::fs::read(dir.join(name))
+                .with_context(|| format!("reading {}", dir.join(name).display()))
+        };
+        let tokenizer = Tokenizer::from_bytes(read("tokenizer.json")?)
+            .map_err(|e| anyhow!("tokenizer.json: {e}"))?;
+        let config_json = read("config.json")?;
+        let engine = if dir.join("manifest.json").is_file() {
+            let config =
+                Config::from_json(&serde_json::from_slice(&config_json).context("config.json")?)?;
+            let manifest: Manifest =
+                serde_json::from_slice(&read("manifest.json")?).context("manifest.json")?;
+            let mut b = pollster::block_on(EngineBuilder::new(config))?;
+            for file in &manifest.files {
+                let bytes = read(&file.path)?;
+                for entry in &file.tensors {
+                    let t = entry.tensor(&bytes)?;
+                    b.push(&entry.name, &t)
+                        .with_context(|| format!("{}: {}", file.path, entry.name))?;
+                }
+            }
+            if let Some(entry) = &manifest.per_layer_table {
+                let path = entry
+                    .path
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("manifest: per_layer_table has no path"))?;
+                let bytes = read(path)?;
+                b.set_per_layer_table(entry.tensor(&bytes)?)?;
+            }
+            b.finish(capacity, max_rows)?
+        } else {
+            let weights = Weights::load(&config_json, &read("model.safetensors")?)?;
+            pollster::block_on(Engine::new(&weights, capacity, max_rows))?
+        };
+        pollster::block_on(engine.warmup())?;
+        // The state cache is off until `set_state_cache`; warmup's two-token
+        // prefix is therefore never saved.
+        Ok(WgpuBackend {
+            engine,
+            tokenizer,
+            specials: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub fn engine(&self) -> &Engine {
+        &self.engine
+    }
+
+    /// Keep the states of prefixes seen before: a RAM LRU of `bytes` and a
+    /// file per state in `dir`. The checkpoint directory's name and the
+    /// byte size of its tensor files identify the model in the files.
+    pub fn set_state_cache(&mut self, dir_path: &Path, bytes: usize, dir: Option<PathBuf>) {
+        let size: u64 = std::fs::read_dir(dir_path)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
+                    .filter_map(|e| e.metadata().ok())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .unwrap_or(0);
+        let name = dir_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("wgpu");
+        self.engine
+            .set_state_cache(bytes, dir, &format!("{name}:{size}"));
+    }
+}
+
+fn core_err(e: anyhow::Error) -> Error {
+    Error::Backend(format!("{e:#}"))
+}
+
+/// Break `<name>`-style control-token surface forms in caller text (same
+/// rule as the llama.cpp backend): the tokenizer matches added tokens
+/// anywhere in the text, so a zero-width non-joiner after `<` keeps user
+/// text from forging a delimiter.
+fn neutralize_specials(text: &str) -> String {
+    if !text.contains('<') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c == '<' {
+            if let Some(&n) = chars.peek() {
+                if n.is_ascii_alphabetic() || n == '|' || n == '/' {
+                    out.push('\u{200c}');
+                }
+            }
+        }
+    }
+    out
+}
+
+impl Backend for WgpuBackend {
+    fn tokenize(&self, text: &str) -> omg_core::Result<Vec<Token>> {
+        if text.is_empty() {
+            return Ok(Vec::new());
+        }
+        let enc = self
+            .tokenizer
+            .encode(neutralize_specials(text), false)
+            .map_err(|e| Error::Backend(format!("tokenize: {e}")))?;
+        Ok(enc.get_ids().iter().map(|&i| Token(i as i32)).collect())
+    }
+
+    fn special(&self, name: &str) -> omg_core::Result<Token> {
+        if let Some(t) = self.specials.lock().unwrap().get(name) {
+            return Ok(*t);
+        }
+        let id = self
+            .tokenizer
+            .token_to_id(name)
+            .ok_or_else(|| Error::Backend(format!("{name:?} is not a token in this vocabulary")))?;
+        let t = Token(id as i32);
+        self.specials.lock().unwrap().insert(name.to_string(), t);
+        Ok(t)
+    }
+
+    fn bos(&self) -> Token {
+        Token(self.engine.config.bos as i32)
+    }
+
+    fn n_embd(&self) -> usize {
+        self.engine.config.d
+    }
+
+    fn n_vocab(&self) -> usize {
+        self.engine.config.vocab
+    }
+
+    fn evaluate(
+        &mut self,
+        prefix: &[Token],
+        branches: &[BranchTokens],
+        want: Want,
+    ) -> omg_core::Result<Vec<BranchOutput>> {
+        let prefix: Vec<u32> = prefix.iter().map(|t| t.0 as u32).collect();
+        pollster::block_on(self.engine.evaluate(&prefix, branches, want)).map_err(core_err)
+    }
+
+    fn evaluate_many(
+        &mut self,
+        groups: &[omg_core::Group<'_>],
+        want: Want,
+    ) -> omg_core::Result<Vec<GroupOutput>> {
+        let prefixes: Vec<Vec<u32>> = groups
+            .iter()
+            .map(|g| g.prefix.iter().map(|t| t.0 as u32).collect())
+            .collect();
+        let groups: Vec<crate::Group<'_>> = groups
+            .iter()
+            .zip(&prefixes)
+            .map(|(g, p)| crate::Group {
+                prefix: p,
+                branches: g.branches,
+            })
+            .collect();
+        pollster::block_on(self.engine.evaluate_groups(&groups, want)).map_err(core_err)
+    }
+
+    fn limits(&self) -> Limits {
+        Limits {
+            tokens: self.engine.capacity,
+            sequences: usize::MAX,
+            rows: self.engine.max_rows,
+        }
+    }
+
+    fn prefix_source(&self) -> Option<PrefixSource> {
+        self.engine.prefix_source()
+    }
+
+    fn evict_resident(&mut self) {
+        self.engine.evict_resident();
+    }
+}

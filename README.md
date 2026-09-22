@@ -1,4 +1,4 @@
-# grande
+# omg
 
 A System One style decision model runtime in Rust. State in, typed questions
 in, calibrated probabilities out, **one forward pass, no text generation**.
@@ -7,58 +7,58 @@ TypeSafe's [Jev](https://docs.typesafe.ai/) defines the contract; the
 architecture follows Archer Hume's reconstruction and
 [jaredpalmer/kev](https://github.com/jaredpalmer/kev): a shared state prefix,
 one isolated branch per question, a readout at each branch's answer position.
-grande targets Japanese, Gemma 4, quantized local inference, and (later) the
+omg targets Japanese, Gemma 4, quantized local inference, and (later) the
 browser. Design notes live in `life/idea/local-jev`.
 
-**Demo:** https://bokuweb.github.io/grande/ (WebGPU; nothing leaves the browser).
-Gemma 4 E2B or E4B zero-shot on grande's own wgpu engine with a 25k-token
+**Demo:** https://bokuweb.github.io/omg/ (WebGPU; nothing leaves the browser).
+Gemma 4 E2B or E4B zero-shot on omg's own wgpu engine with a 25k-token
 vocabulary: 1.2 GB / 2.5 GB streamed from the Hub once and cached in the
 browser, 5 questions over a 90-token state in ~1.1 s (E2B) / ~2.5 s (E4B)
 on an M4.
 
 ## Status
 
-- [x] `grande-core`: TypeSafe-shaped request/response, renderer (label and
+- [x] `omg-core`: TypeSafe-shaped request/response, renderer (label and
       pointer layouts), label readout, pointer head math, temperature
       scaling, ECE / Brier / NLL. No I/O, no backend dependency.
-- [x] `grande-llama`: llama.cpp backend. Prefix decoded once into seq 0,
+- [x] `omg-llama`: llama.cpp backend. Prefix decoded once into seq 0,
       every branch gets the prefix by `llama_memory_seq_cp` (zero copy) and
       all branches are decoded in one batch. Logits or hidden states at
       requested positions only.
-- [x] `grande` CLI: `probe` (packed / separate / check, `--head`), `jglue`,
+- [x] `omg` CLI: `probe` (packed / separate / check, `--head`), `jglue`,
       `serve`, `bench`, `render`, `tokens`, `pieces`, `meta`.
 - [x] pointer-head weights loader (`head.safetensors`, no deps).
-- [x] `grande-server`: axum, `POST /v1/systemone`, `/separate`, `/permute`,
-      `GET /v1/models`, `/health`, bearer auth, 422 `detail[]`, `X-Grande-*` headers.
-- [x] `grande-eval`: JGLUE JNLI / JCommonsenseQA, temperature fit on the
+- [x] `omg-server`: axum, `POST /v1/systemone`, `/separate`, `/permute`,
+      `GET /v1/models`, `/health`, bearer auth, 422 `detail[]`, `X-Omg-*` headers.
+- [x] `omg-eval`: JGLUE JNLI / JCommonsenseQA, temperature fit on the
       even half, accuracy / NLL / Brier / ECE / confident-error rate,
       `--permute` flip rate.
-- [x] `python/grande_train`: LoRA + pointer head with the same layout
-      (token-for-token parity with `grande render` verified), merge → GGUF →
+- [x] `python/omg_train`: LoRA + pointer head with the same layout
+      (token-for-token parity with `omg render` verified), merge → GGUF →
       served by the Rust runtime. Smoke-tested on Gemma 3 270M (MPS).
 - [x] trained 270M heads (3k / 12k records, 18 and 12 layers), vocab-pruned
       to 323 / 256 MB.
 - [ ] trained Gemma 4 base weights (E2B base is 10 GB bf16; needs more than a
       16 GB laptop or a rented GPU)
-- [x] `grande mechanism`: isolation, packed vs separate, boundary forgery.
-- [x] browser demo (`web/`): `grande-core` as wasm + transformers.js on
+- [x] `omg mechanism`: isolation, packed vs separate, boundary forgery.
+- [x] browser demo (`web/`): `omg-core` as wasm + transformers.js on
       WebGPU, Gemma 3 270M / 1B and Gemma 4 E2B ONNX.
 - [x] trained pointer head in the browser: `tools/export_browser.py` (ONNX
       q8, pruned embedding rows, id map), served from a GitHub release.
-- [x] `grande suite` (kev-style frozen suites), `tools/http_eval.py`
+- [x] `omg suite` (kev-style frozen suites), `tools/http_eval.py`
       (any `/v1/systemone` server), `tools/prune_vocab.py`.
 - [x] JevBench public items through the published harness against
-      `grande serve` (`tools/jevbench_compare.py`, [docs/jevbench.md](docs/jevbench.md)).
+      `omg serve` (`tools/jevbench_compare.py`, [docs/jevbench.md](docs/jevbench.md)).
 - [x] unified KV cache; resident prefix across requests over the same state.
 - [x] state cache: the KV of every state seen is kept serialized (RAM LRU,
       `--state-cache-dir` for disk), so coming back to a document is a 2–10 ms
       restore instead of a prefill, across requests and restarts.
 - [x] browser: state decoded once and resident, questions continue from its
       KV cache (`shared` mode); no state re-reading.
-- [x] `grande-wgpu`: our own Gemma 3 / Gemma 4 forward pass in WGSL — state
+- [x] `omg-wgpu`: our own Gemma 3 / Gemma 4 forward pass in WGSL — state
       + every branch in one block-causal pass, native (Metal / Vulkan) and
       WebGPU from the same kernels. Parity with llama.cpp on the trained 270M
-      and on E2B / E4B Q4_0; `grande --model <checkpoint dir>` and the
+      and on E2B / E4B Q4_0; `omg --model <checkpoint dir>` and the
       `gemma-4-e2b-wgpu-ja` / `gemma-4-e4b-wgpu-ja` browser models (1.2 GB /
       2.5 GB after vocabulary pruning).
       The last state's K/V stays resident: a request over the same state
@@ -67,7 +67,7 @@ on an M4.
       every state seen is kept serialized (f16, sliding layers window-only:
       19 MB per 2,000 tokens; RAM LRU, `--state-cache-dir` files natively,
       RAM in the browser) so coming back to one is a ~50 ms restore.
-- [x] `grande jglue --shots N` (few-shot from the train split), `grande
+- [x] `omg jglue --shots N` (few-shot from the train split), `omg
       features` + `tools/train_head.py`: a pointer head on the frozen,
       quantized E2B / E4B read through the zero-shot chat prompt
       (`gemma_label_pointer`), trained on the engine's own hidden states.
@@ -80,7 +80,7 @@ on an M4.
 - [x] state rendered as `path: value` lines (`ticket.messages[0].text: …`),
       so questions can point at nested fields and conversation arrays the
       way TypeSafe's docs do; Python renderer mirrors it.
-- [x] `grande iia`: kev's IIA test (log-odds shift from one irrelevant
+- [x] `omg iia`: kev's IIA test (log-odds shift from one irrelevant
       option) on JGLUE JCQA and kev's suite.
 - [x] Laya on the wgpu engine ([docs/laya.md](docs/laya.md)): Convai's
       encoder + decision head (mmBERT-base, 322M) behind the same
@@ -88,7 +88,7 @@ on an M4.
       per question, all questions in one pass, the scorer's `[MASK]` rows
       read on the host. Same answers as laya-mlx (JNLI 0.702 at 18 ms
       native, 3 questions in 51 ms in the browser, Q8 + 56k-token
-      vocabulary = 180 MB). `grande serve --model <laya dir>` picks it by
+      vocabulary = 180 MB). `omg serve --model <laya dir>` picks it by
       the checkpoint's files; `tools/export_laya.py` packs it for the
       browser; `laya-multilingual-wgpu` in the demo's model list.
 - [x] multilingual-e5-small on the wgpu engine ([docs/e5.md](docs/e5.md)):
@@ -99,7 +99,7 @@ on an M4.
       on the GPU too. Same answers as the PyTorch shim (JNLI 0.712 / JCQA
       0.615 on the full valid split), 10 ms for the 5-question ticket
       natively, 34 ms in the browser, Q8 + 76k-piece vocabulary = 58 MB.
-      `grande serve --model <e5 export>` picks it by `config.json`;
+      `omg serve --model <e5 export>` picks it by `config.json`;
       `tools/export_e5.py` packs it. Not in the demo's model list: the
       head never reads a question's instructions (see below).
 - [x] Ruri v3 on the wgpu engine ([docs/ruri.md](docs/ruri.md)): the
@@ -158,12 +158,12 @@ Prompts are jev_local's, so the numbers compare across runtimes.
 The instruct model is badly overconfident on NLI (mean confidence 0.86 at
 61% accuracy; 41% of its ≥0.9 answers are wrong) and one temperature
 removes most of it. Commonsense QA is already calibrated. Timings were taken
-while other GPU jobs ran; see `grande bench` for clean numbers.
+while other GPU jobs ran; see `omg bench` for clean numbers.
 
-Mechanism tests (`grande mechanism`): isolation sibling 0.098 / absent 0.098 /
+Mechanism tests (`omg mechanism`): isolation sibling 0.098 / absent 0.098 /
 state 0.996, packed vs separate 3.5e-4, forged delimiters add no options.
 
-IIA (`grande iia`, kev's test): one irrelevant option is appended to a
+IIA (`omg iia`, kev's test): one irrelevant option is appended to a
 3–10-way Choice ("紫 — 紫という色", "税金 — 無関係：四半期の税務申告", …)
 and the log-odds between the original top-2 options are compared before
 and after. A model that reads the options against the state should not
@@ -189,18 +189,18 @@ should close it, once a Gemma 4 head is trained.
 ```bash
 cd python && uv venv --python 3.13 .venv && source .venv/bin/activate
 uv pip install torch transformers peft safetensors numpy gguf sentencepiece
-python -m grande_train.train --base unsloth/gemma-3-270m \
+python -m omg_train.train --base unsloth/gemma-3-270m \
   --jnli ../.cache/jglue/jnli-train.jsonl --jcqa ../.cache/jglue/jcommonsenseqa-train.jsonl \
   --n-per-source 1500 --epochs 2 --out ../runs/grande-270m
-python -m grande_train.merge --base unsloth/gemma-3-270m --run ../runs/grande-270m --out ../runs/grande-270m/merged
+python -m omg_train.merge --base unsloth/gemma-3-270m --run ../runs/grande-270m --out ../runs/grande-270m/merged
 PYTHONPATH=/path/to/llama.cpp python /path/to/llama.cpp/convert_hf_to_gguf.py ../runs/grande-270m/merged \
   --outfile ../runs/grande-270m/grande-270m-f16.gguf --outtype f16
-cd .. && ./target/release/grande jglue --model runs/grande-270m/grande-270m-f16.gguf \
+cd .. && ./target/release/omg jglue --model runs/grande-270m/grande-270m-f16.gguf \
   --head runs/grande-270m/head.safetensors --task jnli --out runs/eval-270m-jnli
 ```
 
 The renderer is defined twice (Rust for serving, Python for training) on
-purpose; `grande render` dumps token ids and `grande_train.render.check_parity`
+purpose; `omg render` dumps token ids and `omg_train.render.check_parity`
 compares, so drift is caught before a model is trained on the wrong bytes.
 
 ## Comparison with kev, reflex, Jev
@@ -219,7 +219,7 @@ See [docs/comparison.md](docs/comparison.md). Short version, same M4:
   trained decision head): its multilingual checkpoint beats zero-shot E2B
   on JNLI (0.702 vs 0.614 at 18 ms) and loses everywhere knowledge is
   needed (JCQA 0.551 vs 0.853; JevBench standard 40.3 vs 73.6 / 94.4). It
-  now runs on grande's own wgpu engine, natively and in the browser, as a
+  now runs on omg's own wgpu engine, natively and in the browser, as a
   fast tier next to E2B / E4B: [docs/laya.md](docs/laya.md).
 
 - [multilingual-e5-small](https://huggingface.co/intfloat/multilingual-e5-small)
@@ -239,13 +239,13 @@ See [docs/comparison.md](docs/comparison.md). Short version, same M4:
   41 ms (E2B ~700 ms) — for the question families its head was trained
   on; the head does not read instructions: [docs/ruri.md](docs/ruri.md).
 
-- Japanese (JGLUE): grande E2B zero-shot JNLI 0.614 / JCQA 0.853; kev-0.5b
-  0.450 / 0.577; a 270M grande head trained on 12k records **0.710 / 0.710**
+- Japanese (JGLUE): omg E2B zero-shot JNLI 0.614 / JCQA 0.853; kev-0.5b
+  0.450 / 0.577; a 270M omg head trained on 12k records **0.710 / 0.710**
   at 73–77 ms per record, and a 12-layer vocab-pruned 256 MB version
   0.685 / 0.630 at 26–34 ms.
-- kev's English suite (identical questions): kev 0.797, Jev 0.808, grande
+- kev's English suite (identical questions): kev 0.797, Jev 0.808, omg
   E2B zero-shot 0.678 (banking77, two-stage, 0.575).
-- Browser, same 5-question Japanese ticket: grande E2B 2.8 s cold / 2.5 s
+- Browser, same 5-question Japanese ticket: omg E2B 2.8 s cold / 2.5 s
   with the state resident (was 4.2 s re-reading the state per question) and
   all 5 right; reflex 0.8B 6.7 s cold / 3.5 s warm and 3 of 5 wrong.
 - Vocabulary pruning cuts E2B Q4_0 from 2,841 MB to 1,247 MB with no JGLUE
@@ -266,7 +266,7 @@ mkdir -p models && curl -L -o models/gemma-4-E2B-it-Q4_0.gguf \
   https://huggingface.co/ggml-org/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_0.gguf
 
 cargo build --release            # Metal on macOS; --features cuda / vulkan elsewhere
-./target/release/grande probe --model models/gemma-4-E2B-it-Q4_0.gguf \
+./target/release/omg probe --model models/gemma-4-E2B-it-Q4_0.gguf \
   --request examples/ticket-ja.json --mode check
 ```
 
@@ -275,18 +275,18 @@ packed and per-question passes and reports the largest probability
 difference.
 
 ```bash
-./target/release/grande serve --model models/gemma-4-E2B-it-Q4_0.gguf \
+./target/release/omg serve --model models/gemma-4-E2B-it-Q4_0.gguf \
   --state-cache-mb 512 --state-cache-dir .cache/states
 
 # Laya (encoder + decision head) on the wgpu engine: a Hub snapshot of
 # aac6fef/laya-multilingual-mlx or convaiinnovations/laya-multilingual, or a
 # tools/export_laya.py directory. Same API; ~20 ms a question on an M4.
-./target/release/grande serve --model ~/.cache/huggingface/hub/models--aac6fef--laya-multilingual-mlx/snapshots/<rev>
+./target/release/omg serve --model ~/.cache/huggingface/hub/models--aac6fef--laya-multilingual-mlx/snapshots/<rev>
 
 # multilingual-e5-small or Ruri v3 + the trained (state, option) head on the
 # wgpu engine: a tools/export_e5.py directory. Same API; 10-40 ms a request on an M4.
-./target/release/grande serve --model web/models/multilingual-e5-small-wgpu
-./target/release/grande serve --model web/models/ruri-v3-310m-wgpu
+./target/release/omg serve --model web/models/multilingual-e5-small-wgpu
+./target/release/omg serve --model web/models/ruri-v3-310m-wgpu
 ```
 
 `--baseline` (probe, serve, jglue) turns on contextual calibration: every
@@ -323,14 +323,14 @@ The server keeps the current state resident and every other state it has
 seen serialized: an LRU in RAM (`--state-cache-mb`, 512 MB ≈ 55k tokens of
 E2B state) and, with `--state-cache-dir`, a file per state keyed by model
 and token ids, so a document answered before a restart still restores in
-milliseconds. The `X-Grande-State` response header says which path a
-request took: `resident`, `ram`, `disk` or `decoded`. `grande bench`
+milliseconds. The `X-Omg-State` response header says which path a
+request took: `resident`, `ram`, `disk` or `decoded`. `omg bench`
 reports the restore (`restored_ms`, `restored_from`) next to cold and warm.
 
 `serve` takes a GGUF (llama.cpp) or a wgpu checkpoint directory. Requests
 that arrive while the engine is busy are queued and then handed to it
 together (`--max-batch`, default 32): each keeps its own response and its
-own error, and `X-Grande-Batch` says how many shared the pass. On the wgpu
+own error, and `X-Omg-Batch` says how many shared the pass. On the wgpu
 engine a batch is literally one forward pass over every request's state and
 branches, isolated from each other exactly as branches are; on llama.cpp
 the requests run one after the other unless `--llama-batch` is given (one
@@ -342,13 +342,13 @@ server with a fresh state per request and checks the answers agree.
 ## Layout
 
 ```
-crates/grande-core    types, renderer, readout, math, calibration, Backend trait
-crates/grande-llama   llama-cpp-2 backend
-crates/grande-wgpu    wgpu backend: Gemma 3 / Gemma 4 in WGSL, native and WebGPU;
+crates/omg-core    types, renderer, readout, math, calibration, Backend trait
+crates/omg-llama   llama-cpp-2 backend
+crates/omg-wgpu    wgpu backend: Gemma 3 / Gemma 4 in WGSL, native and WebGPU;
                       laya.rs: ModernBERT / mmBERT + Laya's decision head on the same kernels;
                       e5.rs: multilingual-e5 (BERT) / Ruri v3 (ModernBERT) + the (state, option) head
-crates/grande-web     wasm surface for the browser demo (+ the wgpu engine)
-crates/grande-cli     `grande` binary
+crates/omg-web     wasm surface for the browser demo (+ the wgpu engine)
+crates/omg-cli     `omg` binary
 examples/             request files
 ```
 
@@ -361,7 +361,7 @@ not a prefix + branches model at all.
 
 ## The wgpu engine
 
-`crates/grande-wgpu` implements that contract without a third-party
+`crates/omg-wgpu` implements that contract without a third-party
 runtime: nine WGSL kernels (embedding, RMSNorm, matmul and gated MLP over
 f16 / Q8_0 / Q4_0 weights, a skinny logits projection, q/k norm + RoPE,
 block-causal attention, and the two Gemma 4 per-layer-embedding steps) and
@@ -376,12 +376,12 @@ padding, no runtime constraint on batching a continuation.
 # package a trained run for it (config, tokenizer, head, f16 safetensors)
 python tools/export_wgpu.py --run runs/grande-270m-12k --out web/models/grande-270m-ja-wgpu
 # a directory instead of a GGUF selects the engine
-./target/release/grande probe --model web/models/grande-270m-ja-wgpu \
+./target/release/omg probe --model web/models/grande-270m-ja-wgpu \
   --head runs/grande-270m-12k/head.safetensors --request examples/ticket-ja.json
 
 # Gemma 4 E2B / E4B: repack the llama.cpp GGUF (Q4_0 / Q8_0 codes kept as they are)
 python tools/export_wgpu_gguf.py models/gemma-4-E2B-it-Q4_0.gguf --out models/gemma-4-e2b-wgpu-q4
-./target/release/grande probe --model models/gemma-4-e2b-wgpu-q4 --request examples/ticket-ja.json
+./target/release/omg probe --model models/gemma-4-e2b-wgpu-q4 --request examples/ticket-ja.json
 python tools/export_wgpu_gguf.py models/gemma-4-E4B-it-Q4_0.gguf --out models/gemma-4-e4b-wgpu-q4
 ```
 
@@ -399,7 +399,7 @@ attention: one K/V head on the 270M and E2B, two on E4B (8 query heads,
 All match llama.cpp: the 270M to ~5e-4 in probability on the ticket and
 isolation examples, E2B on the same Q4_0 weights to ≤ 5e-4 (ticket,
 isolation, contract), E4B to ≤ 7e-5 (ticket, isolation).
-`crates/grande-wgpu/tests/reference.rs` checks the shaders against a
+`crates/omg-wgpu/tests/reference.rs` checks the shaders against a
 plain-Rust forward on random models of all three shapes with f16, Q8 and
 Q4 weights.
 
@@ -426,12 +426,12 @@ differently with `true` listed first or second (on the ticket example,
 suite, serve) asks every Choice and Noul under N option orders — the
 identity, its rotations, then their reversals — as extra branches of the
 same pass and averages the option logits, so the state is still read once.
-`order_spread` in the diagnostics (`X-Grande-Order-Spread-Max` from the
+`order_spread` in the diagnostics (`X-Omg-Order-Spread-Max` from the
 server) is the largest |Δp| any option showed between two orders, i.e. the
 bias that was averaged out. Score levels are never permuted.
 
 JGLUE valid, first 300 records, E2B Q4_0, label readout, no temperature
-(`grande jglue --limit 300 [--orders 3]`):
+(`omg jglue --limit 300 [--orders 3]`):
 
 | | JNLI acc | JNLI ECE | JNLI NLL | JCQA acc | JCQA ECE | JCQA NLL | ms / record |
 |---|---|---|---|---|---|---|---|
@@ -450,7 +450,7 @@ DiffusionGemma-as-Jev: a second read only when the first is uncertain).
 Every question is asked once in the first pass; the ones whose confidence
 (1 − H/ln k) comes back below τ are re-asked under the other N−1 orders in
 a second pass, and their logits are averaged as usual. `rechecked` in the
-diagnostics (`X-Grande-Rechecked`) names them. JNLI valid, first 300, E2B
+diagnostics (`X-Omg-Rechecked`) names them. JNLI valid, first 300, E2B
 Q4_0 pruned, label readout:
 
 | | records re-asked | branches | acc | ECE raw | ECE with T (odd half) | ms / record |
@@ -474,7 +474,7 @@ pass, the top options of every group (as many as fit under 52 together)
 are asked once more against each other in a second pass, and the answer's
 probabilities are the second pass's, with the eliminated options at 0.
 `two_stage` in the diagnostics lists the finalists. The browser demo runs
-both through the same code (`grande-core::plan` via wasm: **Orders** in the
+both through the same code (`omg-core::plan` via wasm: **Orders** in the
 page; a 77-way Choice takes two passes there too). On kev's banking77
 (77 intents) this scores 0.575 zero-shot against kev 0.800 / Jev 0.838;
 the group stage loses the gold intent in 6 of 80 records, the rest are
@@ -485,7 +485,7 @@ pointer readout has no cap and never needs this.
 
 What moves the zero-shot numbers, measured on the same first 400 records of
 JGLUE valid (E2B Q4_0, label readout, no temperature: JNLI 0.575, JCQA
-0.855). `grande jglue --limit 400 [--orders N] [--shots N]`:
+0.855). `omg jglue --limit 400 [--orders N] [--shots N]`:
 
 | | JNLI acc | JNLI ECE | JCQA acc | JCQA ECE | ms / record |
 |---|---|---|---|---|---|
@@ -536,11 +536,11 @@ base model never saw; the head is two `d → 256` affine maps in
 
 ```bash
 # hidden states of the train split, 2 shuffled option orders per record (F16 safetensors, ~0.5 GB / 6k)
-./target/release/grande features --model models/gemma-4-E2B-it-Q4_0.gguf --task jnli --limit 6000 --out runs/feat/e2b-jnli.safetensors
-./target/release/grande features --model models/gemma-4-E2B-it-Q4_0.gguf --task jcqa --limit 4000 --out runs/feat/e2b-jcqa.safetensors
+./target/release/omg features --model models/gemma-4-E2B-it-Q4_0.gguf --task jnli --limit 6000 --out runs/feat/e2b-jnli.safetensors
+./target/release/omg features --model models/gemma-4-E2B-it-Q4_0.gguf --task jcqa --limit 4000 --out runs/feat/e2b-jcqa.safetensors
 # the head trains in seconds on the cached rows (last 10% of records held out for model selection)
 python tools/train_head.py --features runs/feat/e2b-jnli.safetensors runs/feat/e2b-jcqa.safetensors --out runs/head-e2b
-./target/release/grande jglue --model models/gemma-4-E2B-it-Q4_0.gguf --head runs/head-e2b/head.safetensors --task jnli --out runs/eval-head-jnli
+./target/release/omg jglue --model models/gemma-4-E2B-it-Q4_0.gguf --head runs/head-e2b/head.safetensors --task jnli --out runs/eval-head-jnli
 ```
 
 Extraction runs at ~0.7 s per record on the M4 (the second order reuses

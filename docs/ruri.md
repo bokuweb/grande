@@ -1,4 +1,4 @@
-# Ruri v3 next to grande
+# Ruri v3 next to omg
 
 2026-09-21. [Ruri v3](https://huggingface.co/cl-nagoya/ruri-v3-130m)
 (Nagoya University, Apache-2.0) is a family of Japanese sentence-embedding
@@ -24,7 +24,7 @@ size, then the fine-tunes; `frozen` for the first part only),
 `tools/e5_table.py` prints the rows.
 Latency is PyTorch fp16 on MPS at batch 1, tokenisation included, which
 is launch-bound (a 25-layer model at 24 ms and a 19-layer one at 31 ms
-are the same number: the run-to-run noise of that runtime); on grande's
+are the same number: the run-to-run noise of that runtime); on omg's
 wgpu engine the 30m / 70m would sit where e5-small does, ~10 ms a request.
 
 ## JNLI (odd half, n = 1,217)
@@ -48,8 +48,8 @@ wgpu engine the 30m / 70m would sit where e5-small does, ~10 ms a request.
 | e5-small `both-mlp` ([e5.md](e5.md)) | 0.759 | 0.025 → 0.042 | 0.587 → 0.583 | 1.22 | 0.743 / 0.064 | 20 |
 | e5-small `ft` | 0.831 | 0.026 → 0.020 | 0.448 → 0.448 | 0.94 | 0.835 / 0.050 | 22 |
 | laya-multilingual | 0.702 | 0.207 → 0.046 | 1.188 → 0.745 | 2.83 | 0.670 / 0.242 | 18 |
-| grande E2B zero-shot | 0.614 | 0.252 → 0.088 | 1.255 → 0.949 | 2.81 | 0.575 / – | 754 |
-| grande E2B + trained pointer head | – | | | | **0.848** / 0.056 | 421 |
+| omg E2B zero-shot | 0.614 | 0.252 → 0.088 | 1.255 → 0.949 | 2.81 | 0.575 / – | 754 |
+| omg E2B + trained pointer head | – | | | | **0.848** / 0.056 | 421 |
 
 ## JCommonsenseQA (odd half, n = 559)
 
@@ -72,8 +72,8 @@ wgpu engine the 30m / 70m would sit where e5-small does, ~10 ms a request.
 | e5-small `both-mlp` | 0.662 | 0.051 → 0.027 | 0.916 → 0.895 | 1.23 | 0.657 / 0.065 | 19 |
 | e5-small `ft` | 0.671 | 0.075 → 0.048 | 0.850 → 0.830 | 1.23 | 0.635 / 0.095 | 19 |
 | laya-multilingual | 0.551 | 0.041 → 0.043 | 1.177 → 1.173 | 1.23 | 0.5225 / 0.066 | 21 |
-| grande E2B zero-shot | 0.853 | 0.044 → 0.046 | 0.447 → 0.438 | 1.19 | 0.855 / 0.046 | 702 |
-| grande E4B zero-shot | – | | | | **0.932** / 0.017 | 735 |
+| omg E2B zero-shot | 0.853 | 0.044 → 0.046 | 0.447 → 0.438 | 1.19 | 0.855 / 0.046 | 702 |
+| omg E4B zero-shot | – | | | | **0.932** / 0.017 | 735 |
 
 Prefix (ruri-v3-30m, frozen heads): `トピック: ` instead of `""` gives
 JNLI `cos` 0.612 / `sep-mlp` 0.704 / `pair-lr` 0.740 / `both-mlp` 0.754
@@ -135,7 +135,7 @@ and could be trained that way (`tools/e5_finetune.py`'s JNLI mode is
 already a one-task cross-encoder), the open question being how far 33
 distinct instruction strings in `.cache/distill` generalise.
 
-## On grande's wgpu engine
+## On omg's wgpu engine
 
 Done (this branch): `ruri-v3-130m-wgpu` and `ruri-v3-310m-wgpu`, on the
 same `e5.rs` engine — it gained a ModernBERT path (pre-LN, RoPE with the
@@ -145,7 +145,7 @@ the BERT one, selected by the export's `model_type`. `tools/export_e5.py
 --model cl-nagoya/ruri-v3-<size> --prefix ""` with the size's generic
 head: Q8, `mlp.Wi` split into value / gate, the 102k-piece vocabulary
 pruned to 86k (the corpus uses most of a Japanese vocabulary, so little
-goes), 146 MB / 314 MB. `grande serve | probe --model <export>` pick them
+goes), 146 MB / 314 MB. `omg serve | probe --model <export>` pick them
 by `config.json`; the browser loader (`kind: "e5"` in `web/engine.js`)
 runs both (release `ruri-v1`), unlisted for the reason above.
 
@@ -159,8 +159,8 @@ through `tools/http_eval.py`, generic head, T 1.5 (130m) / 1.3 (310m):
 | ruri-v3-310m JNLI | 0.805 / 0.046 / 0.506 | 0.815 / 0.036 / 0.508 |
 | ruri-v3-310m JCQA | 0.850 / 0.028 / 0.408 | 0.855 / 0.022 / 0.407 |
 
-Speed (`grande probe --repeat 20`, `examples/ticket-ja.json`, 5 questions,
-M4, GPU otherwise idle; GPU time from `GRANDE_WGPU_PROFILE=1`):
+Speed (`omg probe --repeat 20`, `examples/ticket-ja.json`, 5 questions,
+M4, GPU otherwise idle; GPU time from `OMG_WGPU_PROFILE=1`):
 
 | model | request | GPU time / dispatches | in the browser (Chromium, WebGPU) |
 |---|---|---|---|
@@ -168,7 +168,7 @@ M4, GPU otherwise idle; GPU time from `GRANDE_WGPU_PROFILE=1`):
 | ruri-v3-130m (19 × 512) | **19 ms** | 18 ms / 198 | – |
 | ruri-v3-310m (25 × 768) | **41 ms** | 41 ms / 258 | 112 ms; contract preset (8 questions, 187-token state) 197 ms (measured with a fine-tune sharing the GPU) |
 | laya-multilingual (22 × 768, for scale) | 44 ms (3 questions) | 42 ms / 291 | 51 ms |
-| grande E2B Q4_0 | ~700 ms | | ~1.5 s |
+| omg E2B Q4_0 | ~700 ms | | ~1.5 s |
 
 So ruri-v3-310m + head answers a 5-question Japanese request in 41 ms
 with JNLI 0.81 / JCQA 0.85 — the zero-shot E2B's accuracy on JCQA and 20
@@ -178,7 +178,7 @@ as e5: at d = 512 / 768 the matmul tile is better filled than at 384, but
 the pass is still dispatch-bound (258 dispatches for 41 ms), and a
 fused / small-N tile is where the next 2× is.
 
-## As a grande backend
+## As a omg backend
 
 `tools/e5_serve.py --model cl-nagoya/ruri-v3-<size> --prefix ""` with the
 size's `runs/ruri/<size>/generic/head.pt` serves any of the four behind

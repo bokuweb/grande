@@ -31,8 +31,8 @@ jobs:
           sudo mv "wasm-bindgen-${VERSION}-x86_64-unknown-linux-musl/wasm-bindgen" /usr/local/bin/
       - name: Build wasm
         run: |
-          cargo build --release -p grande-web --target wasm32-unknown-unknown
-          wasm-bindgen --target web --out-dir web/pkg --out-name grande target/wasm32-unknown-unknown/release/grande_web.wasm
+          cargo build --release -p omg-web --target wasm32-unknown-unknown
+          wasm-bindgen --target web --out-dir web/pkg --out-name omg target/wasm32-unknown-unknown/release/omg_web.wasm
           # No wasm-opt: Ubuntu's binaryen is old enough to break the externref
           # table (WebAssembly.Table.grow fails at init). 4.4 MB unoptimized
           # is acceptable for a demo.

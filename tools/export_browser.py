@@ -1,4 +1,4 @@
-"""Export a merged grande checkpoint for the browser: ONNX fp16 of the text
+"""Export a merged omg checkpoint for the browser: ONNX fp16 of the text
 backbone (last_hidden_state, no lm_head), embedding rows pruned to the
 tokens a corpus uses, and an id map so the ORIGINAL tokenizer keeps running
 unchanged in JS (ids outside the kept set fall back to <unk>).
@@ -197,7 +197,7 @@ def main():
     tok.save_pretrained(out)
     cfg = json.load(open(run / "merged" / "config.json"))
     cfg["transformers.js_config"] = {"use_external_data_format": {"model_fp16.onnx": 1, "model.onnx": 1, "model_quantized.onnx": 1}}
-    cfg["grande"] = {"readout": "pointer", "hidden_size": int(d), "layers": len(backbone.layers), "kept_vocab": len(keep), "original_vocab": int(V), "embed_scale": scale}
+    cfg["omg"] = {"readout": "pointer", "hidden_size": int(d), "layers": len(backbone.layers), "kept_vocab": len(keep), "original_vocab": int(V), "embed_scale": scale}
     def plain(o):
         if isinstance(o, np.ndarray):
             return o.tolist()
