@@ -42,7 +42,10 @@ pub(crate) const PARAM_SLOT: u64 = 256;
 /// Workgroup memory the attention kernel declares at a head_dim (see
 /// attention.wgsl): Q tile, K/V tile, scores, positions.
 pub(crate) fn attn_workgroup_bytes(hd: usize, (rows, kb): (usize, usize)) -> u32 {
-    (rows * hd / 2 * 4 + kb * hd / 2 * 4 + 2 * rows * kb * 4 + kb * 8 + rows * 8 + 4) as u32
+    // Q and K/V tiles, scores and probabilities, key and query metadata, the
+    // query runs, krange / tile_any / nruns (attention.wgsl; attention_bi
+    // uses less).
+    (rows * hd / 2 * 4 + kb * hd / 2 * 4 + 2 * rows * kb * 4 + kb * 8 + rows * 28 + 16) as u32
 }
 
 /// Attention workgroup shape (query rows, keys per tile) per head_dim; the
@@ -83,7 +86,9 @@ struct NormParams {
     residual: u32,
     offset: f32,
     scale: f32,
-    _p0: u32,
+    /// Also norm the written row with the second weight into the second
+    /// output (rmsnorm.wgsl).
+    second: u32,
     _p1: u32,
 }
 
@@ -242,7 +247,7 @@ impl K {
         let rw = storage(false);
         match self {
             K::Embed => vec![ro, ro, ro, rw],
-            K::Norm => vec![ro, ro, rw],
+            K::Norm => vec![ro, ro, ro, rw, rw],
             K::Matmul => vec![ro, ro, ro, rw],
             K::MatmulGated => vec![ro, ro, ro, ro, ro, rw],
             K::Logits => vec![ro, ro, ro, rw],
@@ -408,6 +413,12 @@ pub(crate) struct Step {
     pub(crate) bind: wgpu::BindGroup,
 }
 
+/// One layer's steps. The residual-stream norms carry the norm that reads
+/// the stream next (rmsnorm.wgsl `second`): `norm_post_attn` also writes
+/// h = ffn_norm(x), and the layer's last norm (`norm_post_ff`, or the
+/// per-layer chain's `norm`) also writes h = the next layer's attn_norm(x),
+/// or final_norm(x) on the last layer. `norm_in` is dispatched on layer 0
+/// only.
 struct LayerBinds {
     norm_in: Step,
     mm_qkv: Step,
@@ -415,7 +426,6 @@ struct LayerBinds {
     attn: Step,
     mm_o: Step,
     norm_post_attn: Step,
-    norm_pre_ff: Step,
     mm_gate_up: Step,
     mm_down: Step,
     norm_post_ff: Step,
@@ -983,6 +993,8 @@ impl EngineBuilder {
         };
         // Bound where a kernel has no scales / k_norm to read.
         let dummy = f32_buf("dummy", 4);
+        // A dispatch may not bind one buffer both read-only and read-write.
+        let dummy_rw = f32_buf("dummy_rw", 4);
 
         // Workspace.
         let ids = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1102,7 +1114,7 @@ impl EngineBuilder {
             0,
             0,
             "final_norm",
-            &[&x, &w("final_norm")?.data, &h],
+            &[&x, &w("final_norm")?.data, &dummy, &h, &dummy_rw],
         );
         let mm_logits = step(
             K::Logits,
@@ -1140,6 +1152,12 @@ impl EngineBuilder {
         let mut layers = Vec::with_capacity(l_count);
         for l in 0..l_count {
             let n = |s: &str| format!("blk.{l}.{s}");
+            // The norm that reads the residual stream after this layer.
+            let next_norm = if l + 1 == l_count {
+                &w("final_norm")?.data
+            } else {
+                &w(&format!("blk.{}.attn_norm", l + 1))?.data
+            };
             let hd = cfg.head_dim[l];
             let has_kv = cfg.has_kv(l);
             let kv = kv_bufs[cfg.kv_source[l]]
@@ -1178,7 +1196,13 @@ impl EngineBuilder {
                         "pl_mm_proj",
                         &[&attn, &t_p.data, sc(t_p, &dummy), &a],
                     ),
-                    norm: step(K::Norm, 0, 0, "pl_norm", &[&a, &w(&n("pl_norm"))?.data, &x]),
+                    norm: step(
+                        K::Norm,
+                        0,
+                        0,
+                        "pl_norm",
+                        &[&a, &w(&n("pl_norm"))?.data, next_norm, &x, &h],
+                    ),
                 })
             } else {
                 None
@@ -1189,7 +1213,7 @@ impl EngineBuilder {
                     0,
                     0,
                     "norm_in",
-                    &[&x, &w(&n("attn_norm"))?.data, &h],
+                    &[&x, &w(&n("attn_norm"))?.data, &dummy, &h, &dummy_rw],
                 ),
                 mm_qkv: step(
                     K::Matmul,
@@ -1218,14 +1242,13 @@ impl EngineBuilder {
                     0,
                     0,
                     "norm_post_attn",
-                    &[&a, &w(&n("post_attn_norm"))?.data, &x],
-                ),
-                norm_pre_ff: step(
-                    K::Norm,
-                    0,
-                    0,
-                    "norm_pre_ff",
-                    &[&x, &w(&n("ffn_norm"))?.data, &h],
+                    &[
+                        &a,
+                        &w(&n("post_attn_norm"))?.data,
+                        &w(&n("ffn_norm"))?.data,
+                        &x,
+                        &h,
+                    ],
                 ),
                 mm_gate_up: step(
                     K::MatmulGated,
@@ -1253,7 +1276,13 @@ impl EngineBuilder {
                     0,
                     0,
                     "norm_post_ff",
-                    &[&a, &w(&n("post_ffn_norm"))?.data, &x],
+                    &[
+                        &a,
+                        &w(&n("post_ffn_norm"))?.data,
+                        if pl > 0 { &dummy } else { next_norm },
+                        &x,
+                        if pl > 0 { &dummy_rw } else { &h },
+                    ],
                 ),
                 pl: pl_binds,
                 out_scale: scalars.get(&n("out_scale")).copied().unwrap_or(1.0),
@@ -1599,14 +1628,14 @@ impl Engine {
             });
             run("embed", &self.embed, off, (div_ceil(t * d / 4, 256), 1));
 
-            let norm_p = |residual: u32, scale: f32| NormParams {
+            let norm_p = |residual: u32, scale: f32, second: bool| NormParams {
                 t: t as u32,
                 d: d as u32,
                 eps: cfg.eps,
                 residual,
                 offset: cfg.norm_offset,
                 scale,
-                _p0: 0,
+                second: second as u32,
                 _p1: 0,
             };
             let mm = |n: usize, k: usize| MatmulParams {
@@ -1643,8 +1672,10 @@ impl Engine {
             #[cfg(target_arch = "wasm32")]
             let n_layers = self.layers.len();
             for (li, l) in self.layers.iter().enumerate().take(n_layers) {
-                let off = params.push(norm_p(0, 1.0));
-                run("norm", &l.norm_in, off, (t as u32, 1));
+                if li == 0 {
+                    let off = params.push(norm_p(0, 1.0, false));
+                    run("norm", &l.norm_in, off, (t as u32, 1));
+                }
                 let off = params.push(mm(l.qkv_width, d));
                 run("mm_qkv", &l.mm_qkv, off, mm_wg(l.qkv_width));
                 let off = params.push(QkParams {
@@ -1688,21 +1719,19 @@ impl Engine {
                 let attn_w = cfg.heads * l.hd;
                 let off = params.push(mm(d, attn_w));
                 run("mm_o", &l.mm_o, off, mm_wg(d));
-                let off = params.push(norm_p(1, 1.0));
+                let off = params.push(norm_p(1, 1.0, true));
                 run("norm", &l.norm_post_attn, off, (t as u32, 1));
-                let off = params.push(norm_p(0, 1.0));
-                run("norm", &l.norm_pre_ff, off, (t as u32, 1));
                 let off = params.push(mm(l.ff, d));
                 run("mm_gate_up", &l.mm_gate_up, off, gated_wg(l.ff));
                 let off = params.push(mm(d, l.ff));
                 run("mm_down", &l.mm_down, off, mm_wg(d));
                 match &l.pl {
                     None => {
-                        let off = params.push(norm_p(1, l.out_scale));
+                        let off = params.push(norm_p(1, l.out_scale, true));
                         run("norm", &l.norm_post_ff, off, (t as u32, 1));
                     }
                     Some(pb) => {
-                        let off = params.push(norm_p(1, 1.0));
+                        let off = params.push(norm_p(1, 1.0, false));
                         run("norm", &l.norm_post_ff, off, (t as u32, 1));
                         let off = params.push(mm(pl, d));
                         run("pl_mm_gate", &pb.mm_gate, off, mm_wg(pl));
@@ -1715,13 +1744,18 @@ impl Engine {
                         run("pl_gate", &pb.gate, off, (div_ceil(t * pl, 256), 1));
                         let off = params.push(mm(d, pl));
                         run("pl_mm_proj", &pb.mm_proj, off, mm_wg(d));
-                        let off = params.push(norm_p(1, l.out_scale));
+                        let off = params.push(norm_p(1, l.out_scale, true));
                         run("norm", &pb.norm, off, (t as u32, 1));
                     }
                 }
             }
-            let off = params.push(norm_p(0, 1.0));
-            run("norm", &self.final_norm, off, (t as u32, 1));
+            // The last layer's fused norm already wrote h = final_norm(x);
+            // only a GRANDE_WGPU_LAYERS-truncated pass (whose last fused norm
+            // applied the next layer's weight) needs the standalone one.
+            if n_layers < self.layers.len() {
+                let off = params.push(norm_p(0, 1.0, false));
+                run("norm", &self.final_norm, off, (t as u32, 1));
+            }
         }
 
         let mut enc = self
