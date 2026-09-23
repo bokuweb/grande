@@ -73,6 +73,16 @@ score = same rounded level.
 | (state, option) embedding head (70m, docs/ruri.md) | 0.374 (37 / 99) | 37% (all nouls of a request equal) |
 | E2B itself | – | 91% |
 
+Against Laya (laya-multilingual on omg's wgpu engine, `omg probe`, the 16
+presets without the duplicate ticket, 94 questions): Laya agrees with E2B
+on **0.596** (56 / 94), the cross-encoder on **0.649** (61 / 94) — five
+questions apart, within noise at this size. They fail differently: Laya
+gets the calibration preset 7 / 7 (16:00? 0.12, 会議室 1? 0.38 — it reads
+the detail), the cross-encoder 5 / 7; the cross-encoder is ahead where its
+training families are close (incident 5 vs 2, expense 4 vs 2, ticket 5 vs
+4). On JGLUE it is far ahead (0.898 / 0.818 vs Laya's 0.702 / 0.551), but
+it was trained on JGLUE's train split and Laya was not.
+
 The answers now depend on the question — the contract preset's five nouls
 come out 0.99 / 0.87 / 0.98 / 0.97 / 0.99 instead of 0.41 × 5 — and it
 agrees with E2B twice as often as the embedding head (7/8 on the contract,
