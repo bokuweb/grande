@@ -270,21 +270,37 @@ def train(args):
           f"mean {np.mean([len(e['ids']) for e in ex_train]):.0f} tokens", flush=True)
 
     model = Cross(args.model).to(dev)
-    opt = torch.optim.AdamW([{"params": model.enc.parameters(), "lr": args.lr},
+    if args.freeze_embed:
+        # The token table is most of a small model's parameters; freezing it
+        # drops its gradient and Adam state (310m: 79M of 315M).
+        model.enc.embeddings.tok_embeddings.weight.requires_grad_(False)
+    opt = torch.optim.AdamW([{"params": [p for p in model.enc.parameters() if p.requires_grad], "lr": args.lr},
                              {"params": model.scorer.parameters(), "lr": args.head_lr}], weight_decay=0.01)
     steps = args.epochs * sum(1 for _ in batches(ex_train, args.bs, b.pad, True, random.Random(1)))
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, s / max(1, 0.06 * steps)) * max(0.0, (steps - s) / (steps * 0.94)))
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    step, t0 = 0, time.perf_counter()
-    for ep in range(args.epochs):
+    step, t0, first = 0, time.perf_counter(), 0
+    ckpt = out / "ckpt.pt"
+    if ckpt.exists():
+        # Resume after the last finished epoch (a 310m run is hours long).
+        c = torch.load(ckpt, map_location=dev, weights_only=False)
+        # Weights only (Adam moments restart): the disk here has no room for
+        # a 310m optimizer state next to the weights.
+        model.load_state_dict(c["model"])
+        sched.load_state_dict(c["sched"])
+        first, step = c["epoch"] + 1, c["step"]
+        rng.setstate(c["rng"])
+        print(f"resumed after epoch {c['epoch']} (step {step})", flush=True)
+    for ep in range(first, args.epochs):
         model.train()
         if ep > 0:
             ex_train = build_train()  # fresh option shuffles
         tot, n = 0.0, 0
         for _, ids, attn, mk, km, tg in batches(ex_train, args.bs, b.pad, True, rng):
-            z = model(ids.to(dev), attn.to(dev), mk.to(dev), km.to(dev))
-            loss = -(tg.to(dev) * F.log_softmax(z, -1)).sum(-1).mean()
+            with torch.autocast(dev, dtype=torch.bfloat16, enabled=args.bf16):
+                z = model(ids.to(dev), attn.to(dev), mk.to(dev), km.to(dev))
+            loss = -(tg.to(dev) * F.log_softmax(z.float(), -1)).sum(-1).mean()
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -296,7 +312,10 @@ def train(args):
             if step % 200 == 0:
                 print(f"  ep {ep} step {step}/{steps} loss {tot / n:.3f} {time.perf_counter() - t0:.0f}s", flush=True)
         print(f"epoch {ep}: loss {tot / n:.3f} ({time.perf_counter() - t0:.0f}s)", flush=True)
+        torch.save({"model": model.state_dict(), "sched": sched.state_dict(),
+                    "epoch": ep, "step": step, "rng": rng.getstate()}, ckpt)
     torch.save(model.state_dict(), out / "model.pt")
+    ckpt.unlink(missing_ok=True)
     return model, tok, b
 
 
@@ -378,6 +397,8 @@ def main():
     ap.add_argument("--head-lr", type=float, default=1e-3)
     ap.add_argument("--distill-repeat", type=int, default=2, help="copies of the distill questions per epoch (fresh option order each)")
     ap.add_argument("--jglue-limit", type=int, default=0)
+    ap.add_argument("--freeze-embed", action="store_true", help="do not train the token embedding table")
+    ap.add_argument("--bf16", action="store_true", help="bf16 autocast for the forward pass (fp32 weights and optimizer)")
     ap.add_argument("--eval-only", action="store_true")
     ap.add_argument("--probe", nargs="*", default=[], help="request JSON files to answer after training")
     a = ap.parse_args()

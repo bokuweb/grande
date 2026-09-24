@@ -1,4 +1,4 @@
-# A Laya-shaped cross-encoder on Ruri v3 70m
+# A Laya-shaped cross-encoder on Ruri v3 (70m, 310m)
 
 2026-09-23. The (state, option) embedding head of [e5.md](e5.md) /
 [ruri.md](ruri.md) never sees a question's instructions, so every noul over
@@ -138,6 +138,49 @@ config away; expect Laya's ~15–20 ms per question.
   the raw confidence is not enough, since the held-out failures are
   confident.
 
+## ruri-v3-310m
+
+The same recipe on `cl-nagoya/ruri-v3-310m` (315M, 236M without the
+embedding table): token embeddings frozen, bf16 autocast, lr 3e-5, 8
+sequences per 256 tokens — to fit the 16 GB M4 (it still swapped to
+11 GB) — 2 epochs, 4.1 h. `runs/cross/310m/`.
+
+| | 70m | **310m** | reference |
+|---|---|---|---|
+| seen instructions, held-out states: agreement with E4B | 0.938 | **0.948** | oracle prior 0.691 |
+| **held-out instructions**: agreement with E4B | 0.534 | **0.669** | oracle prior 0.610 |
+| … ECE vs E4B on held-out instructions | 0.232 | 0.119 | |
+| 16 Japanese presets: agreement with E2B | 0.649 (61 / 94) | **0.713** (67 / 94) | Laya 0.596 (56 / 94) |
+| noul answers that differ within a request | 91% | 99% | E2B 91% |
+| JNLI valid (odd half) | 0.898 | **0.928** | E2B + pointer head 0.848 (first 400) |
+| JCommonsenseQA valid (odd half) | 0.818 | **0.909** | E2B 0.853, E4B 0.932 (first 400; 310m first 400: 0.915) |
+
+Held-out instructions, one by one (70m → 310m): 会議の場所が明記されているか
+0.19 → 0.69, セキュリティに関わる問い合わせか 0.54 → 0.79, 契約終了後も効力が続く
+義務 0.68 → 0.81, レビュアーは製品を他人に勧めているか 0.35 → 0.56,
+このレビューの評価 0.33 → 0.52, 乙から見たリスク 0.47 → 0.60, 顧客が求めている
+対応 0.76 → 0.73, 数値が含まれているか 0.77 → 0.71.
+
+On the calibration preset (memo: 15:00, 会議室 2) the 310m says "16:00?"
+0.64 and "会議室 1?" 0.76 — less sure than the 70m's 0.99 / 0.98, still on
+the wrong side (E2B 0.02 / 0.01, Laya 0.12 / 0.38); the unanswerable ones
+stay low (0.08–0.23). On the contract it now leans "no" on
+"年14.6%を超えているか" (0.64 vs the 70m's 0.98 and E2B's 0.92 — the
+clause says exactly 14.6%, so lower is right).
+
+Reading: scale is what moved the held-out number — the same 25 training
+instructions, and the 310m is above the oracle prior (0.669 vs 0.610) where
+the 70m was below it, with half the calibration error. It reads new
+questions better but not reliably (0.52–0.81 per instruction, the
+15:00 / 16:00 detail still wrong), so the conclusion about coverage stands;
+the 310m is the backbone to run the "many more instruction strings"
+experiment on. JCQA 0.909 is past zero-shot E2B, JNLI 0.928 past E2B + a
+trained head, in one multi-task model. Latency in PyTorch was not
+measured cleanly (the M4 was swapping); on omg's wgpu engine a 310m
+ModernBERT is the laya.rs path, 41 ms for a 5-question request as an
+embedder (ruri.md), so roughly 5× that per request as a cross-encoder,
+which re-reads the state per question.
+
 ## Rerun
 
 ```bash
@@ -148,4 +191,8 @@ for f in examples/ticket-ja.json runs/cross/preset-*_ja_.json; do
   ./target/release/omg probe --model models/gemma-4-E2B-it-Q4_0.gguf --request $f > runs/cross/e2b/$(basename $f .json).json
 done
 python tools/cross_compare.py --requests examples/ticket-ja.json runs/cross/preset-*_ja_.json
+# 310m (~4 h on an M4; resumes after the last finished epoch)
+python tools/cross_train.py --model cl-nagoya/ruri-v3-310m --out runs/cross/310m --bs 8 --lr 3e-5 --freeze-embed --bf16
+python tools/cross_compare.py --model cl-nagoya/ruri-v3-310m --cross runs/cross/310m \
+    --embed-head runs/ruri/310m/generic/head.pt --embed-temperature 1.3 --requests examples/ticket-ja.json runs/cross/preset-*_ja_.json
 ```
