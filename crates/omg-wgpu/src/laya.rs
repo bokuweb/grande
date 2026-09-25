@@ -59,7 +59,12 @@ pub struct LayaConfig {
     pub theta_local: f32,
     pub eps: f32,
     pub head_layers: usize,
-    /// Decision-head MLP width (4 × d) and the act head's hidden / output widths.
+    /// A question-type embedding is added after the encoder (Laya's
+    /// `type_emb`). Off for the Ruri cross-encoder (docs/cross.md), which
+    /// has neither it nor decision-head layers nor an act head.
+    pub type_emb: bool,
+    /// Decision-head MLP width (4 × d) and the act head's hidden / output
+    /// widths; `act_out` 0 = no act head.
     pub act_hidden: usize,
     pub act_out: usize,
     /// Prompt budgets (`rl_agent_config.json`).
@@ -179,8 +184,13 @@ impl LayaConfig {
                 .or_else(|| encoder["layer_norm_eps"].as_f64())
                 .unwrap_or(1e-5) as f32,
             head_layers: agent["head_layers"].as_u64().unwrap_or(2) as usize,
+            type_emb: agent["type_emb"].as_bool().unwrap_or(true),
             act_hidden: 256,
-            act_out: agent["act_costs"].as_object().map_or(0, |m| m.len()) + 1,
+            act_out: if agent["act_head"].as_bool() == Some(false) {
+                0
+            } else {
+                agent["act_costs"].as_object().map_or(0, |m| m.len()) + 1
+            },
             max_len,
             head_max_len,
             temperature,
@@ -246,8 +256,10 @@ impl LayaConfig {
             TensorSpec::new("embed", vec![self.vocab, d]),
             TensorSpec::new("embed_norm", vec![d]),
             TensorSpec::new("final_norm", vec![d]),
-            TensorSpec::new("type_emb", vec![3, d]),
         ];
+        if self.type_emb {
+            v.push(TensorSpec::new("type_emb", vec![3, d]));
+        }
         for l in 0..self.layers {
             let n = |s: &str| format!("enc.{l}.{s}");
             if l > 0 {
@@ -281,13 +293,15 @@ impl LayaConfig {
         v.push(TensorSpec::new("scorer.l1_b", vec![d]));
         v.push(TensorSpec::new("scorer.l2", vec![1, d]));
         v.push(TensorSpec::new("scorer.l2_b", vec![1]));
-        v.push(TensorSpec::new("act.l1", vec![self.act_hidden, d + 4]));
-        v.push(TensorSpec::new("act.l1_b", vec![self.act_hidden]));
-        v.push(TensorSpec::new(
-            "act.l2",
-            vec![self.act_out, self.act_hidden],
-        ));
-        v.push(TensorSpec::new("act.l2_b", vec![self.act_out]));
+        if self.act_out > 0 {
+            v.push(TensorSpec::new("act.l1", vec![self.act_hidden, d + 4]));
+            v.push(TensorSpec::new("act.l1_b", vec![self.act_hidden]));
+            v.push(TensorSpec::new(
+                "act.l2",
+                vec![self.act_out, self.act_hidden],
+            ));
+            v.push(TensorSpec::new("act.l2_b", vec![self.act_out]));
+        }
         v
     }
 }
@@ -463,11 +477,11 @@ pub struct Sequence {
 /// What the engine returns per sequence: the scorer's raw logit per option
 /// (before temperature) and the act head's probability for acting on the
 /// answer (output 0; upstream's `act_probability`, the rest being the
-/// `act_costs` actions).
+/// `act_costs` actions), None without an act head.
 #[derive(Debug, Clone)]
 pub struct Output {
     pub logits: Vec<f32>,
-    pub act_probability: f32,
+    pub act_probability: Option<f32>,
 }
 
 #[repr(C)]
@@ -823,14 +837,18 @@ impl LayaBuilder {
             &[&dummy, &w("embed_norm")?.data, &dummy, &dummy, &h, &x],
         );
         // x = final_norm(x) (in place, by the last encoder layer) + type_emb[qtype].
-        let type_t = w("type_emb")?;
-        let type_embed = step(
-            K::Embed,
-            0,
-            type_t.dtype.code(),
-            "type_emb",
-            &[&qtypes, &type_t.data, sc(type_t, &dummy), &x],
-        );
+        let type_embed = if cfg.type_emb {
+            let type_t = w("type_emb")?;
+            Some(step(
+                K::Embed,
+                0,
+                type_t.dtype.code(),
+                "type_emb",
+                &[&qtypes, &type_t.data, sc(type_t, &dummy), &x],
+            ))
+        } else {
+            None
+        };
 
         let mut enc = Vec::with_capacity(cfg.layers);
         for l in 0..cfg.layers {
@@ -1017,6 +1035,9 @@ impl LayaBuilder {
             });
         }
         let hv = |name: &str| -> Result<Vec<f32>> {
+            if name.starts_with("act.") && cfg.act_out == 0 {
+                return Ok(Vec::new());
+            }
             host.get(name)
                 .cloned()
                 .ok_or_else(|| anyhow!("missing host tensor {name}"))
@@ -1079,7 +1100,7 @@ pub struct LayaEngine {
     staging: wgpu::Buffer,
     embed: Step,
     embed_norm: Step,
-    type_embed: Step,
+    type_embed: Option<Step>,
     enc: Vec<EncLayer>,
     head: Vec<HeadLayer>,
     host: Host,
@@ -1284,18 +1305,15 @@ impl LayaEngine {
                 let off = params.push(ln(false, true, false, l.last));
                 run("add_wo_norm", &l.add_wo_norm, off, (t as u32, 1));
             }
-            let off = params.push(EmbedParams {
-                t: t as u32,
-                d: d as u32,
-                scale: 1.0,
-                residual: 1,
-            });
-            run(
-                "type_emb",
-                &self.type_embed,
-                off,
-                (div_ceil(t * d / 4, 256), 1),
-            );
+            if let Some(te) = &self.type_embed {
+                let off = params.push(EmbedParams {
+                    t: t as u32,
+                    d: d as u32,
+                    scale: 1.0,
+                    residual: 1,
+                });
+                run("type_emb", te, off, (div_ceil(t * d / 4, 256), 1));
+            }
             for (i, l) in self.head.iter().enumerate() {
                 if i == 0 {
                     let off = params.push(ln(true, false, false, false));
@@ -1436,6 +1454,12 @@ impl LayaEngine {
                 dot(&z, &hst.l2) + hst.l2_b
             })
             .collect();
+        if cfg.act_out == 0 {
+            return Output {
+                logits,
+                act_probability: None,
+            };
+        }
         // Confidence features over the untempered softmax, with the public
         // runtime's padding to two slots for a one-option question.
         let k = logits.len().max(2);
@@ -1456,7 +1480,7 @@ impl LayaEngine {
         let act = softmax(&linear(&a, &hst.act_l2, &hst.act_l2_b, cfg.act_hidden));
         Output {
             logits,
-            act_probability: act[0],
+            act_probability: Some(act[0]),
         }
     }
 

@@ -91,6 +91,14 @@ on an M4.
       vocabulary = 180 MB). `omg serve --model <laya dir>` picks it by
       the checkpoint's files; `tools/export_laya.py` packs it for the
       browser; `laya-multilingual-wgpu` in the demo's model list.
+- [x] Ruri v3 cross-encoders on the same Laya path
+      ([docs/cross.md](docs/cross.md)): ruri-v3-70m / 310m trained as
+      Laya-shaped cross-encoders (instructions, options and state in one
+      sequence) on E4B-labelled synthetic questions + JGLUE. The 310m reads
+      the question (JNLI 0.928 / JCQA 0.909, 71% agreement with E2B on the
+      unseen demo presets vs Laya's 60%) but not every detail of a new one.
+      `ruri-v3-310m-cross-wgpu` (326 MB) and `ruri-v3-70m-cross-wgpu`
+      (78 MB) in the demo's model list; `tools/export_cross.py`.
 - [x] multilingual-e5-small on the wgpu engine ([docs/e5.md](docs/e5.md)):
       a BERT sentence embedder (118M, 21.6M without the embedding table)
       plus a 0.8M (state, option) head trained on JGLUE, behind the same

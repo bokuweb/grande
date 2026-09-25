@@ -181,6 +181,31 @@ ModernBERT is the laya.rs path, 41 ms for a 5-question request as an
 embedder (ruri.md), so roughly 5× that per request as a cross-encoder,
 which re-reads the state per question.
 
+## In the demo (omg's wgpu engine)
+
+Both models run on `laya.rs`, which now takes a checkpoint without Laya's
+question-type embedding, decision-head layers and act head
+(`laya_agent.type_emb` / `head_layers` / `act_head` in the export's
+config). `tools/export_cross.py` writes the Laya export layout (Q8
+encoder, f16 norms and scorer, the full 102k vocabulary, `<s>` / `</s>`
+as the separators the trainer used): `ruri-v3-70m-cross-wgpu` 78 MB,
+`ruri-v3-310m-cross-wgpu` 326 MB, release `cross-v1`, listed in the demo
+and picked up by `omg serve | probe --model <dir>`.
+
+Parity with the PyTorch model on the 16 Japanese presets (94 questions):
+the same decision on 94 / 94 for both sizes, largest probability
+difference 0.009 (Q8). The browser gives the same answers (310m: 16:00?
+0.644, 会議室 1? 0.756, 14.6%? 0.632).
+
+| request time, M4 | 70m | 310m |
+|---|---|---|
+| native (`omg probe`), 16 presets: min / median / max | 13 / 54 / 98 ms | 69 / 335 / 630 ms |
+| browser (Chromium, WebGPU): ticket (5 q) / contract (8 q) | – / 145 ms | 289 / 987 ms |
+
+Every question re-reads the state (the contract preset is 8 sequences of
+~240 tokens, 1,970 tokens in all), so the 310m in the browser costs about
+what E2B does on the same request; the 70m is the fast one.
+
 ## Rerun
 
 ```bash
@@ -193,6 +218,7 @@ done
 python tools/cross_compare.py --requests examples/ticket-ja.json runs/cross/preset-*_ja_.json
 # 310m (~4 h on an M4; resumes after the last finished epoch)
 python tools/cross_train.py --model cl-nagoya/ruri-v3-310m --out runs/cross/310m --bs 8 --lr 3e-5 --freeze-embed --bf16
+python tools/export_cross.py --model cl-nagoya/ruri-v3-310m --weights runs/cross/310m/model.pt --out web/models/ruri-v3-310m-cross-wgpu
 python tools/cross_compare.py --model cl-nagoya/ruri-v3-310m --cross runs/cross/310m \
     --embed-head runs/ruri/310m/generic/head.pt --embed-temperature 1.3 --requests examples/ticket-ja.json runs/cross/preset-*_ja_.json
 ```
