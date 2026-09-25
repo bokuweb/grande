@@ -20,13 +20,17 @@ python3 -m http.server 8765 --directory web
 open "http://localhost:8765/"
 ```
 
-The page offers three models: `gemma-4-e2b-wgpu-ja` (the default) and
+The page offers five models: `gemma-4-e2b-wgpu-ja` (the default) and
 `gemma-4-e4b-wgpu-ja`, Gemma 4 E2B / E4B on omg's own wgpu engine, and
 `laya-multilingual-wgpu`, Convai's Laya (mmBERT encoder + decision head,
 docs/laya.md) on the same engine — 180 MB (Q8, 56k-token vocabulary,
 `tools/export_laya.py`), one bidirectional sequence per question, ~50 ms
 for a 3-question request; fetched from the `laya-v1` release into
-`./models/` by `fetch-models.sh` (small enough for the Pages site). The
+`./models/` by `fetch-models.sh` (small enough for the Pages site). Two
+more run on the Laya loader: `ruri-v3-310m-cross-wgpu` (326 MB) and
+`ruri-v3-70m-cross-wgpu` (78 MB), Ruri v3 trained as Laya-shaped
+cross-encoders (docs/cross.md; `tools/export_cross.py`, release
+`cross-v1`). The
 sentence-embedder backends (multilingual-e5-small, Ruri v3 130m / 310m
 with a trained (state, option) head; docs/e5.md, docs/ruri.md; releases
 `e5-v1`, `ruri-v1`) run on the engine too (`kind: "e5"` in engine.js) but

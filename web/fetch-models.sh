@@ -25,3 +25,16 @@ ls -la "$LDEST" 2>/dev/null || true
 # are not fetched: they are not in the page's model list (their head does
 # not read a question's instructions). `omg serve --model <export>`
 # still runs them natively; download a release by hand to try one here.
+
+# The Ruri v3 cross-encoders (tools/export_cross.py, docs/cross.md), 78 / 326 MB:
+# release cross-v1, assets prefixed by size (70m-*, 310m-*).
+CTAG="${4:-cross-v1}"
+for size in 70m 310m; do
+  CDEST="models/ruri-v3-$size-cross-wgpu"
+  mkdir -p "$CDEST"
+  for f in config.json tokenizer.json tokenizer_config.json special_tokens_map.json manifest.json embed.bin enc.bin head.bin; do
+    gh release download "$CTAG" --repo bokuweb/omg --pattern "$size-$f" --output "$CDEST/$f" --clobber \
+      || { echo "no $CTAG release; skipping ruri-v3-$size-cross"; rm -rf "$CDEST"; break; }
+  done
+  ls -la "$CDEST" 2>/dev/null || true
+done

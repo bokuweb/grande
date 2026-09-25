@@ -52,10 +52,20 @@ const GEMMA4 = { layout: "label", turn_start: "<|turn>", turn_end: "<turn|>", us
 // instructions, so two noul questions over one state get the same answer.
 // They stay a native option (`omg serve --model <export>`) for question
 // families a head was trained on.
+//
+// `ruri-v3-310m-cross-wgpu` / `ruri-v3-70m-cross-wgpu` are Ruri v3
+// (ModernBERT-Ja) trained as Laya-shaped cross-encoders (docs/cross.md):
+// instructions, options and state in one sequence per question, so unlike
+// the embedders they read the question. Run by the Laya loader (kind
+// "laya": no type embedding, head layers or act head). 310m: JNLI 0.928 /
+// JCQA 0.909, 71% agreement with E2B on unseen presets; 70m is ~6x faster
+// and weaker (JNLI 0.898 / JCQA 0.818, 65%). Full vocabulary, Q8.
 export const MODELS = {
   "gemma-4-e2b-wgpu-ja": { id: "gemma-4-e2b-wgpu-ja", local: true, hub: "bokuweb/gemma-4-E2B-it-grande-wgpu-ja", kind: "wgpu", readout: "label", manifest: true, dtype: "q4", layout: GEMMA4, size: "1.2 GB", note: "E2B, wgpu engine: one pass, 25k-token vocabulary" },
   "gemma-4-e4b-wgpu-ja": { id: "gemma-4-e4b-wgpu-ja", local: true, hub: "bokuweb/gemma-4-E4B-it-grande-wgpu-ja", kind: "wgpu", readout: "label", manifest: true, dtype: "q4", layout: GEMMA4, size: "2.5 GB", note: "E4B, wgpu engine: one pass, 25k-token vocabulary" },
   "laya-multilingual-wgpu": { id: "laya-multilingual-wgpu", local: true, hub: "bokuweb/laya-multilingual-grande-wgpu", kind: "laya", manifest: true, dtype: "q8", size: "180 MB", note: "Laya: mmBERT encoder + decision head, ~20 ms a question, 56k-token vocabulary" },
+  "ruri-v3-310m-cross-wgpu": { id: "ruri-v3-310m-cross-wgpu", local: true, kind: "laya", manifest: true, dtype: "q8", size: "326 MB", note: "Ruri v3 310m cross-encoder (Japanese): reads the question, JNLI 0.93 / JCQA 0.91" },
+  "ruri-v3-70m-cross-wgpu": { id: "ruri-v3-70m-cross-wgpu", local: true, kind: "laya", manifest: true, dtype: "q8", size: "78 MB", note: "Ruri v3 70m cross-encoder (Japanese): fastest, JNLI 0.90 / JCQA 0.82" },
 };
 // Specs of the unlisted embedder backends, for adding one back:
 //   { id: "multilingual-e5-small-wgpu", local: true, kind: "e5", manifest: true, dtype: "q8", size: "58 MB" }
