@@ -95,8 +95,9 @@ pub fn distributions(
     for ((seq, out), branch) in seqs.iter().zip(outs).zip(branches) {
         let t = cfg.temperature_for(seq.qtype, out.logits.len()) * temperature;
         let dist = Distribution::from_logits(out.logits, t.max(1e-3), None);
-        diag.act_probability
-            .insert(branch.id.clone(), f64::from(out.act_probability));
+        if let Some(a) = out.act_probability {
+            diag.act_probability.insert(branch.id.clone(), f64::from(a));
+        }
         dists.push((branch, dist));
     }
     (dists, diag)
